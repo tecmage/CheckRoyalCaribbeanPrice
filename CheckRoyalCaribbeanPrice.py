@@ -1233,6 +1233,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
             "final_payment": final_payment_date,
             "past_final_payment": date.today() > final_payment_date,
             "balance_due": booking.get("balanceDue") is True,
+            "balance_due_amount": booking.get("balanceDueAmount"),
         })
 
         if booking.get("balanceDue") is True:
@@ -3291,11 +3292,13 @@ def print_checkin_payment_table() -> None:
             # balance is now past the final payment deadline. A booking with no balance
             # due is paid in full regardless of whether the deadline has passed.
             if r["balance_due"]:
+                amount = r.get("balance_due_amount")
+                owed = f": {amount:,.2f}" if isinstance(amount, (int, float)) else ""
                 if r["past_final_payment"]:
-                    pay += " (PAST DUE)"
+                    pay += f" (PAST DUE{owed})"
                     pay_colors.append(RED)
                 else:
-                    pay += " (balance due)"
+                    pay += f" (balance due{owed})"
                     pay_colors.append(YELLOW)
             else:
                 pay += " (paid)"
