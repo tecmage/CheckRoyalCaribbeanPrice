@@ -281,6 +281,37 @@ def filter_side(cabins: List[Dict[str, Any]], side: Optional[str], flip: bool,
     return [c for c in cabins if side_of(c["cabin"], flip, by_number) == side]
 
 
+# Quantum-class ship codes (Quantum, Anthem, Ovation, Odyssey, Spectrum).
+QUANTUM_CLASS = {"QN", "AN", "OV", "OY", "SC"}
+
+# Balcony-cabin quality by deck and fore/aft zone, transcribed from the cruiseadmiral
+# Quantum/Anthem balcony guide (approximate - edit to taste). Ratings: good/ok/avoid.
+# Zones map to the API's positionCode: FW=forward, MS=mid-ship, AF=aft.
+QUANTUM_QUALITY: Dict[int, Dict[str, str]] = {
+    13: {"AF": "avoid", "MS": "avoid", "FW": "ok"},     # under pool deck / SeaPlex / running track
+    12: {"AF": "good",  "MS": "ok",    "FW": "good"},
+    11: {"AF": "good",  "MS": "good",  "FW": "good"},    # best
+    10: {"AF": "good",  "MS": "good",  "FW": "good"},    # best
+    9:  {"AF": "good",  "MS": "good",  "FW": "good"},
+    8:  {"AF": "good",  "MS": "ok",    "FW": "good"},
+    7:  {"AF": "avoid", "MS": "avoid", "FW": "good"},    # mostly red; forward ok
+    6:  {"AF": "ok",    "MS": "avoid", "FW": "ok"},      # lifeboat obstructions
+}
+QUALITY_TAG = {"good": f"{GREEN}[recommended]{RESET}",
+               "ok": f"{YELLOW}[caution]{RESET}",
+               "avoid": f"{RED}[avoid]{RESET}"}
+
+
+def cabin_quality(ship: str, deck: str, position: Optional[str]) -> Optional[str]:
+    """Deck-guide quality (good/ok/avoid) for a Quantum-class cabin, or None if not covered."""
+    if ship.upper() not in QUANTUM_CLASS:
+        return None
+    try:
+        return QUANTUM_QUALITY.get(int(deck), {}).get((position or "").upper())
+    except (ValueError, TypeError):
+        return None
+
+
 def closest_on_deck(leg_lists: List[List[int]]) -> Optional[Tuple[int, List[int]]]:
     """Given one leg's cabins-on-a-deck per leg, find the pick with the smallest spread."""
     if not all(leg_lists):
@@ -382,6 +413,8 @@ def main() -> None:
     ap.add_argument("--children", type=int, default=0)
     ap.add_argument("--min-legs", type=int, default=2, help="Minimum consecutive sailings (default 2)")
     ap.add_argument("--limit", type=int, default=0, help="Max cabins to list per result (0 = all)")
+    ap.add_argument("--hide-avoid", action="store_true",
+                    help="Quantum-class: drop cabins the deck guide rates 'avoid'")
     ap.add_argument("--after", help="Only sailings on/after this date (YYYY-MM-DD)")
     ap.add_argument("--before", help="Only sailings on/before this date (YYYY-MM-DD)")
     args = ap.parse_args()
@@ -538,9 +571,13 @@ def main() -> None:
                 [c for c in filter_side(get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship,
                                                         args.brand, stype, sub, args.adults,
                                                         args.children, only_decks=deck_pref),
-                                        side, args.flip_sides, by_number) if keep_cat(c)]
+                                        side, args.flip_sides, by_number)
+                 if keep_cat(c) and not (args.hide_avoid
+                                         and cabin_quality(ship, c["deck"], c["position"]) == "avoid")]
                 for v in chain]
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
+            cab_q = {c["cabin"]: cabin_quality(ship, c["deck"], c["position"])
+                     for leg in leg_cabins for c in leg}
 
             s_spans = same_cabin_spans(leg_cabins, args.min_legs)
             c_spans = deck_close_spans(leg_cabins, args.min_legs)
@@ -557,8 +594,10 @@ def main() -> None:
                   + (f" (showing first {limit})" if more > 0 else "") + ":")
             for cabin, i, j in s_spans[:limit]:
                 side_tag = f", {side_of(cabin, args.flip_sides, by_number)}" if show_side else ""
+                q = cab_q.get(cabin)
+                q_tag = f" {QUALITY_TAG[q]}" if q else ""
                 print(f"  {GREEN}Same cabin {cabin}{RESET} (cat {cab_cat.get(cabin,'?')}"
-                      f"{side_tag}): {span_desc(chain, i, j)}")
+                      f"{side_tag}): {span_desc(chain, i, j)}{q_tag}")
             if more > 0:
                 print(f"  ... and {more} more (use --limit 0 to show all)")
             # show a switch-cabins option only if it runs LONGER than the best same-cabin span
