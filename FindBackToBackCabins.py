@@ -312,6 +312,24 @@ def cabin_quality(ship: str, deck: str, position: Optional[str]) -> Optional[str
         return None
 
 
+# "Hump" cabins jut out at the fore & aft elevator banks and have larger balconies. The
+# room-number ranges are consistent across every deck (derived from the Ovation deck-plan
+# PDF by finding cabins clustered at the ELEV markers); port and starboard each have a
+# forward and a mid hump. Same numbering scheme should hold across Quantum-class.
+QUANTUM_HUMP_RANGES = [(143, 185), (224, 262),     # port: forward hump, mid hump
+                       (543, 585), (625, 661)]     # starboard: forward hump, mid hump
+
+
+def is_hump(ship: str, cabin: str) -> bool:
+    if ship.upper() not in QUANTUM_CLASS:
+        return False
+    try:
+        n = int(str(cabin)[-3:])
+    except ValueError:
+        return False
+    return any(lo <= n <= hi for lo, hi in QUANTUM_HUMP_RANGES)
+
+
 def closest_on_deck(leg_lists: List[List[int]]) -> Optional[Tuple[int, List[int]]]:
     """Given one leg's cabins-on-a-deck per leg, find the pick with the smallest spread."""
     if not all(leg_lists):
@@ -415,6 +433,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="Max cabins to list per result (0 = all)")
     ap.add_argument("--hide-avoid", action="store_true",
                     help="Quantum-class: drop cabins the deck guide rates 'avoid'")
+    ap.add_argument("--hump-only", action="store_true",
+                    help="Quantum-class: only the hump cabins (bigger balconies, by the elevators)")
     ap.add_argument("--after", help="Only sailings on/after this date (YYYY-MM-DD)")
     ap.add_argument("--before", help="Only sailings on/before this date (YYYY-MM-DD)")
     args = ap.parse_args()
@@ -572,8 +592,10 @@ def main() -> None:
                                                         args.brand, stype, sub, args.adults,
                                                         args.children, only_decks=deck_pref),
                                         side, args.flip_sides, by_number)
-                 if keep_cat(c) and not (args.hide_avoid
-                                         and cabin_quality(ship, c["deck"], c["position"]) == "avoid")]
+                 if keep_cat(c)
+                 and not (args.hide_avoid
+                          and cabin_quality(ship, c["deck"], c["position"]) == "avoid")
+                 and not (args.hump_only and not is_hump(ship, c["cabin"]))]
                 for v in chain]
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
             cab_q = {c["cabin"]: cabin_quality(ship, c["deck"], c["position"])
@@ -596,8 +618,9 @@ def main() -> None:
                 side_tag = f", {side_of(cabin, args.flip_sides, by_number)}" if show_side else ""
                 q = cab_q.get(cabin)
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
+                hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
                 print(f"  {GREEN}Same cabin {cabin}{RESET} (cat {cab_cat.get(cabin,'?')}"
-                      f"{side_tag}): {span_desc(chain, i, j)}{q_tag}")
+                      f"{side_tag}): {span_desc(chain, i, j)}{q_tag}{hump_tag}")
             if more > 0:
                 print(f"  ... and {more} more (use --limit 0 to show all)")
             # show a switch-cabins option only if it runs LONGER than the best same-cabin span
