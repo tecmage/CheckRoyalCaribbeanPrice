@@ -41,8 +41,8 @@ APPKEY_WEB = "hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm"
 USER_AGENT_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0"
 API = "https://aws-prd.api.rccl.com"
 
-RED, GREEN, YELLOW, BLUE, CYAN, RESET = (
-    "\033[91m", "\033[1;32m", "\033[93m", "\033[94m", "\033[96m", "\033[0m")
+RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, RESET = (
+    "\033[91m", "\033[1;32m", "\033[93m", "\033[94m", "\033[96m", "\033[95m", "\033[0m")
 
 session = requests.Session()
 
@@ -435,6 +435,8 @@ def main() -> None:
                     help="Quantum-class: drop cabins the deck guide rates 'avoid'")
     ap.add_argument("--hump-only", action="store_true",
                     help="Quantum-class: only the hump cabins (bigger balconies, by the elevators)")
+    ap.add_argument("--connecting-permitted", action="store_true",
+                    help="Include connecting staterooms (excluded by default; tagged [connecting])")
     ap.add_argument("--after", help="Only sailings on/after this date (YYYY-MM-DD)")
     ap.add_argument("--before", help="Only sailings on/before this date (YYYY-MM-DD)")
     args = ap.parse_args()
@@ -529,6 +531,16 @@ def main() -> None:
     else:
         subtypes = [code for code, _ in pickable]
 
+    # Connecting staterooms are their own subtype ("Connecting ..." in the name) - works on
+    # any ship. They aren't generally preferred (noise/privacy), so exclude them by default;
+    # --connecting-permitted keeps them (still tagged [connecting]). An explicit category or
+    # subtype request is always honored.
+    connecting_codes = {s.get("code") for t in types if t["code"] == stype
+                        for s in t["stateroomSubtypes"]
+                        if "connect" in (s.get("name") or "").lower()}
+    if not args.connecting_permitted and not (args.subtype or category):
+        subtypes = [c for c in subtypes if c not in connecting_codes] or subtypes
+
     # --- Preferred decks ---
     deck_pref = parse_decks(args.decks)
     if deck_pref is None and sys.stdin.isatty():
@@ -619,8 +631,9 @@ def main() -> None:
                 q = cab_q.get(cabin)
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
                 hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
+                conn_tag = f" {MAGENTA}[connecting]{RESET}" if sub in connecting_codes else ""
                 print(f"  {GREEN}Same cabin {cabin}{RESET} (cat {cab_cat.get(cabin,'?')}"
-                      f"{side_tag}): {span_desc(chain, i, j)}{q_tag}{hump_tag}")
+                      f"{side_tag}): {span_desc(chain, i, j)}{q_tag}{hump_tag}{conn_tag}")
             if more > 0:
                 print(f"  ... and {more} more (use --limit 0 to show all)")
             # show a switch-cabins option only if it runs LONGER than the best same-cabin span
