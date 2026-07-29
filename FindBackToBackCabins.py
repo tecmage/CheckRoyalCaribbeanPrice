@@ -482,9 +482,12 @@ def deck_close_spans(leg_cabins: List[List[Dict[str, Any]]], min_legs: int
 # Prompt helpers
 ##################################
 def parse_decks(raw: Optional[str]) -> Optional[set]:
-    """'7,8,10' -> {'07','08','10'} matching the API's zero-padded deck codes. Blank -> None."""
+    """'7,8,10' -> {'07','08','10'} matching the API's zero-padded deck codes.
+    'all'/'any' -> empty set (explicit no-filter, suppresses the prompt). Blank -> None."""
     if not raw:
         return None
+    if raw.strip().upper() in ("ALL", "ANY"):
+        return set()
     out = {tok.zfill(2) for tok in raw.replace(" ", "").split(",") if tok.isdigit()}
     return out or None
 
@@ -534,9 +537,12 @@ def main() -> None:
                     help="Stateroom type: interior/oceanview/balcony/suite (or API code)")
     ap.add_argument("--sub", dest="subtype", type=str.upper,
                     help="Subtype code, e.g. D (power users; usually use --category)")
-    ap.add_argument("--category", type=str.upper, help="Category code to match, e.g. 4D")
-    ap.add_argument("--side", type=str.lower, choices=["port", "starboard"], help="Side preference")
-    ap.add_argument("--decks", help="Comma-separated preferred deck numbers, e.g. 7,8,9 (blank = any)")
+    ap.add_argument("--category", type=str.upper,
+                    help="Category code to match, e.g. 4D ('all' = no filter, skip the prompt)")
+    ap.add_argument("--side", type=str.lower, choices=["port", "starboard", "any", "both"],
+                    help="Side preference ('any' = no preference, skip the prompt)")
+    ap.add_argument("--decks", help="Comma-separated deck numbers, e.g. 7,8,9 "
+                                    "('all' = no filter, skip the prompt)")
     ap.add_argument("--flip-sides", action="store_true",
                     help="Flip the odd/even -> port/starboard mapping for this ship")
     ap.add_argument("--adults", type=int, default=2)
@@ -678,8 +684,12 @@ def main() -> None:
     pickable = [(s.get("code"), s.get("categoryCode")) for s in type_subs if not s.get("guarantee")]
     guarantees = sorted({s.get("categoryCode") or s.get("code") for s in type_subs if s.get("guarantee")})
 
+    # 'all'/'any' are explicit no-filter answers (and suppress the prompt), both as
+    # --category values and typed at the prompt.
     category = (args.category or "").upper() or None
-    if args.subtype is None and category is None and sys.stdin.isatty():
+    if category in ("ALL", "ANY"):
+        category = None
+    if args.subtype is None and args.category is None and sys.stdin.isatty():
         leads = sorted({c for _, c in pickable if c})
         hint = f" (pickable: {', '.join(leads)}" if leads else " ("
         if guarantees:
@@ -687,6 +697,8 @@ def main() -> None:
         hint += ")"
         raw = input(f"\n{CYAN}Preferred category code{RESET} e.g. 4D{hint}, blank=all: ").strip().upper()
         category = raw or None
+        if category in ("ALL", "ANY"):
+            category = None
 
     # Which subtypes to query: an explicit --sub wins; else narrow to pickable subtypes whose
     # lead-in categoryCode shares the requested category's letters (4D -> the '...D' subtype).
@@ -718,9 +730,10 @@ def main() -> None:
         raw = input(f"\n{CYAN}Preferred decks{RESET}, comma-separated e.g. 8,9,10, blank=any: ").strip()
         deck_pref = parse_decks(raw)
 
-    # --- Side preference ---
-    side = args.side
-    if side is None and sys.stdin.isatty():  # only prompt on a real terminal
+    # --- Side preference ('any'/'both' = explicit no-preference, suppresses the prompt) ---
+    side_given = args.side is not None
+    side = None if args.side in ("any", "both") else args.side
+    if side is None and not side_given and sys.stdin.isatty():
         print(f"\n{CYAN}Side preference?{RESET}")
         side = choose("Side", [("", "No preference"), ("port", "Port"), ("starboard", "Starboard")]) or None
 
