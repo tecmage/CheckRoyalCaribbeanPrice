@@ -44,6 +44,21 @@ API = "https://aws-prd.api.rccl.com"
 RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, RESET = (
     "\033[91m", "\033[1;32m", "\033[93m", "\033[94m", "\033[96m", "\033[95m", "\033[0m")
 
+# Windows PowerShell 5.x / classic conhost print ANSI color escapes literally unless
+# virtual-terminal processing is enabled. Harmless where already on (Windows Terminal)
+# or unsupported - failures are ignored. (Same fix as the main scripts.)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        _kernel32 = ctypes.windll.kernel32
+        _handle = _kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        _mode = ctypes.c_uint32()
+        if _kernel32.GetConsoleMode(_handle, ctypes.byref(_mode)):
+            # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            _kernel32.SetConsoleMode(_handle, _mode.value | 0x0004)
+    except Exception:
+        pass
+
 session = requests.Session()
 
 # Set by --debug-pricing: dump the raw pricing fields the API returns (stderr)
