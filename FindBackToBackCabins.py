@@ -439,6 +439,8 @@ def main() -> None:
                     help="Include connecting staterooms (excluded by default; tagged [connecting])")
     ap.add_argument("--after", help="Only sailings on/after this date (YYYY-MM-DD)")
     ap.add_argument("--before", help="Only sailings on/before this date (YYYY-MM-DD)")
+    ap.add_argument("--saildate", help="A single sailing date (YYYY-MM-DD): list its open cabins "
+                                       "instead of hunting back-to-backs")
     args = ap.parse_args()
 
     def _norm(d: Optional[str]) -> Optional[str]:
@@ -466,25 +468,48 @@ def main() -> None:
         print(f"{RED}No future voyages found for {ship}.{RESET}")
         return
 
-    # Optional date window (interactive prompt if not given as args)
-    if after is None and before is None and sys.stdin.isatty():
-        raw = input(f"\n{CYAN}Limit to a date range?{RESET} start,end as YYYY-MM-DD "
+    # Optional date window (interactive prompt if not given as args). A single date -
+    # either --saildate or one date with no comma at the prompt - selects that one
+    # sailing and switches to a plain open-cabin listing instead of the B2B hunt.
+    saildate = _norm(args.saildate)
+    if saildate is None and after is None and before is None and sys.stdin.isatty():
+        raw = input(f"\n{CYAN}Limit to a date range?{RESET} start,end as YYYY-MM-DD, or ONE "
+                    f"date to list a single sailing's open cabins "
                     f"(blank = all {len(voyages)} sailings): ").strip()
         if raw:
             parts = [p.strip() for p in raw.split(",")]
-            after = _norm(parts[0]) if parts else None
-            before = _norm(parts[1]) if len(parts) > 1 else None
+            if len(parts) == 1:
+                saildate = _norm(parts[0])
+            else:
+                after = _norm(parts[0]) or None
+                before = _norm(parts[1]) if len(parts) > 1 else None
+    if saildate:
+        after = before = saildate
     if after:
         voyages = [v for v in voyages if v["sailDate"] >= after]
     if before:
         voyages = [v for v in voyages if v["sailDate"] <= before]
 
-    chains = build_chains(voyages, args.min_legs)
-    print(f"\n{ship}: {len(voyages)} sailings in range, "
-          f"{len(chains)} back-to-back chain(s) of >= {args.min_legs} legs "
-          f"(longest {max((len(c) for c in chains), default=0)} legs).")
-    if not chains:
+    if saildate and not voyages:
+        print(f"{RED}No {ship} sailing departs on {_dash(saildate)}.{RESET}")
         return
+    if not voyages:
+        print(f"{RED}No sailings in that date range.{RESET}")
+        return
+
+    single_mode = len(voyages) == 1
+    if single_mode:
+        v = voyages[0]
+        chains = [[v]]
+        print(f"\n{ship}: single sailing {_dash(v['sailDate'])} ({v['duration']}n) "
+              f"{v.get('voyageDescription','')} - listing open cabins.")
+    else:
+        chains = build_chains(voyages, args.min_legs)
+        print(f"\n{ship}: {len(voyages)} sailings in range, "
+              f"{len(chains)} back-to-back chain(s) of >= {args.min_legs} legs "
+              f"(longest {max((len(c) for c in chains), default=0)} legs).")
+        if not chains:
+            return
 
     # --- Stateroom type / subtype (probe a sailing that has inventory for this ship's codes) ---
     types, sample = discover_types(ship, args.brand, voyages, args.adults, args.children)
@@ -580,6 +605,56 @@ def main() -> None:
                   f"even={'starboard' if not args.flip_sides else 'port'}). Usual Royal "
                   f"convention but can vary by ship - re-run with --flip-sides if reversed.")
 
+    def keep_cabin(c: Dict[str, Any]) -> bool:
+        if category is not None and (c.get("category") or "").upper() != category:
+            return False
+        if args.hide_avoid and cabin_quality(ship, c["deck"], c["position"]) == "avoid":
+            return False
+        if args.hump_only and not is_hump(ship, c["cabin"]):
+            return False
+        return True
+
+    # --- Single-sailing mode: just list the open cabins, grouped by deck ---
+    if single_mode:
+        v = chains[0][0]
+        found_any = False
+        for sub in subtypes:
+            cabs = [c for c in filter_side(
+                        get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship, args.brand,
+                                        stype, sub, args.adults, args.children,
+                                        only_decks=deck_pref),
+                        side, args.flip_sides, by_number) if keep_cabin(c)]
+            if not cabs:
+                continue
+            found_any = True
+            print(f"{BLUE}{'='*70}{RESET}")
+            print(f"{BLUE}{ship} {stype}/{sub}{RESET}  {_dash(v['sailDate'])}  "
+                  f"{len(cabs)} open cabin(s):")
+            limit = args.limit or len(cabs)
+            shown = 0
+            for deck in sorted({c["deck"] for c in cabs}):
+                if shown >= limit:
+                    break
+                deck_cabs = sorted((c for c in cabs if c["deck"] == deck),
+                                   key=lambda c: int(c["cabin"]))
+                print(f"  Deck {deck}:")
+                for c in deck_cabs:
+                    if shown >= limit:
+                        break
+                    side_tag = f", {side_of(c['cabin'], args.flip_sides, by_number)}" if show_side else ""
+                    q = cabin_quality(ship, c["deck"], c["position"])
+                    tags = (f" {QUALITY_TAG[q]}" if q else "")
+                    tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"]) else ""
+                    tags += f" {MAGENTA}[connecting]{RESET}" if sub in connecting_codes else ""
+                    print(f"    {GREEN}{c['cabin']}{RESET} (cat {c.get('category','?')}{side_tag}){tags}")
+                    shown += 1
+            if shown < len(cabs):
+                print(f"  ... and {len(cabs) - shown} more (use --limit 0 to show all)")
+        if not found_any:
+            print(f"{YELLOW}No open cabins found for that selection.{RESET}")
+        print(f"\n{GREEN}Done.{RESET}")
+        return
+
     print(f"\nSweeping {len(chains)} consecutive chain(s) x {len(subtypes)} sub-categorie(s). "
           f"This makes many public API calls; please be patient.\n")
 
@@ -589,9 +664,6 @@ def main() -> None:
         end = _dash(legs[-1].get("sailEndDate") or legs[-1]["sailDate"])
         nights = sum(int(v.get("duration", 0)) for v in legs)
         return f"{len(legs)} sailings  {start} -> {end}  ({nights} nights)"
-
-    def keep_cat(c: Dict[str, Any]) -> bool:
-        return category is None or (c.get("category") or "").upper() == category
 
     found_any = False
     for chain in chains:
@@ -604,10 +676,7 @@ def main() -> None:
                                                         args.brand, stype, sub, args.adults,
                                                         args.children, only_decks=deck_pref),
                                         side, args.flip_sides, by_number)
-                 if keep_cat(c)
-                 and not (args.hide_avoid
-                          and cabin_quality(ship, c["deck"], c["position"]) == "avoid")
-                 and not (args.hump_only and not is_hump(ship, c["cabin"]))]
+                 if keep_cabin(c)]
                 for v in chain]
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
             cab_q = {c["cabin"]: cabin_quality(ship, c["deck"], c["position"])
