@@ -46,6 +46,17 @@ RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, RESET = (
 
 session = requests.Session()
 
+# Set by --debug-pricing: dump the raw pricing fields the API returns (stderr)
+DEBUG_PRICING = False
+
+
+def price_str(price: Optional[float], exact: bool) -> str:
+    """'$2,453.64' for a known category price, '~$...' when approximated from the
+    subtype's cheapest category, '' when unknown."""
+    if price is None:
+        return ""
+    return f"{'' if exact else '~'}${price:,.2f}"
+
 
 ##################################
 # Low-level fetch + RSC parsing
@@ -242,15 +253,54 @@ def get_open_cabins(pkg: str, sail: str, ship: str, brand: str, stype: str, subt
             data = r.json()
         except Exception:
             continue
+        # Prices are set per CATEGORY (every cabin in a category costs the same). Each
+        # subtype entry in options.stateroomTypes carries its lead-in category's
+        # tax-inclusive party total at pricing.invoice.total - collect those as a
+        # category->price map, then look for a price directly on each roomNumbers
+        # category record as well (field name probed defensively).
+        lead_prices: Dict[str, float] = {}
+        sub_lead_price: Optional[float] = None
+        for st in (((data.get("rooms") or [{}])[0].get("options") or {}).get("stateroomTypes") or []):
+            for s in st.get("stateroomSubtypes", []) or []:
+                total = ((s.get("pricing") or {}).get("invoice") or {}).get("total")
+                if isinstance(total, (int, float)):
+                    if s.get("categoryCode"):
+                        lead_prices[s["categoryCode"]] = float(total)
+                    if s.get("code") == subtype:
+                        sub_lead_price = float(total)
+
+        def _cat_price(cat_record: Dict[str, Any]) -> Optional[float]:
+            for path in (("pricing", "invoice", "total"), ("pricing", "total"),
+                         ("invoice", "total"), ("price",), ("total",), ("startingPrice",)):
+                o: Any = cat_record
+                for k in path:
+                    o = o.get(k) if isinstance(o, dict) else None
+                if isinstance(o, (int, float)):
+                    return float(o)
+            return None
+
         for room in data.get("rooms", []) or []:
             rn = room.get("roomNumbers", {}) or {}
             for cat in rn.get("categories", []) or []:
                 catcode = cat.get("categoryCode") or cat.get("code")
+                price = _cat_price(cat)
+                exact = price is not None
+                if price is None and catcode in lead_prices:
+                    price, exact = lead_prices[catcode], True   # lead-in category's own price
+                if price is None:
+                    price, exact = sub_lead_price, False        # approx: subtype's cheapest
+                if DEBUG_PRICING and cat.get("cabins"):
+                    slim = {k: v for k, v in cat.items() if k != "cabins"}
+                    print(f"[debug-pricing] deck {dc} category record: {json.dumps(slim)[:400]}",
+                          file=sys.stderr)
+                    print(f"[debug-pricing] lead_prices={lead_prices} sub_lead={sub_lead_price}",
+                          file=sys.stderr)
                 for cab in cat.get("cabins", []) or []:
                     num = cab.get("cabinNumber")
                     if num:
                         cabins.append({"cabin": str(num), "deck": dc,
-                                       "position": cab.get("positionCode"), "category": catcode})
+                                       "position": cab.get("positionCode"), "category": catcode,
+                                       "price": price, "price_exact": exact})
     return cabins
 
 
@@ -441,7 +491,12 @@ def main() -> None:
     ap.add_argument("--before", help="Only sailings on/before this date (YYYY-MM-DD)")
     ap.add_argument("--saildate", help="A single sailing date (YYYY-MM-DD): list its open cabins "
                                        "instead of hunting back-to-backs")
+    ap.add_argument("--debug-pricing", action="store_true",
+                    help="Dump the raw category pricing fields the API returns (stderr)")
     args = ap.parse_args()
+
+    global DEBUG_PRICING
+    DEBUG_PRICING = args.debug_pricing
 
     def _norm(d: Optional[str]) -> Optional[str]:
         if not d:
@@ -646,7 +701,9 @@ def main() -> None:
                     tags = (f" {QUALITY_TAG[q]}" if q else "")
                     tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"]) else ""
                     tags += f" {MAGENTA}[connecting]{RESET}" if sub in connecting_codes else ""
-                    print(f"    {GREEN}{c['cabin']}{RESET} (cat {c.get('category','?')}{side_tag}){tags}")
+                    p = price_str(c.get("price"), c.get("price_exact", False))
+                    p_tag = f"  {p}" if p else ""
+                    print(f"    {GREEN}{c['cabin']}{RESET} (cat {c.get('category','?')}{side_tag}){p_tag}{tags}")
                     shown += 1
             if shown < len(cabs):
                 print(f"  ... and {len(cabs) - shown} more (use --limit 0 to show all)")
@@ -681,6 +738,16 @@ def main() -> None:
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
             cab_q = {c["cabin"]: cabin_quality(ship, c["deck"], c["position"])
                      for leg in leg_cabins for c in leg}
+            leg_price = [{c["cabin"]: (c.get("price"), c.get("price_exact", False)) for c in leg}
+                         for leg in leg_cabins]
+
+            def span_total(cabin: str, i: int, j: int) -> str:
+                """Summed category price across the span's legs, '' if any leg unknown."""
+                prices = [leg_price[k].get(cabin, (None, False)) for k in range(i, j + 1)]
+                if any(p[0] is None for p in prices):
+                    return ""
+                total = sum(p[0] for p in prices)
+                return price_str(total, all(p[1] for p in prices))
 
             s_spans = same_cabin_spans(leg_cabins, args.min_legs)
             c_spans = deck_close_spans(leg_cabins, args.min_legs)
@@ -701,8 +768,10 @@ def main() -> None:
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
                 hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
                 conn_tag = f" {MAGENTA}[connecting]{RESET}" if sub in connecting_codes else ""
+                total = span_total(cabin, i, j)
+                total_tag = f"  {total} total" if total else ""
                 print(f"  {GREEN}Same cabin {cabin}{RESET} (cat {cab_cat.get(cabin,'?')}"
-                      f"{side_tag}): {span_desc(chain, i, j)}{q_tag}{hump_tag}{conn_tag}")
+                      f"{side_tag}): {span_desc(chain, i, j)}{total_tag}{q_tag}{hump_tag}{conn_tag}")
             if more > 0:
                 print(f"  ... and {more} more (use --limit 0 to show all)")
             # show a switch-cabins option only if it runs LONGER than the best same-cabin span
