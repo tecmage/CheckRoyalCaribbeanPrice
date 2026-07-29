@@ -683,6 +683,7 @@ def main() -> None:
     type_subs = [s for t in types if t["code"] == stype for s in t["stateroomSubtypes"]]
     pickable = [(s.get("code"), s.get("categoryCode")) for s in type_subs if not s.get("guarantee")]
     guarantees = sorted({s.get("categoryCode") or s.get("code") for s in type_subs if s.get("guarantee")})
+    sub_name = {s.get("code"): (s.get("name") or "") for s in type_subs}
 
     # 'all'/'any' are explicit no-filter answers (and suppress the prompt), both as
     # --category values and typed at the prompt.
@@ -690,11 +691,13 @@ def main() -> None:
     if category in ("ALL", "ANY"):
         category = None
     if args.subtype is None and args.category is None and sys.stdin.isatty():
-        leads = sorted({c for _, c in pickable if c})
-        hint = f" (pickable: {', '.join(leads)}" if leads else " ("
+        if pickable:
+            print(f"\n{CYAN}Categories on this ship:{RESET}")
+            for code, cat in pickable:
+                print(f"  {BLUE}{cat or code}{RESET}  {sub_name.get(code, '')}")
+        hint = ""
         if guarantees:
-            hint += f"; guarantees {', '.join(guarantees)} excluded - line picks the room"
-        hint += ")"
+            hint = f" (guarantees {', '.join(guarantees)} excluded - line picks the room)"
         raw = input(f"\n{CYAN}Preferred category code{RESET} e.g. 4D{hint}, blank=all: ").strip().upper()
         category = raw or None
         if category in ("ALL", "ANY"):
@@ -781,8 +784,8 @@ def main() -> None:
                 continue
             found_any = True
             print(f"{BLUE}{'='*70}{RESET}")
-            print(f"{BLUE}{ship} {stype}/{sub}{RESET}  {_dash(v['sailDate'])}  "
-                  f"{len(cabs)} open cabin(s):")
+            print(f"{BLUE}{ship} {stype}/{sub}{RESET} - {sub_name.get(sub, '')}  "
+                  f"{_dash(v['sailDate'])}  {len(cabs)} open cabin(s):")
             limit = args.limit or len(cabs)
             shown = 0
             for deck in sorted({c["deck"] for c in cabs}):
@@ -855,7 +858,8 @@ def main() -> None:
             best_same = (s_spans[0][2] - s_spans[0][1] + 1) if s_spans else 0
 
             print(f"{BLUE}{'='*70}{RESET}")
-            print(f"{BLUE}{ship} {stype}/{sub}{RESET}  {chain[0].get('voyageDescription','')}")
+            print(f"{BLUE}{ship} {stype}/{sub}{RESET} - {sub_name.get(sub, '')}  "
+                  f"{chain[0].get('voyageDescription','')}")
             limit = args.limit or len(s_spans)
             more = len(s_spans) - limit
             print(f"  {len(s_spans)} same-cabin option(s)"
