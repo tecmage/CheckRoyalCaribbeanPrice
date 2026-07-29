@@ -123,14 +123,18 @@ def _dash(sail: str) -> str:
 ##################################
 # Fleet + schedule
 ##################################
-def get_ships(brand: str) -> List[Dict[str, str]]:
+def get_fleet() -> List[Dict[str, str]]:
+    """Every ship across both brands: [{code, name, brand}]."""
     r = _get(f"{API}/en/royal/web/v2/ships", params={"sort": "name"},
              headers={"User-Agent": USER_AGENT_WEB, "Accept": "application/json", "appkey": APPKEY_WEB})
     if not r or r.status_code != 200:
         return []
-    ships = r.json().get("payload", {}).get("ships", [])
-    return [{"code": s.get("shipCode"), "name": s.get("name")}
-            for s in ships if (s.get("brand") or "R") == brand]
+    return [{"code": s.get("shipCode"), "name": s.get("name"), "brand": s.get("brand") or "R"}
+            for s in r.json().get("payload", {}).get("ships", [])]
+
+
+def get_ships(brand: str) -> List[Dict[str, str]]:
+    return [s for s in get_fleet() if s["brand"] == brand]
 
 
 def get_voyages(ship_code: str) -> List[Dict[str, Any]]:
@@ -502,14 +506,36 @@ def choose(prompt: str, options: List[Tuple[str, str]]) -> Optional[str]:
 ##################################
 # Main
 ##################################
+# Friendly names for the API's stateroom type codes (applied case-insensitively)
+TYPE_ALIASES = {
+    "INSIDE": "INTERIOR", "INT": "INTERIOR",
+    "OCEANVIEW": "OUTSIDE", "OCEAN": "OUTSIDE", "OV": "OUTSIDE",
+    "VERANDA": "BALCONY", "BAL": "BALCONY",
+    "SUITE": "DELUXE", "SUITES": "DELUXE",
+}
+
+EXAMPLES = """examples:
+  %(prog)s                                              interactive
+  %(prog)s --ship ovation --category 4d --side port     B2B hunt, ship by name
+  %(prog)s --ship EG --type veranda --saildate 2027-01-02   one sailing's open cabins
+  %(prog)s --ship voyager --type suite --after 1/1/2027 --before 3/31/2027 --hump-only
+(all values are case-insensitive; --ship takes a code or any part of the name)"""
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Find back-to-back cabin availability")
-    ap.add_argument("--brand", default="R", help="R=Royal, C=Celebrity")
-    ap.add_argument("--ship", help="Two-letter ship code (skip the ship prompt)")
-    ap.add_argument("--type", dest="stype", help="Stateroom type code, e.g. BALCONY")
-    ap.add_argument("--sub", dest="subtype", help="Subtype code, e.g. D (power users; usually use --category)")
-    ap.add_argument("--category", help="Category code to match, e.g. 4D")
-    ap.add_argument("--side", choices=["port", "starboard"], help="Side preference")
+    ap = argparse.ArgumentParser(description="Find back-to-back cabin availability",
+                                 epilog=EXAMPLES,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--brand", type=lambda s: {"ROYAL": "R", "CELEBRITY": "C"}.get(s.upper(), s.upper()),
+                    choices=["R", "C"], default="R",
+                    help="R/royal or C/celebrity (auto-detected when --ship is given)")
+    ap.add_argument("--ship", help="Ship code (OV) or any part of the name ('ovation')")
+    ap.add_argument("--type", dest="stype", type=str.upper,
+                    help="Stateroom type: interior/oceanview/balcony/suite (or API code)")
+    ap.add_argument("--sub", dest="subtype", type=str.upper,
+                    help="Subtype code, e.g. D (power users; usually use --category)")
+    ap.add_argument("--category", type=str.upper, help="Category code to match, e.g. 4D")
+    ap.add_argument("--side", type=str.lower, choices=["port", "starboard"], help="Side preference")
     ap.add_argument("--decks", help="Comma-separated preferred deck numbers, e.g. 7,8,9 (blank = any)")
     ap.add_argument("--flip-sides", action="store_true",
                     help="Flip the odd/even -> port/starboard mapping for this ship")
@@ -535,24 +561,53 @@ def main() -> None:
     DEBUG_PRICING = args.debug_pricing
 
     def _norm(d: Optional[str]) -> Optional[str]:
+        """Accept YYYY-MM-DD, YYYYMMDD, MM/DD/YYYY, M/D/YYYY, MM/DD/YY -> YYYYMMDD."""
         if not d:
             return None
-        s = d.replace("-", "").replace("/", "")
-        return s if len(s) == 8 and s.isdigit() else None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+            try:
+                return datetime.strptime(d.strip(), fmt).strftime("%Y%m%d")
+            except ValueError:
+                continue
+        return None
 
     after, before = _norm(args.after), _norm(args.before)
 
-    # --- Ship ---
-    ship = args.ship
-    if not ship:
-        ships = get_ships(args.brand)
-        if not ships:
+    # --- Ship (code or name fragment; brand auto-detected from the fleet list) ---
+    fleet = get_fleet()
+    ship = None
+    if args.ship:
+        want = args.ship.strip().upper()
+        hit = next((s for s in fleet if s["code"] == want), None)
+        if not hit:
+            matches = [s for s in fleet if want in (s["name"] or "").upper()]
+            if len(matches) == 1:
+                hit = matches[0]
+            elif len(matches) > 1:
+                print(f"{YELLOW}'{args.ship}' matches several ships:{RESET} "
+                      + ", ".join(f"{s['name']} ({s['code']})" for s in matches))
+                return
+        if hit:
+            ship, args.brand = hit["code"], hit["brand"]
+        elif len(want) == 2 and not fleet:
+            ship = want   # fleet list unavailable; trust the explicit code
+        else:
+            print(f"{RED}Unknown ship '{args.ship}'.{RESET} Run without --ship to pick from the list.")
+            return
+    else:
+        if not fleet:
             print(f"{RED}Could not load ships.{RESET}")
             return
         print(f"\n{CYAN}Select a ship:{RESET}")
-        ship = choose("Ship", [(s["code"], f"{s['name']} ({s['code']})") for s in ships])
-        if not ship:
+        picked = choose("Ship", [(s["code"], f"{s['name']} ({s['code']})") for s in fleet])
+        if not picked:
             return
+        ship = picked
+        args.brand = next((s["brand"] for s in fleet if s["code"] == picked), args.brand)
+
+    # Friendly stateroom-type names -> API codes
+    if args.stype:
+        args.stype = TYPE_ALIASES.get(args.stype, args.stype)
 
     voyages = get_voyages(ship)
     if not voyages:
