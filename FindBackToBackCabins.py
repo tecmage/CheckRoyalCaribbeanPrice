@@ -339,6 +339,13 @@ SIDE_SPLIT = {
     "ST": 402, "SY": 400, "UT": 512, "VY": 514, "WN": 522,
 }
 
+# Orientation, measured per ship by anchoring each deck plan's bow direction with the
+# API's FW/AF cabin positions (deck plans are drawn viewed from above): most Royal
+# ships put the LOWER rooms on the port side, but the Voyager and Freedom classes are
+# numbered mirror-image - HIGHER rooms are port there. (ID inferred from its Freedom-
+# class sisters.) Celebrity: odd = port on every resolved ship.
+SIDE_PORT_HIGH = {"AD", "EX", "FR", "ID", "LB", "MA", "NV", "VY"}
+
 
 def side_of(cabin: str, flip: bool, by_number: bool = False,
             split: int = SIDE_SPLIT_DEFAULT) -> str:
@@ -663,22 +670,25 @@ def main() -> None:
         side = choose("Side", [("", "No preference"), ("port", "Port"), ("starboard", "Starboard")]) or None
 
     # Side rule is brand-determined (measured fleet-wide against deck-plan geometry):
-    # Royal = low/high room-number split, Celebrity = odd/even parity.
+    # Royal = low/high room-number split, Celebrity = odd/even parity. Orientation is
+    # per-ship: Voyager/Freedom-class ships are numbered mirror-image to the rest.
     by_number = args.brand == "R"
     split_val = SIDE_SPLIT.get(ship.upper(), SIDE_SPLIT_DEFAULT)
+    flip_eff = args.flip_sides
+    if by_number and ship.upper() in SIDE_PORT_HIGH:
+        flip_eff = not flip_eff
     show_side = bool(side)
     if side:
         if by_number:
-            print(f"\n{YELLOW}Note:{RESET} Royal ships separate sides by room number: "
-                  f"{'lower=port, higher=starboard' if not args.flip_sides else 'lower=starboard, higher=port'} "
-                  f"(split at {split_val} on {ship}, measured from its deck plans). "
-                  f"Re-run with --flip-sides if reversed.")
+            lo_side, hi_side = ("port", "starboard") if not flip_eff else ("starboard", "port")
+            print(f"\n{YELLOW}Note:{RESET} Royal ships separate sides by room number: on {ship} "
+                  f"lower={lo_side}, higher={hi_side} (split at {split_val}; rule and "
+                  f"orientation measured from its deck plans). --flip-sides inverts.")
         else:
-            print(f"\n{YELLOW}Note:{RESET} Celebrity ships separate sides by parity "
-                  f"(odd={'port' if not args.flip_sides else 'starboard'}, "
-                  f"even={'starboard' if not args.flip_sides else 'port'}). Which parity is "
-                  f"which side is unverified - check a deck plan and re-run with "
-                  f"--flip-sides if reversed.")
+            odd_side, even_side = ("port", "starboard") if not flip_eff else ("starboard", "port")
+            print(f"\n{YELLOW}Note:{RESET} Celebrity ships separate sides by parity: "
+                  f"odd={odd_side}, even={even_side} (measured from the fleet's deck plans). "
+                  f"--flip-sides inverts.")
 
     def keep_cabin(c: Dict[str, Any]) -> bool:
         if category is not None and (c.get("category") or "").upper() != category:
@@ -698,7 +708,7 @@ def main() -> None:
                         get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship, args.brand,
                                         stype, sub, args.adults, args.children,
                                         only_decks=deck_pref),
-                        side, args.flip_sides, by_number, split_val) if keep_cabin(c)]
+                        side, flip_eff, by_number, split_val) if keep_cabin(c)]
             if not cabs:
                 continue
             found_any = True
@@ -716,7 +726,7 @@ def main() -> None:
                 for c in deck_cabs:
                     if shown >= limit:
                         break
-                    side_tag = f", {side_of(c['cabin'], args.flip_sides, by_number, split_val)}" if show_side else ""
+                    side_tag = f", {side_of(c['cabin'], flip_eff, by_number, split_val)}" if show_side else ""
                     q = cabin_quality(ship, c["deck"], c["position"])
                     tags = (f" {QUALITY_TAG[q]}" if q else "")
                     tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"]) else ""
@@ -752,7 +762,7 @@ def main() -> None:
                 [c for c in filter_side(get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship,
                                                         args.brand, stype, sub, args.adults,
                                                         args.children, only_decks=deck_pref),
-                                        side, args.flip_sides, by_number, split_val)
+                                        side, flip_eff, by_number, split_val)
                  if keep_cabin(c)]
                 for v in chain]
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
@@ -783,7 +793,7 @@ def main() -> None:
             print(f"  {len(s_spans)} same-cabin option(s)"
                   + (f" (showing first {limit})" if more > 0 else "") + ":")
             for cabin, i, j in s_spans[:limit]:
-                side_tag = f", {side_of(cabin, args.flip_sides, by_number, split_val)}" if show_side else ""
+                side_tag = f", {side_of(cabin, flip_eff, by_number, split_val)}" if show_side else ""
                 q = cab_q.get(cabin)
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
                 hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
