@@ -521,7 +521,7 @@ EXAMPLES = """examples:
   %(prog)s                                              interactive
   %(prog)s --ship ovation --category 4d --side port     B2B hunt, ship by name
   %(prog)s --ship EG --type veranda --saildate 2027-01-02   one sailing's open cabins
-  %(prog)s --ship voyager --type suite --after 1/1/2027 --before 3/31/2027 --hump-only
+  %(prog)s --ship voyager --type interior,balcony --after 1/1/2027 --before 3/31/2027
 (all values are case-insensitive; --ship takes a code or any part of the name)"""
 
 
@@ -534,7 +534,8 @@ def main() -> None:
                     help="R/royal or C/celebrity (auto-detected when --ship is given)")
     ap.add_argument("--ship", help="Ship code (OV) or any part of the name ('ovation')")
     ap.add_argument("--type", dest="stype", type=str.upper,
-                    help="Stateroom type: interior/oceanview/balcony/suite (or API code)")
+                    help="Stateroom type(s), comma-separated: interior/oceanview/balcony/suite "
+                         "or API codes; 'all' = every type (e.g. --type interior,balcony)")
     ap.add_argument("--sub", dest="subtype", type=str.upper,
                     help="Subtype code, e.g. D (power users; usually use --category)")
     ap.add_argument("--category", type=str.upper,
@@ -611,9 +612,6 @@ def main() -> None:
         ship = picked
         args.brand = next((s["brand"] for s in fleet if s["code"] == picked), args.brand)
 
-    # Friendly stateroom-type names -> API codes
-    if args.stype:
-        args.stype = TYPE_ALIASES.get(args.stype, args.stype)
 
     voyages = get_voyages(ship)
     if not voyages:
@@ -669,21 +667,39 @@ def main() -> None:
         print(f"{RED}Could not read stateroom categories for {ship}.{RESET}")
         return
 
-    stype = args.stype
-    if not stype:
-        print(f"\n{CYAN}Stateroom type:{RESET}")
-        stype = choose("Type", [(t["code"], f"{t['name']} ({t['code']})") for t in types])
-        if not stype:
+    # --- Stateroom type(s): comma-separated, friendly aliases, 'all' = every type ---
+    valid_types = [t["code"] for t in types]
+    if args.stype:
+        stypes = []
+        for tok in args.stype.split(","):
+            tok = TYPE_ALIASES.get(tok.strip().upper(), tok.strip().upper())
+            if not tok:
+                continue
+            if tok in ("ALL", "ANY"):
+                stypes = list(valid_types)
+                break
+            stypes.append(tok)
+        bad = [t for t in stypes if t not in valid_types]
+        if bad:
+            print(f"{RED}Unknown stateroom type(s): {', '.join(bad)}.{RESET} "
+                  f"This ship has: {', '.join(valid_types)}")
             return
+        stypes = list(dict.fromkeys(stypes))   # dedupe, keep order
+    else:
+        print(f"\n{CYAN}Stateroom type:{RESET}")
+        picked_type = choose("Type", [(t["code"], f"{t['name']} ({t['code']})") for t in types])
+        if not picked_type:
+            return
+        stypes = [picked_type]
 
     # --- Preferred category code (e.g. 4D) - matches how cabins are usually referenced ---
-    # Split the type's subtypes into pickable vs guarantee. Guarantee categories (X-prefixed,
+    # Split each type's subtypes into pickable vs guarantee. Guarantee categories (X-prefixed,
     # guarantee=true) let the line assign your room, so you can't hold a specific cabin across
     # legs - exclude them from a back-to-back cabin search.
-    type_subs = [s for t in types if t["code"] == stype for s in t["stateroomSubtypes"]]
-    pickable = [(s.get("code"), s.get("categoryCode")) for s in type_subs if not s.get("guarantee")]
-    guarantees = sorted({s.get("categoryCode") or s.get("code") for s in type_subs if s.get("guarantee")})
-    sub_name = {s.get("code"): (s.get("name") or "") for s in type_subs}
+    type_subs = [(t["code"], s) for t in types if t["code"] in stypes for s in t["stateroomSubtypes"]]
+    pickable = [(st, s.get("code"), s.get("categoryCode")) for st, s in type_subs if not s.get("guarantee")]
+    guarantees = sorted({s.get("categoryCode") or s.get("code") for _, s in type_subs if s.get("guarantee")})
+    sub_name = {(st, s.get("code")): (s.get("name") or "") for st, s in type_subs}
 
     # 'all'/'any' are explicit no-filter answers (and suppress the prompt), both as
     # --category values and typed at the prompt.
@@ -693,8 +709,8 @@ def main() -> None:
     if args.subtype is None and args.category is None and sys.stdin.isatty():
         if pickable:
             print(f"\n{CYAN}Categories on this ship:{RESET}")
-            for code, cat in pickable:
-                print(f"  {BLUE}{cat or code}{RESET}  {sub_name.get(code, '')}")
+            for st, code, cat in pickable:
+                print(f"  {BLUE}{cat or code}{RESET}  {sub_name.get((st, code), '')}")
         hint = ""
         if guarantees:
             hint = f" (guarantees {', '.join(guarantees)} excluded - line picks the room)"
@@ -709,23 +725,25 @@ def main() -> None:
         return re.sub(r"[^A-Za-z]", "", s or "").upper()
 
     if args.subtype:
-        subtypes = [args.subtype]
+        subtype_pairs = [(st, code) for st, code, _ in pickable if code == args.subtype] \
+                        or [(st, args.subtype) for st in stypes]
     elif category:
-        subtypes = [code for code, cat in pickable if _letters(cat) == _letters(category)]
-        if not subtypes:
-            subtypes = [code for code, _ in pickable]
+        subtype_pairs = [(st, code) for st, code, cat in pickable
+                         if _letters(cat) == _letters(category)]
+        if not subtype_pairs:
+            subtype_pairs = [(st, code) for st, code, _ in pickable]
     else:
-        subtypes = [code for code, _ in pickable]
+        subtype_pairs = [(st, code) for st, code, _ in pickable]
 
     # Connecting staterooms are their own subtype ("Connecting ..." in the name) - works on
     # any ship. They aren't generally preferred (noise/privacy), so exclude them by default;
     # --connecting-permitted keeps them (still tagged [connecting]). An explicit category or
     # subtype request is always honored.
-    connecting_codes = {s.get("code") for t in types if t["code"] == stype
+    connecting_pairs = {(t["code"], s.get("code")) for t in types if t["code"] in stypes
                         for s in t["stateroomSubtypes"]
                         if "connect" in (s.get("name") or "").lower()}
     if not args.connecting_permitted and not (args.subtype or category):
-        subtypes = [c for c in subtypes if c not in connecting_codes] or subtypes
+        subtype_pairs = [p for p in subtype_pairs if p not in connecting_pairs] or subtype_pairs
 
     # --- Preferred decks ---
     deck_pref = parse_decks(args.decks)
@@ -774,7 +792,7 @@ def main() -> None:
     if single_mode:
         v = chains[0][0]
         found_any = False
-        for sub in subtypes:
+        for stype, sub in subtype_pairs:
             cabs = [c for c in filter_side(
                         get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship, args.brand,
                                         stype, sub, args.adults, args.children,
@@ -784,7 +802,7 @@ def main() -> None:
                 continue
             found_any = True
             print(f"{BLUE}{'='*70}{RESET}")
-            print(f"{BLUE}{ship} {stype}/{sub}{RESET} - {sub_name.get(sub, '')}  "
+            print(f"{BLUE}{ship} {stype}/{sub}{RESET} - {sub_name.get((stype, sub), '')}  "
                   f"{_dash(v['sailDate'])}  {len(cabs)} open cabin(s):")
             limit = args.limit or len(cabs)
             shown = 0
@@ -801,7 +819,7 @@ def main() -> None:
                     q = cabin_quality(ship, c["deck"], c["position"])
                     tags = (f" {QUALITY_TAG[q]}" if q else "")
                     tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"]) else ""
-                    tags += f" {MAGENTA}[connecting]{RESET}" if sub in connecting_codes else ""
+                    tags += f" {MAGENTA}[connecting]{RESET}" if (stype, sub) in connecting_pairs else ""
                     p = price_str(c.get("price"), c.get("price_exact", False))
                     p_tag = f"  {p}" if p else ""
                     print(f"    {GREEN}{c['cabin']}{RESET} (cat {c.get('category','?')}{side_tag}){p_tag}{tags}")
@@ -813,7 +831,7 @@ def main() -> None:
         print(f"\n{GREEN}Done.{RESET}")
         return
 
-    print(f"\nSweeping {len(chains)} consecutive chain(s) x {len(subtypes)} sub-categorie(s). "
+    print(f"\nSweeping {len(chains)} consecutive chain(s) x {len(subtype_pairs)} sub-categorie(s). "
           f"This makes many public API calls; please be patient.\n")
 
     def span_desc(chn: List[Dict[str, Any]], i: int, j: int) -> str:
@@ -825,7 +843,7 @@ def main() -> None:
 
     found_any = False
     for chain in chains:
-        for sub in subtypes:
+        for stype, sub in subtype_pairs:
             print(f"  ...checking {len(chain)} sailings from {_dash(chain[0]['sailDate'])} "
                   f"[{stype}/{sub}{'/'+category if category else ''}]", file=sys.stderr)
             # enumerate open cabins per leg (empty list where sold out), filtered by category
@@ -858,7 +876,7 @@ def main() -> None:
             best_same = (s_spans[0][2] - s_spans[0][1] + 1) if s_spans else 0
 
             print(f"{BLUE}{'='*70}{RESET}")
-            print(f"{BLUE}{ship} {stype}/{sub}{RESET} - {sub_name.get(sub, '')}  "
+            print(f"{BLUE}{ship} {stype}/{sub}{RESET} - {sub_name.get((stype, sub), '')}  "
                   f"{chain[0].get('voyageDescription','')}")
             limit = args.limit or len(s_spans)
             more = len(s_spans) - limit
@@ -869,7 +887,7 @@ def main() -> None:
                 q = cab_q.get(cabin)
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
                 hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
-                conn_tag = f" {MAGENTA}[connecting]{RESET}" if sub in connecting_codes else ""
+                conn_tag = f" {MAGENTA}[connecting]{RESET}" if (stype, sub) in connecting_pairs else ""
                 total = span_total(cabin, i, j)
                 total_tag = f"  {total} total" if total else ""
                 print(f"  {GREEN}Same cabin {cabin}{RESET} (cat {cab_cat.get(cabin,'?')}"
