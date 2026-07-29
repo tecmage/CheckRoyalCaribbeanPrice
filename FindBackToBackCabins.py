@@ -9,9 +9,10 @@ date), checks your category's availability on every leg, and ranks the results:
     2. CLOSE cabins                        (same deck, near each other per leg)
     3. Category available on each leg      (you may have to switch cabins)
 
-You can filter to a port or starboard preference (derived from cabin-number
-parity - see the note printed at run time). Everything here is the public
-booking funnel: no login required.
+You can filter to a port or starboard preference (Royal ships separate sides by
+a low/high room-number split, Celebrity by odd/even parity - both measured from
+the fleet's deck-plan geometry; see the note printed at run time). Everything
+here is the public booking funnel: no login required.
 
     python FindBackToBackCabins.py                 # fully interactive
     python FindBackToBackCabins.py --ship IC --type BALCONY --sub D --side port
@@ -322,16 +323,29 @@ def get_open_cabins(pkg: str, sail: str, ship: str, brand: str, stype: str, subt
 ##################################
 # Port / starboard + ranking
 ##################################
-# Room number below this (within a deck) is port on ships that number both sides even
-# (Quantum-class): lower rooms = port, higher = starboard.
-PORT_STARBOARD_SPLIT = 500
+# Which rule tells port from starboard? Measured against official deck-plan SVG
+# geometry across the fleet (July 2026): EVERY Royal Caribbean ship separates sides
+# by a low/high room-number split (odd/even parity scored ~50% = a coin flip on all
+# 31 Royal ships), while Celebrity ships use odd/even parity (0.85-1.0 agreement).
+# Per-ship split points below were measured from the deck plans (kept only where the
+# classification scored >= 0.8); unmeasured ships fall back to 500. Lower = port was
+# validated on Ovation; parity orientation on Celebrity defaults to odd = port -
+# check a deck plan and use --flip-sides if a ship reads reversed.
+SIDE_SPLIT_DEFAULT = 500
+SIDE_SPLIT = {
+    "AD": 515, "AL": 328, "AN": 528, "BR": 500, "EX": 514, "FR": 513, "HE": 400,
+    "HM": 328, "IC": 465, "ID": 501, "JW": 500, "LB": 508, "LE": 360, "MA": 515,
+    "OA": 506, "OV": 318, "OY": 502, "QN": 322, "RD": 500, "SC": 322, "SR": 500,
+    "ST": 402, "SY": 400, "UT": 512, "VY": 514, "WN": 522,
+}
 
 
-def side_of(cabin: str, flip: bool, by_number: bool = False) -> str:
-    """Port/starboard from the room number: parity (odd=port) on mixed-parity ships, or
-    low/high room number (lower=port) on ships numbered even on both sides (Quantum-class)."""
+def side_of(cabin: str, flip: bool, by_number: bool = False,
+            split: int = SIDE_SPLIT_DEFAULT) -> str:
+    """Port/starboard from the room number: low/high split on Royal ships,
+    odd/even parity on Celebrity ships."""
     if by_number:
-        port = int(str(cabin)[-3:]) < PORT_STARBOARD_SPLIT
+        port = int(str(cabin)[-3:]) < split
     else:
         port = int(str(cabin)[-1]) % 2 == 1
     if flip:
@@ -340,10 +354,10 @@ def side_of(cabin: str, flip: bool, by_number: bool = False) -> str:
 
 
 def filter_side(cabins: List[Dict[str, Any]], side: Optional[str], flip: bool,
-                by_number: bool = False) -> List[Dict[str, Any]]:
+                by_number: bool = False, split: int = SIDE_SPLIT_DEFAULT) -> List[Dict[str, Any]]:
     if not side:
         return cabins
-    return [c for c in cabins if side_of(c["cabin"], flip, by_number) == side]
+    return [c for c in cabins if side_of(c["cabin"], flip, by_number, split) == side]
 
 
 # Quantum-class ship codes (Quantum, Anthem, Ovation, Odyssey, Spectrum).
@@ -648,32 +662,23 @@ def main() -> None:
         print(f"\n{CYAN}Side preference?{RESET}")
         side = choose("Side", [("", "No preference"), ("port", "Port"), ("starboard", "Starboard")]) or None
 
-    show_side = False   # only label sides when a side filter is active
-    by_number = False   # False = odd/even parity; True = low/high room number (Quantum-class)
+    # Side rule is brand-determined (measured fleet-wide against deck-plan geometry):
+    # Royal = low/high room-number split, Celebrity = odd/even parity.
+    by_number = args.brand == "R"
+    split_val = SIDE_SPLIT.get(ship.upper(), SIDE_SPLIT_DEFAULT)
+    show_side = bool(side)
     if side:
-        # Decide which side rule fits this ship: parity works only when both parities are
-        # present. Quantum-class (Ovation, Anthem, Odyssey, Quantum, Spectrum) numbers cabins
-        # even on BOTH sides, so we fall back to the room-number rule (lower = port).
-        probe_leg = chains[0][len(chains[0]) // 2]
-        probe = []
-        for sub in subtypes[:2]:
-            probe += get_open_cabins(ship + probe_leg["voyageCode"], probe_leg["sailDate"], ship,
-                                     args.brand, stype, sub, args.adults, args.children,
-                                     only_decks=deck_pref)
-        probe = [c for c in probe if category is None or (c.get("category") or "").upper() == category]
-        odd = sum(1 for c in probe if int(c["cabin"][-1]) % 2 == 1)
-        show_side = True
-        by_number = bool(probe) and odd in (0, len(probe))
         if by_number:
-            print(f"\n{YELLOW}Note:{RESET} this ship numbers cabins even on both sides, so "
-                  f"port/starboard comes from the room number: "
+            print(f"\n{YELLOW}Note:{RESET} Royal ships separate sides by room number: "
                   f"{'lower=port, higher=starboard' if not args.flip_sides else 'lower=starboard, higher=port'} "
-                  f"(split at {PORT_STARBOARD_SPLIT}). Re-run with --flip-sides if reversed.")
+                  f"(split at {split_val} on {ship}, measured from its deck plans). "
+                  f"Re-run with --flip-sides if reversed.")
         else:
-            print(f"\n{YELLOW}Note:{RESET} side is derived from cabin-number parity "
+            print(f"\n{YELLOW}Note:{RESET} Celebrity ships separate sides by parity "
                   f"(odd={'port' if not args.flip_sides else 'starboard'}, "
-                  f"even={'starboard' if not args.flip_sides else 'port'}). Usual Royal "
-                  f"convention but can vary by ship - re-run with --flip-sides if reversed.")
+                  f"even={'starboard' if not args.flip_sides else 'port'}). Which parity is "
+                  f"which side is unverified - check a deck plan and re-run with "
+                  f"--flip-sides if reversed.")
 
     def keep_cabin(c: Dict[str, Any]) -> bool:
         if category is not None and (c.get("category") or "").upper() != category:
@@ -693,7 +698,7 @@ def main() -> None:
                         get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship, args.brand,
                                         stype, sub, args.adults, args.children,
                                         only_decks=deck_pref),
-                        side, args.flip_sides, by_number) if keep_cabin(c)]
+                        side, args.flip_sides, by_number, split_val) if keep_cabin(c)]
             if not cabs:
                 continue
             found_any = True
@@ -711,7 +716,7 @@ def main() -> None:
                 for c in deck_cabs:
                     if shown >= limit:
                         break
-                    side_tag = f", {side_of(c['cabin'], args.flip_sides, by_number)}" if show_side else ""
+                    side_tag = f", {side_of(c['cabin'], args.flip_sides, by_number, split_val)}" if show_side else ""
                     q = cabin_quality(ship, c["deck"], c["position"])
                     tags = (f" {QUALITY_TAG[q]}" if q else "")
                     tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"]) else ""
@@ -747,7 +752,7 @@ def main() -> None:
                 [c for c in filter_side(get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship,
                                                         args.brand, stype, sub, args.adults,
                                                         args.children, only_decks=deck_pref),
-                                        side, args.flip_sides, by_number)
+                                        side, args.flip_sides, by_number, split_val)
                  if keep_cabin(c)]
                 for v in chain]
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
@@ -778,7 +783,7 @@ def main() -> None:
             print(f"  {len(s_spans)} same-cabin option(s)"
                   + (f" (showing first {limit})" if more > 0 else "") + ":")
             for cabin, i, j in s_spans[:limit]:
-                side_tag = f", {side_of(cabin, args.flip_sides, by_number)}" if show_side else ""
+                side_tag = f", {side_of(cabin, args.flip_sides, by_number, split_val)}" if show_side else ""
                 q = cab_q.get(cabin)
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
                 hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
