@@ -299,7 +299,11 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     paid = ledger["gross"]
     log(f"  You pay (gross): {money(paid)}   original fare {money(ledger['original_fare'])} "
         f"- discounts {money(abs(ledger['discount'] or 0))} + taxes/fees {money(ledger['taxes'])}")
-    if ledger["deposit_type"] == "NRD":
+    if ledger["is_casino"]:
+        # The promo item's refundability field describes the promo, not the deposit -
+        # Club Royale's own terms govern casino-rate deposits and changes
+        log(f"  Fare: {YELLOW}casino rate{RESET} (Club Royale terms govern deposit/changes)")
+    elif ledger["deposit_type"] == "NRD":
         log(f"  Fare: {YELLOW}non-refundable deposit (NRD){RESET}")
     elif ledger["deposit_type"] == "REFUNDABLE":
         log(f"  Fare: refundable deposit")
@@ -393,19 +397,23 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     if ledger["is_casino"]:
         log(f"  {YELLOW}Note: casino-rate booking - a straight repricing (dl-paid) would forfeit "
             f"the comp. Prior CASINO UPGRD charges on this account billed ~the category "
-            f"difference, so dl-rate is the better estimate; confirm with the casino desk.{RESET}")
+            f"difference, so dl-rate is the better estimate; confirm with the casino desk. "
+            f"Club Royale terms: changes or cancellations can forfeit the offer; cancelling "
+            f"within 7 days of sailing or no-showing carries a $200/stateroom charge and can "
+            f"suspend future offers.{RESET}")
 
     # Deposit-policy notes (Royal's published NRD rules): category changes - up OR down -
     # on the SAME ship and sail date carry no change fee and keep the deposit; the $100pp
     # fee is only for ship/sail-date changes; cancelling forfeits the deposit; and NRD
     # reprices must stay on a non-refundable fare.
     quotes_nrd = any(r.get("refundability") == "DEPOSIT_NOT_REFUNDABLE" for r in rows)
-    if ledger["deposit_type"] == "NRD":
+    if ledger["deposit_type"] == "NRD" and not ledger["is_casino"]:
         log(f"  {YELLOW}NRD fare notes:{RESET} category changes on this same ship/sail date "
             f"(including downgrades) have no change fee and keep your deposit. Reprices must "
             f"stay on a non-refundable fare{' (the prices above are NRD rates)' if quotes_nrd else ''}. "
             f"Changing ship or sail date costs $100/person; cancelling forfeits the deposit.")
-    elif ledger["deposit_type"] == "REFUNDABLE" and quotes_nrd:
+    elif (ledger["deposit_type"] == "REFUNDABLE" and quotes_nrd
+          and not ledger["is_casino"]):
         log(f"  Note: the prices above are non-refundable-deposit rates - matching one may "
             f"require switching this refundable booking to NRD (allowed before final "
             f"payment; the switch is one-way).")
