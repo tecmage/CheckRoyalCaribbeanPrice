@@ -80,6 +80,14 @@ from the ledger's discount itemization and flagged. On those, a straight web rep
 (dl-paid) would forfeit the comp – the casino desk generally bills ~the category
 difference, so **dl-rate is the number to use there** (confirm with the desk).
 
+Fare-deposit awareness: the fare's deposit type (refundable vs non-refundable "NRD")
+is read from the ledger and shown per booking. NRD bookings get Royal's published
+rules inline: category changes (up or down) on the same ship/sail date carry no
+change fee and keep the deposit; reprices must stay on a non-refundable fare (the
+quoted prices are NRD rates); ship/sail-date changes cost $100/person; cancelling
+forfeits the deposit. Refundable bookings are warned that the quoted prices are NRD
+rates - matching one may mean a one-way switch to NRD.
+
 Apprise alerts: `--alert-below N` (or `upgradeAlertBelow: N` in `config.yaml`, handy
 for cron) sends one notification per run listing every upgrade – a higher class, or a
 pricier category within your class – whose category-difference cost is at or below N.

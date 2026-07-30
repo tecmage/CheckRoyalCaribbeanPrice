@@ -125,12 +125,24 @@ def read_ledger(account, booking: Dict[str, Any]) -> Dict[str, Any]:
         return rec.get("amount") if rec else None
 
     casino_items, promo_items = [], []
+    refundabilities = set()
     for code in ("DISCOUNT", "OPTIONS"):
         for item in (by_code.get(code, {}).get("priceItems") or []):
             desc = item.get("description") or ""
             entry = {"code": item.get("code"), "desc": desc,
                      "amount": item.get("amount"), "promo": item.get("promoCd")}
             (casino_items if CASINO_MARKER.search(desc) else promo_items).append(entry)
+            if item.get("refundability"):
+                refundabilities.add(item["refundability"])
+
+    # Fare deposit type: the DISCOUNT items carry the fare's refundability
+    # (DEPOSIT_NOT_REFUNDABLE = the 'NRD' fares, REFUNDABLE = refundable deposit)
+    if "DEPOSIT_NOT_REFUNDABLE" in refundabilities:
+        deposit_type = "NRD"
+    elif "REFUNDABLE" in refundabilities:
+        deposit_type = "REFUNDABLE"
+    else:
+        deposit_type = None
 
     return {
         "gross": amt("GROSS_TOTALS"),
@@ -140,6 +152,7 @@ def read_ledger(account, booking: Dict[str, Any]) -> Dict[str, Any]:
         "taxes": amt("TAXES_AND_FEES"),
         "payments_applied": amt("PAYMENTS_APPLIED"),
         "balance_due": amt("BALANCE_DUE"),
+        "deposit_type": deposit_type,
         "casino_items": casino_items,
         "promo_items": [i for i in promo_items if i.get("amount")],
         "is_casino": bool(casino_items),
@@ -199,6 +212,7 @@ def get_sailing_inventory(account, booking: Dict[str, Any], loyalty: Optional[st
                 "guarantee": bool(s.get("guarantee")),
                 "connecting": "connect" in (s.get("name") or "").lower(),
                 "total": float(total) if isinstance(total, (int, float)) else None,
+                "refundability": (s.get("pricing") or {}).get("refundability"),
             })
     return out
 
@@ -285,6 +299,10 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     paid = ledger["gross"]
     log(f"  You pay (gross): {money(paid)}   original fare {money(ledger['original_fare'])} "
         f"- discounts {money(abs(ledger['discount'] or 0))} + taxes/fees {money(ledger['taxes'])}")
+    if ledger["deposit_type"] == "NRD":
+        log(f"  Fare: {YELLOW}non-refundable deposit (NRD){RESET}")
+    elif ledger["deposit_type"] == "REFUNDABLE":
+        log(f"  Fare: refundable deposit")
     if ledger["balance_due"]:
         log(f"  {YELLOW}Payments applied {money(ledger['payments_applied'])}; "
             f"balance due {money(ledger['balance_due'])}{RESET}")
@@ -376,6 +394,21 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         log(f"  {YELLOW}Note: casino-rate booking - a straight repricing (dl-paid) would forfeit "
             f"the comp. Prior CASINO UPGRD charges on this account billed ~the category "
             f"difference, so dl-rate is the better estimate; confirm with the casino desk.{RESET}")
+
+    # Deposit-policy notes (Royal's published NRD rules): category changes - up OR down -
+    # on the SAME ship and sail date carry no change fee and keep the deposit; the $100pp
+    # fee is only for ship/sail-date changes; cancelling forfeits the deposit; and NRD
+    # reprices must stay on a non-refundable fare.
+    quotes_nrd = any(r.get("refundability") == "DEPOSIT_NOT_REFUNDABLE" for r in rows)
+    if ledger["deposit_type"] == "NRD":
+        log(f"  {YELLOW}NRD fare notes:{RESET} category changes on this same ship/sail date "
+            f"(including downgrades) have no change fee and keep your deposit. Reprices must "
+            f"stay on a non-refundable fare{' (the prices above are NRD rates)' if quotes_nrd else ''}. "
+            f"Changing ship or sail date costs $100/person; cancelling forfeits the deposit.")
+    elif ledger["deposit_type"] == "REFUNDABLE" and quotes_nrd:
+        log(f"  Note: the prices above are non-refundable-deposit rates - matching one may "
+            f"require switching this refundable booking to NRD (allowed before final "
+            f"payment; the switch is one-way).")
     return hits
 
 
