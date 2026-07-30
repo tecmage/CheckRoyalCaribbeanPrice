@@ -428,7 +428,7 @@ def main() -> None:
     parser.add_argument("-c", "--config", type=str, default="config.yaml",
                         help="Path to configuration YAML file (default: config.yaml)")
     parser.add_argument("--reservation", type=str,
-                        help="Only this reservation/booking id")
+                        help="Only these reservation/booking ids (comma-separated)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Max categories listed per booking (0 = all)")
     parser.add_argument("--alert-below", type=float, default=None,
@@ -444,9 +444,12 @@ def main() -> None:
     apobj = build_apprise(data) if alert_below is not None else None
     bookings = fetch_bookings(account)
     if args.reservation:
-        bookings = [b for b in bookings if str(b.get("bookingId")) == str(args.reservation)]
+        wanted = {r.strip() for r in str(args.reservation).split(",") if r.strip()}
+        bookings = [b for b in bookings if str(b.get("bookingId")) in wanted]
+        missing = wanted - {str(b.get("bookingId")) for b in bookings}
+        if missing:
+            log(f"{YELLOW}Not found on this account: {', '.join(sorted(missing))}{RESET}")
         if not bookings:
-            log(f"{RED}No booking {args.reservation} on this account.{RESET}")
             return
     log(f"\n{len(bookings)} booking(s) to check.")
 
