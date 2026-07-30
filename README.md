@@ -514,6 +514,14 @@ If you have their username/password, you can add it to the list of accounts in t
 - [CruiseSpotlight Price Lookup](https://cruisespotlight.com/royal-caribbean-cruise-planner-price-lookup/) – public price lookup for any cruise  
 - `BrowseRoyalCaribbeanPrice.py` – included here for fun; lets you explore public prices with one script  
 
+## Fork-Only Tools
+
+This fork carries extra standalone scripts – see [FORK-TOOLS.md](FORK-TOOLS.md):
+
+- `FindBackToBackCabins.py` – find cabins you can keep across consecutive sailings (back-to-back), or list a sailing's open cabins with prices; port/starboard, deck, category, hump and quality filters. No account needed.
+- `CheckRoyalCaribbeanUpgrades.py` – what upgrading each booked cruise would cost (two deltas: vs what you paid, and vs your category's current rate), with Club Royale casino-rate detection and optional Apprise alerts.
+- `CheckRoyalCaribbeanCasinoOffers.py` – track Club Royale casino offers and their reserve-by deadlines.
+
 ## Credits
 
 Thanks to contributors:
