@@ -20,6 +20,11 @@ billed roughly the category difference, so lean on dl-rate there.
 
     python3.12 CheckRoyalCaribbeanUpgrades.py -c config.yaml
     python3.12 CheckRoyalCaribbeanUpgrades.py -c config.yaml --reservation 1234567
+    python3.12 CheckRoyalCaribbeanUpgrades.py -c config.yaml --alert-below 100
+
+--alert-below N (or upgradeAlertBelow: N in config.yaml) sends one Apprise
+notification per run listing every upgrade - a higher class, or a pricier
+category within your class - whose category-difference cost is at or below N.
 """
 from __future__ import annotations
 
@@ -70,7 +75,27 @@ def build_account(config_path: str):
     account.access = crccl.login(account)
     state, loyalty, _points = crccl.get_profile(account)
     account.access.loyalty_number = loyalty
-    return account, state, loyalty
+    return account, state, loyalty, data
+
+
+def build_apprise(data: Dict[str, Any]):
+    """Apprise notifier from any apprise URLs in the configuration (or None)."""
+    urls = [i["url"] for i in data.get("apprise", []) if isinstance(i, dict) and "url" in i]
+    if not urls:
+        return None
+    try:
+        from apprise import Apprise
+    except ImportError:
+        log_warn("apprise not installed; console output only")
+        return None
+    apobj = Apprise()
+    for url in urls:
+        apobj.add(url)
+    return apobj
+
+
+# Class ladder used to decide what counts as an UPGRADE for alerting
+TYPE_RANK = {"INTERIOR": 0, "OUTSIDE": 1, "BALCONY": 2, "CONCIERGE": 3, "AQUA": 3, "DELUXE": 4}
 
 
 def fetch_bookings(account) -> List[Dict[str, Any]]:
@@ -242,7 +267,8 @@ def delta(v: Optional[float], width: int = 12) -> str:
 
 
 def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
-                   state: Optional[str], limit: int) -> None:
+                   state: Optional[str], limit: int,
+                   alert_below: Optional[float] = None) -> List[str]:
     bid = booking.get("bookingId")
     guests = booking.get("passengersInStateroom") or []
     booked_cat = next((g.get("stateroomCategoryCode") for g in guests
@@ -272,7 +298,7 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     if not inventory:
         log(f"  {YELLOW}No categories currently for sale on this sailing "
             f"(sold out or too close to departure) - cannot price upgrades.{RESET}")
-        return
+        return []
 
     # Per-category prices for the booked subtype (booked category may not be its lead-in)
     booked_now: Optional[float] = None
@@ -305,7 +331,7 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     rows.sort(key=lambda r: r["total"])
     if not rows:
         log(f"  {YELLOW}No priced categories returned for this sailing.{RESET}")
-        return
+        return []
 
     log(f"\n  Current prices for {max(1, len(guests))} guest(s), loyalty applied "
         f"(all-in, taxes included):")
@@ -313,22 +339,44 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     log(header)
     log("    " + "-" * (len(header) - 4))
     shown = 0
+    booked_rank = TYPE_RANK.get(next((x["type"] for x in rows if x["category"] == booked_cat),
+                                     ""), -1)
+    hits: List[str] = []
     for r in rows:
-        if limit and shown >= limit:
-            log(f"    ... and {len(rows) - shown} more (use --limit 0 to show all)")
-            break
-        mark = "*" if (r["category"] == booked_cat or
-                       (booked_now is None and r["subtype"] == booked_sub)) else " "
         d_paid = (r["total"] - paid) if isinstance(paid, (int, float)) else None
         d_rate = (r["total"] - booked_now) if isinstance(booked_now, (int, float)) else None
-        log(f"    {mark} {str(r['category'] or r['subtype']):5} {str(r['type']):8} "
-            f"{money(r['total']):>12} {delta(d_paid)} {delta(d_rate)}  {r['name']}")
-        shown += 1
+
+        if not limit or shown < limit:
+            mark = "*" if (r["category"] == booked_cat or
+                           (booked_now is None and r["subtype"] == booked_sub)) else " "
+            log(f"    {mark} {str(r['category'] or r['subtype']):5} {str(r['type']):8} "
+                f"{money(r['total']):>12} {delta(d_paid)} {delta(d_rate)}  {r['name']}")
+            shown += 1
+
+        # Alerting scans EVERY row regardless of the display --limit: a HIGHER-class
+        # category whose category-difference cost (dl-rate, falling back to dl-paid
+        # when the booked category isn't priced) is at or below the threshold
+        if alert_below is not None and r["category"] != booked_cat:
+            basis = d_rate if d_rate is not None else d_paid
+            # An upgrade is a higher CLASS, or a pricier category within the same class
+            # (e.g. Balcony 2D -> Spacious Balcony 4B)
+            rank = TYPE_RANK.get(r["type"], -1)
+            is_upgrade = (rank > booked_rank
+                          or (rank == booked_rank and isinstance(booked_now, (int, float))
+                              and r["total"] > booked_now))
+            if basis is not None and basis <= alert_below and is_upgrade:
+                hits.append(f"{booking.get('shipCode')} {sail_disp} #{bid}: "
+                            f"{booked_cat} -> {r['category']} {r['name']} "
+                            f"for {'+' if basis > 0 else ''}${basis:,.2f} "
+                            f"(now ${r['total']:,.2f})")
+    if limit and len(rows) > limit:
+        log(f"    ... and {len(rows) - limit} more (use --limit 0 to show all)")
 
     if ledger["is_casino"]:
         log(f"  {YELLOW}Note: casino-rate booking - a straight repricing (dl-paid) would forfeit "
             f"the comp. Prior CASINO UPGRD charges on this account billed ~the category "
             f"difference, so dl-rate is the better estimate; confirm with the casino desk.{RESET}")
+    return hits
 
 
 ##################################
@@ -342,9 +390,17 @@ def main() -> None:
                         help="Only this reservation/booking id")
     parser.add_argument("--limit", type=int, default=0,
                         help="Max categories listed per booking (0 = all)")
+    parser.add_argument("--alert-below", type=float, default=None,
+                        help="Send an Apprise alert when a higher-class category's "
+                             "dl-rate is at or below this amount (also settable as "
+                             "upgradeAlertBelow in config.yaml)")
     args = parser.parse_args()
 
-    account, state, loyalty = build_account(args.config)
+    account, state, loyalty, data = build_account(args.config)
+    alert_below = args.alert_below
+    if alert_below is None and data.get("upgradeAlertBelow") is not None:
+        alert_below = float(data["upgradeAlertBelow"])
+    apobj = build_apprise(data) if alert_below is not None else None
     bookings = fetch_bookings(account)
     if args.reservation:
         bookings = [b for b in bookings if str(b.get("bookingId")) == str(args.reservation)]
@@ -353,12 +409,24 @@ def main() -> None:
             return
     log(f"\n{len(bookings)} booking(s) to check.")
 
+    all_hits: List[str] = []
     for booking in bookings:
         if not booking.get("sailDate") or not booking.get("amendToken"):
             log(f"\n{YELLOW}Skipping booking {booking.get('bookingId')} "
                 f"(no sail date or amend token).{RESET}")
             continue
-        report_booking(account, booking, loyalty, state, args.limit)
+        all_hits += report_booking(account, booking, loyalty, state, args.limit,
+                                   alert_below=alert_below)
+
+    if alert_below is not None:
+        if all_hits:
+            body = (f"{len(all_hits)} upgrade(s) at or below ${alert_below:,.2f} "
+                    f"(category-difference basis):\n" + "\n".join(f"- {h}" for h in all_hits))
+            log(f"\n{GREEN}{body}{RESET}")
+            if apobj is not None:
+                apobj.notify(body=body, title="Cruise Upgrade Opportunity")
+        else:
+            log(f"\n No upgrades at or below ${alert_below:,.2f}.")
 
     log(f"\n{GREEN}Done.{RESET} dl-paid = category total minus what you pay today; "
         f"dl-rate = minus your booked category at today's rate.")
