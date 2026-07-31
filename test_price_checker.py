@@ -2055,3 +2055,57 @@ def test_exact_price_match_includes_obc(monkeypatch):
     assert any("You have the best price of 2500.00" in log_line and "150.00 OBC" in log_line for log_line in captured_logs), \
         f"OBC tracking lost on exact match. Logs: {''.join(captured_logs)}"
 
+
+
+# ITEM 17: CHECK-IN / FINAL-PAYMENT TABLE - BALANCE-DUE TRI-STATE
+# A null/absent balanceDue must never render as "(paid)"; only an explicit
+# False may. Null with a positive balanceDueAmount is a balance due.
+
+def _run_payment_table(monkeypatch, row_overrides):
+    import CheckRoyalCaribbeanPrice as crccl
+    from datetime import date as _date
+    row = {
+        "name": "Mock Ship #1234",
+        "sail_date": "2027-03-15",
+        "checkin_label": "TBD",
+        "final_payment": _date(2026, 12, 15),
+        "past_final_payment": False,
+        "balance_due": None,
+        "balance_due_amount": None,
+    }
+    row.update(row_overrides)
+    monkeypatch.setattr(crccl, "checkin_payment_rows", [row])
+    captured = []
+    monkeypatch.setattr(crccl, "log", lambda msg: captured.append(msg))
+    crccl.print_checkin_payment_table()
+    return "".join(captured)
+
+
+def test_payment_table_explicit_false_is_paid(monkeypatch):
+    out = _run_payment_table(monkeypatch, {"balance_due": False})
+    assert "(paid)" in out
+
+
+def test_payment_table_true_shows_balance(monkeypatch):
+    out = _run_payment_table(monkeypatch, {"balance_due": True, "balance_due_amount": 512.34})
+    assert "balance due: 512.34" in out
+    assert "(paid)" not in out
+
+
+def test_payment_table_none_is_not_paid(monkeypatch):
+    # The reported bug: API returns balanceDue null -> row must not claim paid
+    out = _run_payment_table(monkeypatch, {"balance_due": None})
+    assert "(paid)" not in out
+    assert "status unknown" in out
+
+
+def test_derive_balance_due_states():
+    from CheckRoyalCaribbeanPrice import derive_balance_due
+    assert derive_balance_due({"balanceDue": True}) is True
+    assert derive_balance_due({"balanceDue": False}) is False
+    # null balanceDue: a numeric amount decides
+    assert derive_balance_due({"balanceDue": None, "balanceDueAmount": 250.0}) is True
+    assert derive_balance_due({"balanceDueAmount": 0}) is False
+    # nothing to go on -> unknown, never "paid"
+    assert derive_balance_due({"balanceDue": None, "balanceDueAmount": None}) is None
+    assert derive_balance_due({}) is None
