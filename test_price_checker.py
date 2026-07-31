@@ -2071,7 +2071,6 @@ def _run_payment_table(monkeypatch, row_overrides):
         "final_payment": _date(2026, 12, 15),
         "past_final_payment": False,
         "balance_due": None,
-        "balance_due_amount": None,
     }
     row.update(row_overrides)
     monkeypatch.setattr(crccl, "checkin_payment_rows", [row])
@@ -2087,9 +2086,10 @@ def test_payment_table_explicit_false_is_paid(monkeypatch):
 
 
 def test_payment_table_true_shows_balance(monkeypatch):
-    out = _run_payment_table(monkeypatch, {"balance_due": True, "balance_due_amount": 512.34})
-    assert "balance due: 512.34" in out
-    assert "(paid)" not in out
+    # No amount in the label - TA fees make the exact remaining payment uncertain
+    out = _run_payment_table(monkeypatch, {"balance_due": True})
+    assert "(balance due)" in out
+    assert "512" not in out and "(paid)" not in out
 
 
 def test_payment_table_none_is_not_paid(monkeypatch):

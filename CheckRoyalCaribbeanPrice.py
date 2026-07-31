@@ -1235,7 +1235,6 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
             "final_payment": final_payment_date,
             "past_final_payment": date.today() > final_payment_date,
             "balance_due": balance_due,
-            "balance_due_amount": balance_due_amount,
         })
 
         if balance_due is True:
@@ -3311,14 +3310,14 @@ def print_checkin_payment_table() -> None:
             # balance is now past the final payment deadline. "(paid)" is only shown
             # when the API explicitly said the balance is settled - a missing/null
             # balanceDue must not masquerade as paid in full.
+            # No amount in the label: with a travel agent involved the exact
+            # remaining payment is uncertain, so the table only flags the state.
             if r["balance_due"]:
-                amount = r.get("balance_due_amount")
-                owed = f": {amount:,.2f}" if isinstance(amount, (int, float)) else ""
                 if r["past_final_payment"]:
-                    pay += f" (PAST DUE{owed})"
+                    pay += " (PAST DUE)"
                     pay_colors.append(RED)
                 else:
-                    pay += f" (balance due{owed})"
+                    pay += " (balance due)"
                     pay_colors.append(YELLOW)
             elif r["balance_due"] is False:
                 pay += " (paid)"
