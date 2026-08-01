@@ -98,6 +98,36 @@ def build_apprise(data: Dict[str, Any]):
 TYPE_RANK = {"INTERIOR": 0, "OUTSIDE": 1, "BALCONY": 2, "CONCIERGE": 3, "AQUA": 3, "DELUXE": 4}
 
 
+# Within a class, price is the upgrade proxy - but these niche products price
+# above regular cabins without being better ones (a Studio is a smaller solo
+# cabin; obstructed/partial views are lesser variants). They are only screened
+# for SAME-class comparisons: as a class jump (interior -> studio balcony for a
+# solo guest) they are still genuine upgrades.
+LESSER_PRODUCT = re.compile(r"studio|obstruct|partial view", re.I)
+
+
+def is_upgrade_candidate(booked_rank: Optional[int], booked_now: Optional[float],
+                         row_rank: Optional[int], row_total: float,
+                         row_name: str = "") -> bool:
+    """
+    Whether an inventory row counts as an UPGRADE over the booked category:
+    a higher class, or - within the same class - a non-niche category pricing
+    above the booked category's current rate.
+
+    booked_rank None means the booked class could not be established (nothing
+    from the booked subtype is on sale). Never guess in that case: treating
+    "unknown" as "lowest" once alerted a balcony 1B booking to "upgrade" to an
+    interior 4U, because every class outranked the -1 fallback.
+    """
+    if booked_rank is None or row_rank is None:
+        return False
+    if row_rank > booked_rank:
+        return True
+    return (row_rank == booked_rank and isinstance(booked_now, (int, float))
+            and row_total > booked_now
+            and not LESSER_PRODUCT.search(row_name or ""))
+
+
 def fetch_bookings(account) -> List[Dict[str, Any]]:
     brand_code = "R" if account.is_royal else "C"
     url = f"https://aws-prd.api.rccl.com/v1/profileBookings/enriched/{account.access.id}"
@@ -105,7 +135,12 @@ def fetch_bookings(account) -> List[Dict[str, Any]]:
                                       params={"brand": brand_code, "includeCheckin": "true"})
     if resp is None:
         return []
-    return resp.json().get("payload", {}).get("profileBookings", [])
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    # (x or {}) at each hop: the API can return an explicit null payload
+    return ((data or {}).get("payload") or {}).get("profileBookings") or []
 
 
 ##################################
@@ -324,14 +359,12 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
 
     # Per-category prices for the booked subtype (booked category may not be its lead-in)
     booked_now: Optional[float] = None
+    booked_type: Optional[str] = None
     if booked_sub:
         booked_type = next((r["type"] for r in inventory if r["subtype"] == booked_sub), None)
         if booked_type:
             cat_prices = get_category_prices(account, booking, booked_sub, booked_type, loyalty)
             booked_now = cat_prices.get(booked_cat)
-            if booked_now is None and cat_prices:
-                # category itself sold out; note the subtype's cheapest sibling instead
-                booked_now = None
 
     if booked_now is not None:
         log(f"  Booked category {booked_cat} at today's rate: {money(booked_now)}  "
@@ -355,14 +388,21 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         log(f"  {YELLOW}No priced categories returned for this sailing.{RESET}")
         return []
 
-    log(f"\n  Current prices for {max(1, len(guests))} guest(s), loyalty applied "
+    loyalty_note = "loyalty applied" if loyalty else "loyalty UNAVAILABLE - rack rates"
+    log(f"\n  Current prices for {max(1, len(guests))} guest(s), {loyalty_note} "
         f"(all-in, taxes included):")
     header = f"    {'':1} {'cat':5} {'type':8} {'now':>12} {'dl-paid':>12} {'dl-rate':>12}  description"
     log(header)
     log("    " + "-" * (len(header) - 4))
     shown = 0
-    booked_rank = TYPE_RANK.get(next((x["type"] for x in rows if x["category"] == booked_cat),
-                                     ""), -1)
+    # The booked class comes from the booking's own subtype (resolved against
+    # inventory above), so it stays known even when the exact category is sold
+    # out; the rows scan is only a fallback. None = genuinely unknown.
+    if booked_type is None:
+        booked_type = next((x["type"] for x in rows if x["category"] == booked_cat), None)
+    booked_rank = TYPE_RANK.get(booked_type) if booked_type else None
+    if booked_rank is None and alert_below is not None:
+        log(f"  {YELLOW}Booked class unknown - upgrade alerts skipped for this booking.{RESET}")
     hits: List[str] = []
     for r in rows:
         d_paid = (r["total"] - paid) if isinstance(paid, (int, float)) else None
@@ -382,10 +422,9 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
             basis = d_rate if d_rate is not None else d_paid
             # An upgrade is a higher CLASS, or a pricier category within the same class
             # (e.g. Balcony 2D -> Spacious Balcony 4B)
-            rank = TYPE_RANK.get(r["type"], -1)
-            is_upgrade = (rank > booked_rank
-                          or (rank == booked_rank and isinstance(booked_now, (int, float))
-                              and r["total"] > booked_now))
+            is_upgrade = is_upgrade_candidate(booked_rank, booked_now,
+                                              TYPE_RANK.get(r["type"]), r["total"],
+                                              r.get("name") or "")
             if basis is not None and basis <= alert_below and is_upgrade:
                 hits.append(f"{booking.get('shipCode')} {sail_disp} #{bid}: "
                             f"{booked_cat} -> {r['category']} {r['name']} "
@@ -440,7 +479,12 @@ def main() -> None:
     account, state, loyalty, data = build_account(args.config)
     alert_below = args.alert_below
     if alert_below is None and data.get("upgradeAlertBelow") is not None:
-        alert_below = float(data["upgradeAlertBelow"])
+        try:
+            alert_below = float(data["upgradeAlertBelow"])
+        except (TypeError, ValueError):
+            log_warn(f"Ignoring invalid upgradeAlertBelow in config: "
+                     f"{data['upgradeAlertBelow']!r} (not a number)")
+            alert_below = None
     apobj = build_apprise(data) if alert_below is not None else None
     bookings = fetch_bookings(account)
     if args.reservation:

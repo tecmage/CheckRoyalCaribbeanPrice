@@ -1,2 +1,6 @@
 config.yaml
 __pycache__
+gui_settings.json
+reports/
+booking_raw_*.json
+output.txt

@@ -4,7 +4,7 @@ import sys
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -177,7 +177,7 @@ def build_account(data: Dict[str, Any]) -> crccl.AccountInfo:
 ##################################
 # Casino Offers API
 ##################################
-def fetch_casino_offers(account_info: crccl.AccountInfo) -> List[CasinoOffer]:
+def fetch_casino_offers(account_info: crccl.AccountInfo) -> Tuple[List[CasinoOffer], bool]:
     """
     Retrieves all active Club Royale offers for the account, following pagination.
 
@@ -185,7 +185,9 @@ def fetch_casino_offers(account_info: crccl.AccountInfo) -> List[CasinoOffer]:
         account_info (AccountInfo): A logged-in account with an active access session.
 
     Returns:
-        List[CasinoOffer]: The parsed active offers (empty on failure).
+        Tuple[List[CasinoOffer], bool]: The parsed active offers, and True when
+            every page was retrieved. False means a page failed mid-pagination,
+            so the list is only the pages fetched so far and may be incomplete.
     """
     token = account_info.access.token
     headers = {
@@ -216,24 +218,35 @@ def fetch_casino_offers(account_info: crccl.AccountInfo) -> List[CasinoOffer]:
             )
         except Exception as e:
             log(f"Can't contact cruise line servers; please try again later\n(program exception '{e}')")
-            return offers
+            return offers, False
 
         if response.status_code != 200:
-            log(f"{RED}Casino offers API returned HTTP {response.status_code}{RESET}")
-            return offers
+            log(f"{RED}Casino offers API returned HTTP {response.status_code} on page {page}{RESET}")
+            return offers, False
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            log_warn(f"Casino offers API returned a non-JSON body on page {page}; treating results as partial")
+            return offers, False
+
         offers.extend(CasinoOffer.from_api(o) for o in (payload.get("offers") or []))
-        total_pages = payload.get("totalPages", 1) or 1
+        # The API has returned totalPages as a string; coerce it, and fall back
+        # to a single page if the value is junk rather than crashing the loop.
+        try:
+            total_pages = int(payload.get("totalPages") or 1)
+        except (TypeError, ValueError):
+            total_pages = 1
         page += 1
 
-    return offers
+    return offers, True
 
 
 ##################################
 # Reporting
 ##################################
-def report_offers(offers: List[CasinoOffer], warn_days: int, apobj: Optional[Any]) -> None:
+def report_offers(offers: List[CasinoOffer], warn_days: int, apobj: Optional[Any],
+                  complete: bool = True) -> None:
     """
     Prints every offer and alerts on those whose reserve-by deadline is near.
 
@@ -246,12 +259,17 @@ def report_offers(offers: List[CasinoOffer], warn_days: int, apobj: Optional[Any
         offers (List[CasinoOffer]): The active offers to report.
         warn_days (int): Alert when an offer's reserve-by date is within this many days.
         apobj (Optional[Apprise]): Notifier for alerts, or None for console only.
+        complete (bool): False when pagination failed partway, so the offer list
+                         may be missing pages (which page failed is logged by
+                         fetch_casino_offers at failure time).
     """
+    partial_note = f"{YELLOW}(partial - a page failed, list may be incomplete){RESET}"
     if not offers:
-        log("No active casino offers found.")
+        log("No active casino offers found." + (f" {partial_note}" if not complete else ""))
         return
 
-    log(f"\n{BLUE}Club Royale offers: {len(offers)} active{RESET}")
+    log(f"\n{BLUE}Club Royale offers: {len(offers)} active{RESET}"
+        + (f" {partial_note}" if not complete else ""))
 
     alerts: List[tuple] = []
     for offer in offers:
@@ -310,8 +328,8 @@ def main() -> None:
 
     apobj = build_apprise(data)
     account_info = build_account(data)
-    offers = fetch_casino_offers(account_info)
-    report_offers(offers, args.warn_days, apobj)
+    offers, complete = fetch_casino_offers(account_info)
+    report_offers(offers, args.warn_days, apobj, complete)
 
 
 if __name__ == "__main__":

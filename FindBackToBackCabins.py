@@ -120,6 +120,24 @@ def _dash(sail: str) -> str:
     return f"{s[0:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 and s.isdigit() else s
 
 
+def _cabin_int(c) -> int:
+    """Cabin number as an int for sorting/geometry - strips any non-digits
+    ('1234A' -> 1234); junk with no digits at all sorts as 0."""
+    return int(re.sub(r"\D", "", str(c)) or 0)
+
+
+def _norm(d: Optional[str]) -> Optional[str]:
+    """Accept YYYY-MM-DD, YYYYMMDD, MM/DD/YYYY, M/D/YYYY, MM/DD/YY -> YYYYMMDD."""
+    if not d:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(d.strip(), fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    return None
+
+
 ##################################
 # Fleet + schedule
 ##################################
@@ -156,6 +174,7 @@ def get_voyages(ship_code: str) -> List[Dict[str, Any]]:
 
 def build_chains(voyages: List[Dict[str, Any]], min_len: int) -> List[List[Dict[str, Any]]]:
     """Group voyages into maximal runs where each leg's end date = the next leg's start date."""
+    min_len = max(1, min_len)   # 0/negative would emit an empty leading chain
     chains, run = [], []
     for v in voyages:
         if run and run[-1].get("sailEndDate") == v.get("sailDate"):
@@ -356,7 +375,7 @@ def side_of(cabin: str, flip: bool, by_number: bool = False,
     """Port/starboard from the room number: low/high split on Royal ships,
     odd/even parity on Celebrity ships."""
     if by_number:
-        port = int(str(cabin)[-3:]) < split
+        port = _cabin_int(str(cabin)[-3:]) < split
     else:
         port = int(str(cabin)[-1]) % 2 == 1
     if flip:
@@ -421,15 +440,32 @@ def is_hump(ship: str, cabin: str) -> bool:
 
 
 def closest_on_deck(leg_lists: List[List[int]]) -> Optional[Tuple[int, List[int]]]:
-    """Given one leg's cabins-on-a-deck per leg, find the pick with the smallest spread."""
-    if not all(leg_lists):
+    """Given one leg's cabins-on-a-deck per leg, find the pick (one cabin per leg) with
+    the smallest spread - the classic smallest-range-covering-K-lists sliding window."""
+    if not leg_lists or not all(leg_lists):
         return None
+    need = len(leg_lists)
+    events = sorted((c, k) for k, lst in enumerate(leg_lists) for c in lst)
+    counts: Counter = Counter()
+    covered = left = 0
     best = None
-    for anchor in leg_lists[0]:
-        pick = [anchor] + [min(lst, key=lambda x: abs(x - anchor)) for lst in leg_lists[1:]]
-        spread = max(pick) - min(pick)
-        if best is None or spread < best[0]:
-            best = (spread, pick)
+    for right, (c, _k) in enumerate(events):
+        if counts[_k] == 0:
+            covered += 1
+        counts[_k] += 1
+        while covered == need:
+            spread = c - events[left][0]
+            if best is None or spread < best[0]:
+                pick: List[Optional[int]] = [None] * need
+                for cc, kk in events[left:right + 1]:
+                    if pick[kk] is None:
+                        pick[kk] = cc
+                best = (spread, pick)  # type: ignore[assignment]
+            lc, lk = events[left]
+            counts[lk] -= 1
+            if counts[lk] == 0:
+                covered -= 1
+            left += 1
     return best
 
 
@@ -457,7 +493,7 @@ def same_cabin_spans(leg_cabins: List[List[Dict[str, Any]]], min_legs: int
     for cabin in set().union(*leg_sets) if leg_sets else set():
         for i, j in _maximal_spans([cabin in s for s in leg_sets], min_legs):
             out.append((cabin, i, j))
-    out.sort(key=lambda s: (-(s[2] - s[1] + 1), int(s[0])))
+    out.sort(key=lambda s: (-(s[2] - s[1] + 1), _cabin_int(s[0])))
     return out
 
 
@@ -469,7 +505,7 @@ def deck_close_spans(leg_cabins: List[List[Dict[str, Any]]], min_legs: int
     for dc in decks:
         present = [any(c["deck"] == dc for c in leg) for leg in leg_cabins]
         for i, j in _maximal_spans(present, min_legs):
-            leg_lists = [sorted(int(c["cabin"]) for c in leg_cabins[k] if c["deck"] == dc)
+            leg_lists = [sorted(_cabin_int(c["cabin"]) for c in leg_cabins[k] if c["deck"] == dc)
                          for k in range(i, j + 1)]
             res = closest_on_deck(leg_lists)
             if res:
@@ -494,6 +530,10 @@ def parse_decks(raw: Optional[str]) -> Optional[set]:
 
 def choose(prompt: str, options: List[Tuple[str, str]]) -> Optional[str]:
     """options: list of (value, label). Returns chosen value, or None to quit."""
+    if not sys.stdin.isatty():
+        print(f"{RED}{prompt} required in non-interactive mode - pass the matching flag "
+              f"(--ship/--type/--side).{RESET}", file=sys.stderr)
+        return None
     for i, (_, label) in enumerate(options):
         print(f"  {BLUE}{i}{RESET}) {label}")
     print(f"  {BLUE}q{RESET}) Quit")
@@ -567,18 +607,11 @@ def main() -> None:
     global DEBUG_PRICING
     DEBUG_PRICING = args.debug_pricing
 
-    def _norm(d: Optional[str]) -> Optional[str]:
-        """Accept YYYY-MM-DD, YYYYMMDD, MM/DD/YYYY, M/D/YYYY, MM/DD/YY -> YYYYMMDD."""
-        if not d:
-            return None
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
-            try:
-                return datetime.strptime(d.strip(), fmt).strftime("%Y%m%d")
-            except ValueError:
-                continue
-        return None
-
     after, before = _norm(args.after), _norm(args.before)
+    for raw, parsed in ((args.after, after), (args.before, before)):
+        if raw and parsed is None:
+            print(f"{RED}Unrecognized date '{raw}'{RESET}")
+            return
 
     # --- Ship (code or name fragment; brand auto-detected from the fleet list) ---
     fleet = get_fleet()
@@ -612,6 +645,12 @@ def main() -> None:
         ship = picked
         args.brand = next((s["brand"] for s in fleet if s["code"] == picked), args.brand)
 
+    # The deck-guide quality ratings and hump-cabin ranges are Quantum-class data only;
+    # on any other ship those flags would silently match nothing / filter nothing.
+    if (args.hide_avoid or args.hump_only) and ship.upper() not in QUANTUM_CLASS:
+        print(f"{YELLOW}Note: deck-guide/hump data only exists for Quantum-class ships; "
+              f"ignoring that flag here.{RESET}")
+        args.hide_avoid = args.hump_only = False
 
     voyages = get_voyages(ship)
     if not voyages:
@@ -622,6 +661,9 @@ def main() -> None:
     # either --saildate or one date with no comma at the prompt - selects that one
     # sailing and switches to a plain open-cabin listing instead of the B2B hunt.
     saildate = _norm(args.saildate)
+    if args.saildate and saildate is None:
+        print(f"{RED}Unrecognized date '{args.saildate}'{RESET}")
+        return
     if saildate is None and after is None and before is None and sys.stdin.isatty():
         raw = input(f"\n{CYAN}Limit to a date range?{RESET} start,end as YYYY-MM-DD, or ONE "
                     f"date to list a single sailing's open cabins "
@@ -647,11 +689,14 @@ def main() -> None:
         print(f"{RED}No sailings in that date range.{RESET}")
         return
 
-    single_mode = len(voyages) == 1
+    single_mode = bool(saildate) or len(voyages) == 1
+    if single_mode and not saildate:
+        print(f"{YELLOW}Only one sailing in range - listing its open cabins instead of "
+              f"hunting back-to-backs.{RESET}")
     if single_mode:
         v = voyages[0]
         chains = [[v]]
-        print(f"\n{ship}: single sailing {_dash(v['sailDate'])} ({v['duration']}n) "
+        print(f"\n{ship}: single sailing {_dash(v['sailDate'])} ({int(v.get('duration') or 0)}n) "
               f"{v.get('voyageDescription','')} - listing open cabins.")
     else:
         chains = build_chains(voyages, args.min_legs)
@@ -810,7 +855,7 @@ def main() -> None:
                 if shown >= limit:
                     break
                 deck_cabs = sorted((c for c in cabs if c["deck"] == deck),
-                                   key=lambda c: int(c["cabin"]))
+                                   key=lambda c: _cabin_int(c["cabin"]))
                 print(f"  Deck {deck}:")
                 for c in deck_cabs:
                     if shown >= limit:
@@ -838,7 +883,7 @@ def main() -> None:
         legs = chn[i:j + 1]
         start = _dash(legs[0]["sailDate"])
         end = _dash(legs[-1].get("sailEndDate") or legs[-1]["sailDate"])
-        nights = sum(int(v.get("duration", 0)) for v in legs)
+        nights = sum(int(v.get("duration") or 0) for v in legs)
         return f"{len(legs)} sailings  {start} -> {end}  ({nights} nights)"
 
     found_any = False
