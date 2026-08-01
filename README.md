@@ -521,6 +521,8 @@ This fork carries extra standalone scripts – see [FORK-TOOLS.md](FORK-TOOLS.md
 - `FindBackToBackCabins.py` – find cabins you can keep across consecutive sailings (back-to-back), or list a sailing's open cabins with prices; port/starboard, deck, category, hump and quality filters. No account needed.
 - `CheckRoyalCaribbeanUpgrades.py` – what upgrading each booked cruise would cost (two deltas: vs what you paid, and vs your category's current rate), with Club Royale casino-rate detection and optional Apprise alerts.
 - `CheckRoyalCaribbeanCasinoOffers.py` – track Club Royale casino offers and their reserve-by deadlines.
+- `CheckRoyalCaribbeanCruiseHistory.py` – past cruise history with roommate matching across household accounts, plus Crown & Anchor points/tier projections.
+- `CheckRoyalCaribbeanGui.py` – a desktop GUI wrapping all of the above (and the price checker/browser): one tab per config file, live colored output, ship/sailing dropdowns, HTML reports, run-all and repeat timers. `pyinstaller CheckRoyalCaribbeanGui.spec` builds a windowed exe.
 
 ## Credits
 

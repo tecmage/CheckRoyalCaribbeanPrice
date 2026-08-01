@@ -11,6 +11,10 @@ need `curl_cffi` (same as the main script) to get past the cruise line's edge se
   booked cruise would cost, casino-rate aware (uses your account)
 - [CheckRoyalCaribbeanCasinoOffers.py](#checkroyalcaribbeancasinoofferspy) – track Club
   Royale casino offers and their reserve-by deadlines (uses your account)
+- [CheckRoyalCaribbeanCruiseHistory.py](#checkroyalcaribbeancruisehistorypy) – past
+  cruise history, roommate matching across accounts, C&A tier progress (uses your account)
+- [CheckRoyalCaribbeanGui.py](#checkroyalcaribbeanguipy) – desktop GUI that wraps all of the scripts:
+  config tabs per account, live colored output, HTML reports
 
 ---
 
@@ -119,3 +123,56 @@ python CheckRoyalCaribbeanCasinoOffers.py -c config.yaml --warn-days 14
   is configured, sent as a notification
 
 Uses the first `accountInfo` entry in your config; stateless (no history file).
+
+---
+
+## CheckRoyalCaribbeanCruiseHistory.py
+
+Reports **past cruise history + who shared each stateroom**, plus Crown & Anchor
+progress. For every account in `accountInfo` it pulls the per-sailing loyalty ledger
+and upcoming bookings, then:
+
+```
+python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml
+python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --double-points 123456,789012
+```
+
+- Each person's past sailings: date, ship, nights, cabin, itinerary, points earned
+- Roommate matching on past sailings by joining multiple accounts' histories on
+  ship + sail date + cabin (the ledger only records the account holder)
+- Upcoming bookings with the roommates the API lists per stateroom
+- C&A points projection for booked cruises (suite/solo multipliers, crystal-block and
+  Diamond-Plus milestone math), with `--double-points` to mark bookings made during a
+  double-points promo (the API has no booking date, so you supply the IDs)
+
+Output is console-only (plus `logFile` if configured); nothing is written to disk.
+
+---
+
+## CheckRoyalCaribbeanGui.py
+
+A **desktop GUI (Tkinter, no extra dependencies)** that wraps all of the scripts in
+one dark-themed window:
+
+```
+python CheckRoyalCaribbeanGui.py
+```
+
+- **Bottom tabs, one per config file** (e.g. `config.yaml.alice`, `config.yaml.bob`):
+  the `+` tab adds one, right-click removes or opens it in your editor. Each tab keeps
+  its own output pane and its own saved form values for the account-based scripts;
+  ship-search settings are shared. Tabs show ▶ / ✓ / ✖ while running / after a run.
+- **Script picker + options form** generated per script (tooltips on every field).
+  Back-to-Back and the Cruise Planner Browser get live dropdowns: the fleet list
+  (brand-filtered, API placeholder ships removed) and, after picking a ship, its
+  actual sailing dates.
+- **Run / Refresh, Run All Tabs** (each config sequentially), **Stop**, repeat-every-N-hours
+  timer, and per-run **HTML reports** (Export button, or auto-export to `reports/`).
+- Output pane: ANSI colors rendered, smart autoscroll, Ctrl+F search, font zoom
+  (Ctrl +/−/wheel), right-click copy/export menu.
+- Scripts run as child processes, so the GUI never interferes with CLI/cron/Docker
+  usage. Settings persist in `gui_settings.json` (gitignored, next to the script/exe).
+
+**Windows exe**: `pyinstaller CheckRoyalCaribbeanGui.spec` (windowed; bundles the six scripts and
+runs them via the exe's internal `--run-script` dispatch). Unit tests for its helpers
+live in `test_gui_helpers.py`.
