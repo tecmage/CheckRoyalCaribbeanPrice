@@ -1632,7 +1632,7 @@ def get_cruise_price(account_info: AccountInfo,
         #       do we want to use this commented-out block instead
         if url_params.package_code and not automatic_URL:
             # Pre-filter rooms that actually have inventory available
-            # (key is 'rooms_left' as produced above; price may be None)
+            # (key is 'rooms_left' as produced by check_if_room_is_available; price may be None)
             valid_rooms = [
                 r for r in results.get("available_rooms", [])
                 if r.get('rooms_left') is not None and r.get('rooms_left') > 0
