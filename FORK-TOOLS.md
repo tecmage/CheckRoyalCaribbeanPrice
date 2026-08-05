@@ -1,7 +1,7 @@
 # Fork-Only Tools
 
 Extra standalone scripts that live on this fork (`tecmage/CheckRoyalCaribbeanPrice`,
-branch `aes-all-fixes`) alongside the main price checker. Each reuses the main
+branch `fork-tools`) alongside the main price checker. Each reuses the main
 script's login / logging / API plumbing where it needs an account, and all of them
 need `curl_cffi` (same as the main script) to get past the cruise line's edge servers.
 
@@ -54,6 +54,7 @@ Filters and tags:
 | `--hide-avoid`, `--hump-only` | Quantum-class extras: a deck-guide quality tag (`[recommended]`/`[caution]`/`[avoid]`) and the hump cabins (bigger balconies at the elevator banks, `[hump]`) |
 | `--connecting-permitted` | connecting staterooms are excluded by default; this re-includes them (tagged `[connecting]`) |
 | `--adults` / `--children`, `--min-legs`, `--limit` | occupancy, minimum chain length, output cap |
+| `--brand`, `--sub` | force `R`/`C` when not giving `--ship` (auto-detected otherwise); raw subtype code for power users (usually use `--category`) |
 
 All values are case-insensitive. Prices are the tax-inclusive party total at the public
 rate (current promos included, no loyalty/qualifier discounts). Guarantee categories
@@ -103,6 +104,7 @@ is display-only.
 
 Notes: uses the first `accountInfo` entry in your config. Sailings with no inventory
 for sale (sold out / too close to departure) are reported as such rather than priced.
+`--limit N` caps how many candidate categories are listed per booking (0 = all).
 
 ---
 
@@ -174,5 +176,7 @@ python CheckRoyalCaribbeanGui.py
   usage. Settings persist in `gui_settings.json` (gitignored, next to the script/exe).
 
 **Windows exe**: `pyinstaller CheckRoyalCaribbeanGui.spec` (windowed; bundles the six scripts and
-runs them via the exe's internal `--run-script` dispatch). Unit tests for its helpers
+runs them via the exe's internal `--run-script` dispatch). Because the scripts are bundled at
+build time, the exe keeps running its built-in copies until you rebuild it - run the `.py`
+directly if you want script changes picked up immediately. Unit tests for its helpers
 live in `test_gui_helpers.py`.
