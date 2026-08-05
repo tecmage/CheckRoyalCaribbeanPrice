@@ -105,6 +105,8 @@ is display-only.
 Notes: uses the first `accountInfo` entry in your config. Sailings with no inventory
 for sale (sold out / too close to departure) are reported as such rather than priced.
 `--limit N` caps how many candidate categories are listed per booking (0 = all).
+Each booking's header shows `Reservation #id (name)` using `reservationFriendlyNames`
+from your config, same as the main price checker.
 
 ---
 

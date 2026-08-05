@@ -199,3 +199,11 @@ def test_read_ledger_empty_prices(monkeypatch):
     assert ledger["is_casino"] is False
     assert ledger["deposit_type"] is None
     assert ledger["casino_items"] == [] and ledger["promo_items"] == []
+
+
+def test_reservation_header_uses_friendly_names(monkeypatch):
+    import CheckRoyalCaribbeanUpgrades as up
+    monkeypatch.setattr(up, "friendly_names", {"1234567": "Summer Cruise"})
+    assert up.reservation_header("1234567") == "Reservation #1234567 (Summer Cruise)"
+    # unnamed and non-string ids fall back to the bare number
+    assert up.reservation_header(7654321) == "Reservation #7654321"

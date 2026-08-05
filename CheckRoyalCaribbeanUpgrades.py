@@ -53,6 +53,9 @@ log = None
 log_warn = None
 log_err = None
 
+# reservationFriendlyNames from config.yaml, populated in build_account()
+friendly_names: Dict[str, str] = {}
+
 
 ##################################
 # Config & Authentication
@@ -62,8 +65,10 @@ def build_account(config_path: str):
     with open(config_path) as f:
         data = crccl.expand_env_vars(yaml.safe_load(f)) or {}
     crccl.setup_hybrid_logging(data.get("logFile"))
-    global log, log_warn, log_err
+    global log, log_warn, log_err, friendly_names
     log, log_warn, log_err = crccl.log, crccl.log_warn, crccl.log_err
+    friendly_names = {str(k): str(v)
+                      for k, v in (data.get("reservationFriendlyNames") or {}).items()}
 
     accounts = data.get("accountInfo") or []
     if not accounts:
@@ -300,6 +305,14 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
 ##################################
 # Reporting
 ##################################
+def reservation_header(bid: Any) -> str:
+    """'Reservation #id (friendly name)' - same header format as the main price checker."""
+    display = f"Reservation #{bid}"
+    if str(bid) in friendly_names:
+        display += f" ({friendly_names[str(bid)]})"
+    return display
+
+
 def money(v: Optional[float]) -> str:
     return f"${v:,.2f}" if isinstance(v, (int, float)) else "-"
 
@@ -327,7 +340,7 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     sail_disp = f"{sd[0:4]}-{sd[4:6]}-{sd[6:8]}" if len(sd) == 8 else sd
 
     log(f"\n{BLUE}{'=' * 72}{RESET}")
-    log(f"{BLUE}Reservation {bid}{RESET}  {booking.get('shipCode')} {sail_disp}  "
+    log(f"{BLUE}{reservation_header(bid)}{RESET}  {booking.get('shipCode')} {sail_disp}  "
         f"room {booking.get('stateroomNumber')}  cat {booked_cat}  {len(guests)} guest(s)")
 
     ledger = read_ledger(account, booking)
