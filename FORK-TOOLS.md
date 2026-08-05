@@ -150,6 +150,9 @@ python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --double-points 123456
   double-points promo (the API has no booking date, so you supply the IDs)
 
 Output is console-only (plus `logFile` if configured); nothing is written to disk.
+A 5-second cooldown is applied between account logins (same as the main script), and
+accounts that fail login or have no sailings are called out in the household/shared-room
+sections rather than silently shrinking them.
 
 ---
 

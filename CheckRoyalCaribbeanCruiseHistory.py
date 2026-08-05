@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -36,7 +37,9 @@ from CheckRoyalCaribbeanPrice import GREEN, YELLOW, BLUE, RESET
 SHIP_NAMES: Dict[str, str] = {}
 
 
-def load_accounts(config_path: str) -> List[Any]:
+def load_accounts(config_path: str) -> Tuple[List[Any], List[str]]:
+    """Log every account in. Returns (accounts, skipped) where skipped holds the
+    masked usernames that failed login, for the cross-account views to disclose."""
     with open(config_path) as f:
         data = crccl.expand_env_vars(yaml.safe_load(f)) or {}
     crccl.setup_hybrid_logging(data.get("logFile"))
@@ -47,7 +50,12 @@ def load_accounts(config_path: str) -> List[Any]:
         sys.exit(1)
 
     accounts = []
-    for a in entries:
+    skipped: List[str] = []
+    for i, a in enumerate(entries):
+        if i:
+            # Same courtesy pause the main price checker uses between accounts
+            crccl.log(f"Sleeping {crccl.ACCOUNT_COOLDOWN_SECONDS} seconds to allow API to cool down between accounts")
+            time.sleep(crccl.ACCOUNT_COOLDOWN_SECONDS)
         account = crccl.AccountInfo(username=a["username"], password=a["password"],
                                     cruise_line=a.get("cruiseLine", "royalcaribbean"))
         # login/get_profile call sys.exit on failure; one bad account must not
@@ -56,13 +64,15 @@ def load_accounts(config_path: str) -> List[Any]:
             account.access = crccl.login(account)
             _state, loyalty, points = crccl.get_profile(account)
         except SystemExit:
-            crccl.log(f"{YELLOW}skipping {a.get('username')}: login failed{RESET}")
+            label = mask_username(a.get("username") or "") or f"account {i + 1}"
+            crccl.log(f"{YELLOW}skipping {label}: login failed{RESET}")
+            skipped.append(label)
             continue
         accounts.append((account, loyalty, points))
     if not accounts:
         print("No accounts could log in.", file=sys.stderr)
         sys.exit(1)
-    return accounts
+    return accounts, skipped
 
 
 def api_get(account, url: str, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
@@ -98,14 +108,27 @@ def guest_name(guest: Dict[str, Any]) -> str:
     return " ".join(p for p in (first, last) if p) or "<unnamed>"
 
 
-def account_label(account, idx: int) -> str:
-    """Display label for section headers. Headers are persisted to logFile, so
-    mask the login email: local part + first letter of the domain (jo@g…)."""
-    name = account.username or ""
+def mask_username(name: str) -> str:
+    """Mask a login email for display: local part + first letter of the domain
+    (jo@g…). Output is persisted to logFile, so full logins must not leak."""
+    name = name or ""
     if "@" in name:
         local, domain = name.split("@", 1)
         name = f"{local}@{domain[:1]}…"
-    return name or f"account {idx + 1}"
+    return name
+
+
+def account_label(account, idx: int) -> str:
+    """Display label for section headers (masked login, or a positional fallback)."""
+    return mask_username(account.username) or f"account {idx + 1}"
+
+
+def missing_note(skipped: List[str], no_history: List[str]) -> Optional[str]:
+    """One-line disclosure of who is absent from the cross-account views, so a
+    shrunken household/shared-room join is never mistaken for the full picture."""
+    parts = [f"{n} - login failed" for n in skipped]
+    parts += [f"{n} - no sailings on record" for n in no_history]
+    return f"(not included: {'; '.join(parts)})" if parts else None
 
 
 ##################################
@@ -326,9 +349,12 @@ def show_sailings(sailings: List[Dict[str, Any]], earns_blocks: bool = True) -> 
                   f"{s.get('itineraryDescription') or ''}{block_txt}")
 
 
-def show_household(histories: List[Tuple[str, List[Dict[str, Any]]]]) -> None:
+def show_household(histories: List[Tuple[str, List[Dict[str, Any]]]],
+                   absent_note: Optional[str] = None) -> None:
     """Merged view across everyone's histories: together vs apart, per year."""
     crccl.log(f"\n{BLUE}=== Household combined view ==={RESET}")
+    if absent_note:
+        crccl.log(f"{YELLOW}{absent_note}{RESET}")
     sets: Dict[str, set] = {}
     key_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for label, sailings in histories:
@@ -591,9 +617,12 @@ def room_key(sailing: Dict[str, Any]) -> Tuple[str, str, str]:
             sailing.get("cabinNumber") or "?")
 
 
-def show_shared_rooms(histories: List[Tuple[str, List[Dict[str, Any]]]]) -> None:
+def show_shared_rooms(histories: List[Tuple[str, List[Dict[str, Any]]]],
+                      absent_note: Optional[str] = None) -> None:
     """Join everyone's history on ship+date+cabin to show who shared each room."""
     crccl.log(f"\n{BLUE}=== Who shared the room (matched across accounts) ==={RESET}")
+    if absent_note:
+        crccl.log(f"{YELLOW}{absent_note}{RESET}")
     rooms: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     occupants: Dict[Tuple[str, str, str], List[str]] = defaultdict(list)
     for label, sailings in histories:
@@ -661,7 +690,15 @@ def main() -> None:
     args = parser.parse_args()
     promo_ids = frozenset(i.strip() for i in args.double_points.split(",") if i.strip())
 
-    accounts = load_accounts(args.config)
+    accounts, skipped = load_accounts(args.config)
+    try:
+        _run_report(accounts, skipped, promo_ids)
+    finally:
+        for account, _loyalty, _points in accounts:
+            account.access.session.close()
+
+
+def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset) -> None:
     registry = crccl.ShipRegistry()
     try:
         crccl.get_ship_dictionary_web(registry)
@@ -699,9 +736,17 @@ def main() -> None:
             crccl.log("No past sailings returned.")
         per_account.append((account, points, sailings))
 
+    # Disclose anyone missing from the joins; with fewer than two usable
+    # histories, say why the household sections are absent instead of silence.
+    no_history = [account_label(acc, i)
+                  for i, (acc, _pts, sails) in enumerate(per_account) if not sails]
+    absent = missing_note(skipped, no_history)
     if len(histories) > 1:
-        show_shared_rooms(histories)
-        show_household(histories)
+        show_shared_rooms(histories, absent)
+        show_household(histories, absent)
+    elif len(per_account) + len(skipped) > 1:
+        crccl.log(f"\n{YELLOW}Household views skipped: only {len(histories)} account(s) "
+                  f"with history. {absent}{RESET}")
 
     # Upcoming bookings + roommates (per-booking data, first account's view)
     bookings = fetch_bookings(accounts[0][0], 0)
