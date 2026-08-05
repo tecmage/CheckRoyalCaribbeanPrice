@@ -36,6 +36,23 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 USER_AGENT_WEB = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0'
 APPKEY_WEB = 'hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm'
 
+# API timeout / retry behavior
+# Seconds before giving up on an API call so a stalled connection cannot hang the run
+# forever. Override with requestTimeout in config.yaml if the API is slow for you.
+REQUEST_TIMEOUT = 30
+# Shorter timeout for quick auxiliary endpoints (check-in status, loyalty summary,
+# sample-config download) where a long wait is not worth it
+SHORT_REQUEST_TIMEOUT = 10
+# How API failures are handled when a call site does not choose explicitly:
+# "retry" (back off and try again), "skip" (log and move on), "exit" (stop the run)
+DEFAULT_ON_FAILURE = "retry"
+# Retry attempts and exponential backoff base for on_failure="retry" calls
+# (sleep = RETRY_BACKOFF_BASE ** attempt seconds between attempts: 2s, 4s)
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2
+# Cool-down between accounts when checking more than one, to avoid hammering the API
+ACCOUNT_COOLDOWN_SECONDS = 5
+
 # ANSI color codes
 RESET = '\033[0m' # Resets color to default
 
@@ -456,7 +473,7 @@ class CruiseAppConfig:
     """
     # Global Settings
     date_display_format: Optional[str] = "%x"
-    request_timeout: int = 30
+    request_timeout: int = REQUEST_TIMEOUT
     log_file: Optional[str] = None
     apprise_urls: List[str] = field(default_factory=list)
     notify_on_error: bool = False
@@ -524,8 +541,8 @@ def _execute_api_request(
     data: Optional[Union[str, dict]] = None,
     headers: Optional[dict] = None,
     timeout: Optional[int] = None,
-    on_failure: str = "retry",
-    max_retries: int = 3
+    on_failure: str = DEFAULT_ON_FAILURE,
+    max_retries: int = MAX_RETRIES
 ) -> Optional[requests.Response]:
     """
     Unified API execution engine for all cruise line network interactions.
@@ -542,7 +559,7 @@ def _execute_api_request(
     # Resolve the effective timeout: an explicit caller override wins, then the
     # user-configured requestTimeout, then the 30-second baseline default
     if timeout is None:
-        timeout = config.request_timeout if config else 30
+        timeout = config.request_timeout if config else REQUEST_TIMEOUT
 
     # Start with any caller-specified override headers, or an empty base
     final_headers = headers.copy() if headers else {}
@@ -579,7 +596,7 @@ def _execute_api_request(
                 return response  # Success!
             except Exception as e:
                 if attempt < max_retries:
-                    backoff_time = 2 ** attempt
+                    backoff_time = RETRY_BACKOFF_BASE ** attempt
                     logging.warning(f"Attempt {attempt}/{max_retries} failed for {url}: {e}. Retrying in {backoff_time}s...")
                     time.sleep(backoff_time)
                 else:
@@ -926,7 +943,7 @@ def login(account_info: AccountInfo) -> APIAccess:
     # login cookie container and initial OAuth handshakes are preserved perfectly
     # without running into downstream fallback session side-effects.
     try:
-        response = session.post(f'https://www.{account_info.url_brand}.com/auth/oauth2/access_token', headers=headers, data=data, timeout=30)
+        response = session.post(f'https://www.{account_info.url_brand}.com/auth/oauth2/access_token', headers=headers, data=data, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         log(f"Can't contact cruise line servers; please try again later\n(program exception '{e}')")
         sys.exit(1)
@@ -1051,7 +1068,7 @@ def get_checkin_info(account_info: AccountInfo,
         (the check-in opening moment, or None when there is nothing dated to show).
     """
     url = f'https://aws-prd.api.rccl.com/en/{account_info.api_brand}/web/v3/ships/voyages/{ship_code}{sail_date}/enriched'
-    response = _execute_api_request(account_info, "GET", url, timeout=10)
+    response = _execute_api_request(account_info, "GET", url, timeout=SHORT_REQUEST_TIMEOUT)
     if response is None:
         return "", None
     payload = response.json().get("payload")
@@ -1167,7 +1184,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         reservation_display = f"Reservation #{reservation_ID}"
         if str(reservation_ID) in reservation_friendly_names:
             reservation_display += f" ({reservation_friendly_names.get(str(reservation_ID))})"
-        log(f"\n{reservation_display}")
+        log(f"\n{BLUE}{reservation_display}{RESET}")
 
         log(f"{config.format_date(sail_date)} {ship_dictionary.get_ship(ship_code)} Room {stateroom_number} (In this cabin: {metrics['passenger_names']})")
 
@@ -1189,9 +1206,10 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
                 sitting_type = selection.get('sittingType', '')
                 sitting_time = selection.get('sittingTime', '')
                 dining_string = f"\tDining: {sitting_type} {sitting_time}"
-                raw_table_size = selection.get("tableSize", "")
-                if raw_table_size and str(raw_table_size) != "00":
-                    padded_table = str(raw_table_size).zfill(2)
+                raw_table_size = str(selection.get("tableSize", "") or "")
+                # tableSize can be a non-numeric code (e.g. "S") - only zero-pad digits
+                padded_table = raw_table_size.zfill(2) if raw_table_size.isdigit() else raw_table_size
+                if padded_table and padded_table != "00":
                     dining_string += f" Table Size: {padded_table}"
                 log(dining_string)
 
@@ -1241,15 +1259,17 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         # Include the room number so multiple cabins on the same sailing are distinct.
         summary_name = ship_dictionary.get_ship(ship_code)
         if stateroom_number:
-            summary_name += f" #{stateroom_number}"
-        if str(reservation_ID) in reservation_friendly_names:
-            summary_name += f" ({reservation_friendly_names.get(str(reservation_ID))})"
+            summary_name += f" ({stateroom_number})"
+        summary_reservation = str(reservation_ID)
+        if summary_reservation in reservation_friendly_names:
+            summary_reservation += f" ({reservation_friendly_names.get(summary_reservation)})"
         balance_due = derive_balance_due(booking)
         balance_due_amount = booking.get("balanceDueAmount")
         if str(reservation_ID) in config.paid_reservations:
             balance_due = False   # user vouches for it (reservationsPaidInFull)
         checkin_payment_rows.append({
             "name": summary_name,
+            "reservation": summary_reservation,
             "sail_date": sail_date,
             "checkin_label": checkin_label or "TBD",
             "final_payment": final_payment_date,
@@ -1610,28 +1630,21 @@ def get_cruise_price(account_info: AccountInfo,
 
         # TODO: This code block will print the "Available Rooms" line even if the count is 0;
         #       do we want to use this commented-out block instead
-#        if url_params.package_code and not automatic_URL:
-#            # Pre-filter rooms that actually have inventory available
-#            valid_rooms = [
-#                r for r in results.get("available_rooms", [])
-#                if r.get('roomsLeft') is not None and r.get('roomsLeft') > 0
-#            ]
-#
-#            if valid_rooms:
-#                log(f"\tAvailable Rooms (non-discounted price) for {url_params.number_of_adults} Adult and {url_params.number_of_children} Child on This Sailing Are:")
-#                for available_room in valid_rooms:
-#                    log(f"\t{available_room.get('name')} {available_room.get('price'):.2f} - Rooms Left {available_room.get('roomsLeft')}")
-#            else:
-#                log(f"\tNo alternative room inventory returned by the booking engine.")
-#        return
         if url_params.package_code and not automatic_URL:
-            log(f"\tAvailable Rooms (non-discounted price) for {url_params.number_of_adults} Adult and {url_params.number_of_children} Child on This Sailing Are:")
-            for available_room in results.get("available_rooms", []):
-                # key is 'rooms_left' (as produced above); price may be None
-                rooms_left = available_room.get('rooms_left')
-                room_price = available_room.get('price')
-                if rooms_left is not None and rooms_left > 0 and room_price is not None:
-                    log(f"\t{available_room.get('name')} {room_price:.2f} - Rooms Left {rooms_left}")
+            # Pre-filter rooms that actually have inventory available
+            # (key is 'rooms_left' as produced above; price may be None)
+            valid_rooms = [
+                r for r in results.get("available_rooms", [])
+                if r.get('rooms_left') is not None and r.get('rooms_left') > 0
+                and r.get('price') is not None
+            ]
+
+            if valid_rooms:
+                log(f"\tAvailable Rooms (non-discounted price) for {url_params.number_of_adults} Adult and {url_params.number_of_children} Child on This Sailing Are:")
+                for available_room in valid_rooms:
+                    log(f"\t{available_room.get('name')} {available_room.get('price'):.2f} - Rooms Left {available_room.get('rooms_left')}")
+            else:
+                log(f"\tNo alternative room inventory returned by the booking engine.")
         return
 
     obc_value = float(obc or 0.0)
@@ -1878,7 +1891,7 @@ def check_if_room_is_available(params: CruiseURLParams) -> tuple[bool, List[Dict
     api_URL = f'https://www.{params.url_brand}.com/room-selection/type-and-subtype'
     try:
         response = requests.get(api_URL, params=request_params, headers=headers,
-                                timeout=config.request_timeout if config else 30)
+                                timeout=config.request_timeout if config else REQUEST_TIMEOUT)
     except Exception as err:
         log (f"Unable to check room availability with server ({err})")
         return False, []
@@ -2616,7 +2629,7 @@ def get_checkin_statuses(account_info: AccountInfo, reservation_id: str, guest_I
             url=api_url,
             data=json.dumps(payload),
             headers=headers,
-            timeout=10,
+            timeout=SHORT_REQUEST_TIMEOUT,
             on_failure="retry"
     )
 
@@ -2661,7 +2674,7 @@ def get_boarding_pass(account_info: AccountInfo, booking: Dict[str, Any], guest_
             url=api_url,
             data=json.dumps(payload),
             headers=headers,
-            timeout=10,
+            timeout=SHORT_REQUEST_TIMEOUT,
             on_failure="retry"
     )
 
@@ -2687,7 +2700,7 @@ def get_number_of_nights(account_info: AccountInfo, loyalty_number: str) -> Tupl
     response = _execute_api_request(
         account_info, "GET", url,
         params={'loyaltyNumber': loyalty_number},
-        timeout=10,
+        timeout=SHORT_REQUEST_TIMEOUT,
         on_failure="retry"
     )
 
@@ -3312,7 +3325,7 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         minimum_saving_alert=minimum_saving_alert,
         notify_on_error=data.get("notifyOnError", False),
         show_promos=data.get("showPromos", True),
-        request_timeout=int(data.get("requestTimeout", 30)),
+        request_timeout=int(data.get("requestTimeout", REQUEST_TIMEOUT)),
         date_display_format=data.get("dateDisplayFormat", "%x"),
         log_file=data.get("logFile"),
         apobj=apobj,
@@ -3322,7 +3335,8 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         apprise_urls=apprise_urls,
         reservation_prices=data.get("reservationPricePaid", {}),
         reservation_names=data.get("reservationFriendlyNames", {}),
-        apprise_test=data.get("appriseTest", False),   # was never populated: the test path could not run
+        # accept both spellings: the original code and README document apprise_test
+        apprise_test=data.get("appriseTest", data.get("apprise_test", False)),
         paid_reservations={str(r) for r in (data.get("reservationsPaidInFull") or [])}
     )
 
@@ -3364,7 +3378,7 @@ def print_checkin_payment_table() -> None:
 
     rows = sorted(checkin_payment_rows, key=lambda r: r["sail_date"] or "")
 
-    headers = ("Sail Date", "Ship (Room)", "Check-In", "Final Payment")
+    headers = ("Sail Date", "Ship (Room)", "Reservation", "Check-In", "Final Payment")
     table = []
     pay_colors = []
     for r in rows:
@@ -3393,7 +3407,7 @@ def print_checkin_payment_table() -> None:
         else:
             pay = "-"
             pay_colors.append("")
-        table.append((sail, r["name"], r["checkin_label"], pay))
+        table.append((sail, r["name"], r.get("reservation", "-"), r["checkin_label"], pay))
 
     # Size each column to the widest of its header/cells. The stored values are ANSI-free;
     # color is applied only at print time so it never skews this width math.
@@ -3497,11 +3511,11 @@ def main() -> None:
                 account_info.access.session.close()
             if len(config.accounts) > 1:
                 log("Sleeping for 5 seconds to allow API to cool down between accounts")
-                time.sleep(5)
+                time.sleep(ACCOUNT_COOLDOWN_SECONDS)
 
         # Process the anonymous prospective cruise watchlist using the config dataclass property
         if getattr(config, 'prospective_cruises', None):
-            log("\nProcessing Prospective Cruise Watchlist...")
+            log(f"\n{BLUE}Processing Prospective Cruise Watchlist...{RESET}")
 
             # Establish a clean, isolated session for tracking
             anon_session = new_api_session()
@@ -3574,7 +3588,7 @@ if __name__ == "__main__":
             try:
                 print("Downloading sample configuaration file...")
                 url = 'https://raw.githubusercontent.com/jdeath/CheckRoyalCaribbeanPrice/refs/heads/main/SAMPLE-SIMPLE-config.yaml'
-                response = requests.get(url, timeout=10)
+                response = requests.get(url, timeout=SHORT_REQUEST_TIMEOUT)
                 response.raise_for_status()
 
                 local_file_name = "config.yaml"

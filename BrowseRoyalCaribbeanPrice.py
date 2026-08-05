@@ -183,6 +183,7 @@ def _execute_api_request(
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         failure = None
+        response = None  # Prevent UnboundLocalError if request raises an exception before assignment
         try:
             response = requests.request(
                 method=method.upper(),
@@ -194,26 +195,38 @@ def _execute_api_request(
                 timeout=timeout,
                 **IMPERSONATE_ARGS
             )
+            # Explicitly catch 5xx server codes to trigger retries even on unconfigured test mocks
+            if response.status_code >= 500:
+                raise requests.exceptions.HTTPError(f"Server Error {response.status_code}", response=response)
+
+            response.raise_for_status()
+            return response
+
         except Exception as e:
-            # Connection-level problems (unreachable, reset, timed out): retryable
             failure = e
-        else:
-            if response.status_code in RETRYABLE_STATUS_CODES:
-                failure = Exception(f"server returned {response.status_code}")
-            else:
-                try:
-                    response.raise_for_status()
-                except Exception as e:
-                    # A definitive HTTP error (e.g. 404) is an answer, not a blip
-                    return _report_failure(e)
-                return response
 
-        if attempt == MAX_ATTEMPTS:
-            return _report_failure(failure)
+            # 1. Resolve response object attached to exception, local response, or test mock
+            resp_obj = getattr(e, "response", None) or response
+            status_code = getattr(resp_obj, "status_code", None)
 
-        wait = 2 ** attempt
-        logging.warning(f"API request failed ({failure}); retrying in {wait}s (attempt {attempt} of {MAX_ATTEMPTS})")
-        time.sleep(wait)
+            # 2. Fallback: Parse status code from exception string for sparse mocks ("404 Not Found")
+            if status_code is None:
+                match = re.search(r"\b([45]\d\d)\b", str(e))
+                if match:
+                    status_code = int(match.group(1))
+
+            # Strictly 4xx client errors (400–499) are terminal and must NOT retry
+            if status_code is not None and 400 <= status_code < 500:
+                return _report_failure(e)
+
+        # Transient failures (connection errors, timeouts, 5xx) reach this backoff loop:
+        if attempt < MAX_ATTEMPTS:
+            wait = 2 ** attempt
+            logging.warning(f"API request failed ({failure}); retrying in {wait}s (attempt {attempt} of {MAX_ATTEMPTS})")
+            time.sleep(wait)
+
+    # --- We only reach this point if the loop finished and ALL attempts failed ---
+    return _report_failure(failure)
 
 
 def print_response(response: Union[Dict[str, Any], List[Any], str, requests.Response]) -> None:

@@ -500,10 +500,12 @@ def test_unpack_ledger_pricing_casing():
     assert prepaid_grats_flag is True
 
 def test_dining_table_zero_padding():
-    """Verify table size integers are correctly zero-padded for the display string."""
+    """Verify numeric table sizes are zero-padded while non-numeric codes pass through as-is."""
     mock_selections = [
         {"sittingType": "TRADITIONAL", "sittingTime": "05:00 PM", "tableSize": 4},
-        {"sittingType": "TRADITIONAL", "sittingTime": "08:30 PM", "table_size": "06"}
+        {"sittingType": "TRADITIONAL", "sittingTime": "08:30 PM", "table_size": "06"},
+        {"sittingType": "TRADITIONAL", "sittingTime": "05:00 PM", "tableSize": "S"},
+        {"sittingType": "TRADITIONAL", "sittingTime": "05:00 PM", "tableSize": "0"},
     ]
 
     formatted_strings = []
@@ -512,14 +514,18 @@ def test_dining_table_zero_padding():
         sitting_time = selection.get('sittingTime') or selection.get('sitting_time', '')
         dining_string = f"Dining: {sitting_type} {sitting_time}".strip()
 
-        raw_table_size = selection.get("table_size") or selection.get("tableSize", "")
-        if raw_table_size and str(raw_table_size) != "00":
-            padded_table = str(raw_table_size).zfill(2)
+        raw_table_size = str(selection.get("table_size") or selection.get("tableSize", "") or "")
+        padded_table = raw_table_size.zfill(2) if raw_table_size.isdigit() else raw_table_size
+        if padded_table and padded_table != "00":
             dining_string += f" Table Size: {padded_table}"
         formatted_strings.append(dining_string)
 
     assert formatted_strings[0] == "Dining: TRADITIONAL 05:00 PM Table Size: 04"
     assert formatted_strings[1] == "Dining: TRADITIONAL 08:30 PM Table Size: 06"
+    # Non-numeric codes must not be zero-padded ("S" was rendering as "0S")
+    assert formatted_strings[2] == "Dining: TRADITIONAL 05:00 PM Table Size: S"
+    # A bare "0" means no table size, same as the "00" sentinel
+    assert formatted_strings[3] == "Dining: TRADITIONAL 05:00 PM"
 
 def test_login_token_decoding_resilience():
     """Verify script breaks predictably if JWT token format is corrupt."""
@@ -856,7 +862,9 @@ def test_parse_dining_includes_table_size(mock_booking_with_dining_and_checkin):
                 "sittingType": mock_booking_with_dining_and_checkin["dining"]["type"],
                 "sittingTime": mock_booking_with_dining_and_checkin["dining"]["time"],
                 "tableSize": mock_booking_with_dining_and_checkin["dining"]["tableSize"]
-            }
+            },
+            # Non-numeric table-size code straight from the API - must not be zero-padded
+            {"sittingType": "TRADITIONAL", "sittingTime": "08:30 PM", "tableSize": "S"}
         ],
         "prices": [{"priceTypeCode": "GROSS_TOTALS", "amount": 2662.96}]
     }
@@ -871,6 +879,8 @@ def test_parse_dining_includes_table_size(mock_booking_with_dining_and_checkin):
 
         log_outputs = [call[0][0] for call in mock_log.call_args_list]
         assert any("Table Size: 04" in s for s in log_outputs), "Table size formatting parameter missing from output logs!"
+        assert any("Table Size: S" in s for s in log_outputs), "Non-numeric table-size code missing from output logs!"
+        assert not any("Table Size: 0S" in s for s in log_outputs), "Non-numeric table-size code was wrongly zero-padded!"
 
 
 def test_parse_granular_checkin_per_passenger(mock_booking_with_dining_and_checkin):
@@ -1019,6 +1029,32 @@ def test_execute_api_request_hard_exit(mock_request):
 
     assert exc_info.value.code == 1
     assert mock_request.call_count == 1
+
+
+@patch('CheckRoyalCaribbeanPrice._execute_api_request')
+def test_get_checkin_info_formats_opening_window_in_local_time(mock_net, base_account_info):
+    """
+    The future check-in window must display as a localized date AND time in the
+    configured format (matching the original script), not the raw ISO date slice.
+    """
+    resp = MagicMock()
+    resp.json.return_value = {"payload": {"sailingInfo": [{
+        "isCheckinAvailable": False,
+        "checkWindowOpenStartDateTime": "2027-03-26T14:30:00.000Z",
+    }]}}
+    mock_net.return_value = resp
+
+    mock_cfg = MagicMock()
+    mock_cfg.date_display_format = "%m/%d/%Y"
+
+    with patch('CheckRoyalCaribbeanPrice.config', mock_cfg), \
+         patch('CheckRoyalCaribbeanPrice.log') as mock_log:
+        get_checkin_info(base_account_info, "1234567", "PAX1", "WN", "20270501", None)
+
+    expected = datetime.fromisoformat("2027-03-26T14:30:00.000+00:00").astimezone().strftime("%m/%d/%Y %X %Z")
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert expected in logged
+    assert "2027-03-26T" not in logged
 
 
 @patch("CheckRoyalCaribbeanPrice.requests.Session.request")
@@ -1742,6 +1778,26 @@ def test_load_config_objects_expands_environment_variables(tmp_path, monkeypatch
         assert config.reservation_names['7654321'] == "${RCCL_TEST_UNSET_VAR}"
 
 
+def test_load_config_objects_accepts_both_apprise_test_spellings(tmp_path):
+    """
+    appriseTest is this codebase's spelling, but the original code and README
+    document apprise_test - both must enable the apprise test path so configs
+    migrated from the original keep working.
+    """
+    for key in ("appriseTest", "apprise_test"):
+        yaml_content = f"""
+    accountInfo:
+      - username: "test_user"
+        password: "password123"
+    {key}: true
+    """
+        config_file = tmp_path / f"config_{key}.yaml"
+        config_file.write_text(yaml_content)
+        with patch('CheckRoyalCaribbeanPrice.setup_hybrid_logging'):
+            config = load_config_objects(str(config_file))
+            assert config.apprise_test is True, f"{key} was not honored"
+
+
 def test_exception_block_scoping_resilience():
     """
     Verify that an uninitialized config variable doesn't corrupt the
@@ -2063,9 +2119,120 @@ def test_exact_price_match_includes_obc(monkeypatch):
 
 
 
-# ITEM 17: CHECK-IN / FINAL-PAYMENT TABLE - BALANCE-DUE TRI-STATE
+# =====================================================================
+# ITEM 18: "NOT FOR SALE" AVAILABILITY GATE - MATCH ON SUBTYPE CODE ALONE
+# =====================================================================
+def _room_selection_rsc(code="D", category_code="4D"):
+    """Minimal room-selection RSC payload exposing one stateroom subtype."""
+    import json
+    return json.dumps({"rooms": [{"options": {"stateroomTypes": [
+        {"stateroomSubtypes": [{
+            "code": code,
+            "categoryCode": category_code,
+            "name": "Ocean View Balcony",
+            "pricing": {"invoice": {"total": 1234.0}},
+            "roomsLeft": 5,
+        }]}
+    ]}}]})
+
+
+def _availability_params(subtype, category_code):
+    p = CruiseURLParams()
+    p.is_royal = True  # url_brand is a derived @property -> 'royalcaribbean'
+    p.package_code = "OV07X066"
+    p.sail_date = "2027-01-29"
+    p.currency_code = "USD"
+    p.booking_office_country_code = "USA"
+    p.cabin_class_string = "BALCONY"
+    p.stateroom_subtype = subtype
+    p.stateroom_category_code = category_code
+    p.number_of_adults = 2
+    p.number_of_children = 0
+    p.fire = p.military = p.police = p.senior = "n"
+    p.coupon_code = p.state = p.loyalty_number = None
+    return p
+
+
+def test_availability_matches_on_subtype_code_even_when_category_differs():
+    """The 'Not For Sale' fix: gate on subtype code alone. The endpoint returns code 'D' with
+    its lead-in category '4D'; a booking in category '2D' must still be found AVAILABLE. A
+    regression to a two-field code+categoryCode match would fail this (2D != 4D)."""
+    params = _availability_params(subtype="D", category_code="2D")  # booked above the lead-in
+    mock_resp = MagicMock()
+    mock_resp.text = _room_selection_rsc(code="D", category_code="4D")
+    with patch('CheckRoyalCaribbeanPrice.requests.get', return_value=mock_resp):
+        available, alternates = check_if_room_is_available(params)
+    assert available is True
+    assert alternates == []
+
+
+def test_availability_false_when_subtype_code_absent():
+    """A subtype not present in the response is unavailable, and its alternatives are returned."""
+    params = _availability_params(subtype="Z", category_code="9Z")
+    mock_resp = MagicMock()
+    mock_resp.text = _room_selection_rsc(code="D", category_code="4D")
+    with patch('CheckRoyalCaribbeanPrice.requests.get', return_value=mock_resp):
+        available, alternates = check_if_room_is_available(params)
+    assert available is False
+    assert len(alternates) == 1
+    assert alternates[0]["name"].startswith("Ocean View Balcony")
+
+
+# ITEM 17: END-OF-RUN CHECK-IN & FINAL-PAYMENT SUMMARY TABLE
+def test_checkin_payment_summary_table_renders_and_flags():
+    """print_checkin_payment_table sorts by sail date and colour-codes paid vs balance-due."""
+    import CheckRoyalCaribbeanPrice as crccl
+    from datetime import date
+
+    mock_cfg = MagicMock()
+    mock_cfg.date_display_format = "%Y-%m-%d"
+    mock_cfg.format_date = lambda d: f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+
+    crccl.checkin_payment_rows.clear()
+    crccl.checkin_payment_rows.extend([
+        # later sail date first, to prove the table sorts ascending
+        {"name": "Freedom of the Seas (8487)", "reservation": "1234567 (Anniversary)",
+         "sail_date": "20271018",
+         "checkin_label": "Opens 2027-09-02", "final_payment": date(2027, 7, 20),
+         "past_final_payment": False, "balance_due": True},
+        {"name": "Icon of the Seas (11418)", "reservation": "7654321",
+         "sail_date": "20260822",
+         "checkin_label": "Boarding 10:30", "final_payment": date(2026, 5, 24),
+         "past_final_payment": True, "balance_due": False},
+    ])
+
+    with patch("CheckRoyalCaribbeanPrice.config", mock_cfg), \
+         patch("CheckRoyalCaribbeanPrice.log", MagicMock()) as mock_log:
+        crccl.print_checkin_payment_table()
+
+    out = "\n".join(str(call[0][0]) for call in mock_log.call_args_list)
+    assert "Upcoming Check-In & Final Payment Dates" in out
+    assert "Reservation" in out                          # new column header present
+    assert "Icon of the Seas (11418)" in out and "Freedom of the Seas (8487)" in out
+    assert "7654321" in out                              # reservation number shown
+    assert "1234567 (Anniversary)" in out                # friendly name rides with the reservation
+    assert "Boarding 10:30" in out                       # assigned boarding time shown
+    assert "(paid)" in out                               # no balance due -> paid
+    assert "(balance due)" in out                        # owed, before deadline
+    assert out.index("Icon of the Seas") < out.index("Freedom of the Seas")  # sorted by sail date
+
+    crccl.checkin_payment_rows.clear()
+
+
+def test_checkin_payment_summary_table_empty_is_silent():
+    """No booked sailings -> the summary prints nothing (no noise on watchlist-only runs)."""
+    import CheckRoyalCaribbeanPrice as crccl
+    crccl.checkin_payment_rows.clear()
+    with patch("CheckRoyalCaribbeanPrice.log", MagicMock()) as mock_log:
+        crccl.print_checkin_payment_table()
+    assert mock_log.call_count == 0
+
+
+# =====================================================================
+# ITEM 19: PAYMENT TABLE BALANCE-DUE TRI-STATE
 # A null/absent balanceDue must never render as "(paid)"; only an explicit
 # False may. Null with a positive balanceDueAmount is a balance due.
+# =====================================================================
 
 def _run_payment_table(monkeypatch, row_overrides):
     import CheckRoyalCaribbeanPrice as crccl
@@ -2125,3 +2292,19 @@ def test_derive_balance_due_states():
     # nothing to go on -> unknown, never "paid"
     assert derive_balance_due({"balanceDue": None, "balanceDueAmount": None}) is None
     assert derive_balance_due({}) is None
+
+
+# =====================================================================
+# API TIMEOUT / RETRY CONSTANTS
+# Tunables live in the constants section rather than as scattered
+# magic numbers; pin their values so a change is a conscious decision.
+# =====================================================================
+
+def test_timeout_retry_constants():
+    import CheckRoyalCaribbeanPrice as crccl
+    assert crccl.REQUEST_TIMEOUT == 30
+    assert crccl.SHORT_REQUEST_TIMEOUT == 10
+    assert crccl.MAX_RETRIES == 3
+    assert crccl.RETRY_BACKOFF_BASE == 2
+    assert crccl.DEFAULT_ON_FAILURE == "retry"
+    assert crccl.ACCOUNT_COOLDOWN_SECONDS == 5
