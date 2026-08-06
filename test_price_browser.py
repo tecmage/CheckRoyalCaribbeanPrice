@@ -131,10 +131,11 @@ class TestWebFleetAndSailingDiscovery:
         assert ships == []
 
     @patch('BrowseRoyalCaribbeanPrice._execute_api_request')
-    def test_get_ships_web_title_cases_allcaps_names(self, mock_execute):
-        """New ships arrive from the API in ALL CAPS (e.g. HERO OF THE SEAS); names
-        are .title()-cased for display, and the old hardcoded 'HE' injection is gone
-        now that the API lists Hero itself. ("Of The" stays capitalized - accepted.)"""
+    def test_get_ships_web_normalizes_allcaps_names(self, mock_execute):
+        """New ships arrive from the API in ALL CAPS (e.g. HERO OF THE SEAS); names are
+        title-cased with "of the" kept lowercase so the --ship matcher ("<arg> of the
+        Seas") still finds them. The old hardcoded 'HE' injection is gone now that the
+        API lists Hero itself."""
         mock_resp = MagicMock(spec=requests.Response)
         mock_resp.json.return_value = {
             "payload": {
@@ -148,10 +149,10 @@ class TestWebFleetAndSailingDiscovery:
 
         ships = get_ships_web()
 
-        # No synthetic rows anymore - one output row per API ship, title-cased
+        # No synthetic rows anymore - one output row per API ship, casing normalized
         assert len(ships) == 2
-        assert ships[0] == {'code': 'AL', 'name': 'Allure Of The Seas'}
-        assert ships[1] == {'code': 'HE', 'name': 'Hero Of The Seas'}
+        assert ships[0] == {'code': 'AL', 'name': 'Allure of the Seas'}
+        assert ships[1] == {'code': 'HE', 'name': 'Hero of the Seas'}
 
     @patch('BrowseRoyalCaribbeanPrice._execute_api_request')
     def test_get_sailings_web_resilient_to_malformed_json(self, mock_execute):
