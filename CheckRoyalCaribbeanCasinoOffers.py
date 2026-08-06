@@ -300,7 +300,7 @@ def report_offers(offers: List[CasinoOffer], warn_days: int, apobj: Optional[Any
                 + "\n".join(f"- {text}" for _, text in alerts))
         log(f"\n{RED}{body}{RESET}")
         if apobj is not None:
-            apobj.notify(body=body, title="Club Royale Offer Expiring")
+            apobj.notify(body=body, title="Club Royale Offer Expiring", body_format=crccl.NotifyFormat.TEXT)
     else:
         log(f"\n{GREEN}No offers within {warn_days} days of their reserve-by deadline.{RESET}")
 

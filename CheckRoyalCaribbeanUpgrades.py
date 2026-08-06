@@ -568,7 +568,7 @@ def main() -> None:
                     f"(category-difference basis):\n" + "\n".join(f"- {h}" for h in all_hits))
             log(f"\n{GREEN}{body}{RESET}")
             if apobj is not None:
-                apobj.notify(body=body, title="Cruise Upgrade Opportunity")
+                apobj.notify(body=body, title="Cruise Upgrade Opportunity", body_format=crccl.NotifyFormat.TEXT)
         else:
             log(f"\n No upgrades at or below ${alert_below:,.2f}.")
 
