@@ -89,6 +89,12 @@ def dp340_eligible(account, points) -> bool:
     return account.is_royal and (points or 0) >= 340
 
 
+def should_apply_dp340(eligible: bool, booked_with_code: bool, guest_count: int) -> bool:
+    """Quote a solo booking with DP340 when the account qualifies, or when the
+    booking already carries the code - repricing keeps the terms it was booked on."""
+    return (eligible or booked_with_code) and guest_count == 1
+
+
 def build_apprise(data: Dict[str, Any]):
     """Apprise notifier from any apprise URLs in the configuration (or None)."""
     urls = [i["url"] for i in data.get("apprise", []) if isinstance(i, dict) and "url" in i]
@@ -393,7 +399,7 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
                             for i in ledger["promo_items"] + ledger["casino_items"])
     if booked_with_dp340:
         log("  DP340 single-supplement discount is applied on this booking")
-    apply_dp340 = dp340_ok and len(guests) == 1
+    apply_dp340 = should_apply_dp340(dp340_ok, booked_with_dp340, len(guests))
 
     inventory = get_sailing_inventory(account, booking, loyalty, dp340=apply_dp340)
     if not inventory:

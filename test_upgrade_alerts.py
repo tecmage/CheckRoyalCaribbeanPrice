@@ -287,3 +287,16 @@ def test_category_prices_sends_coupon_code_only_when_asked(monkeypatch):
 
     up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456", dp340=False)
     assert "couponCode" not in captured[1]["rooms"][0]
+
+
+def test_should_apply_dp340_gate():
+    import CheckRoyalCaribbeanUpgrades as up
+    # account qualifies, solo booking
+    assert up.should_apply_dp340(True, False, 1) is True
+    # booking already carries the code - keep quoting with it even if the
+    # account doesn't qualify on points
+    assert up.should_apply_dp340(False, True, 1) is True
+    # never on multi-guest bookings, regardless of source
+    assert up.should_apply_dp340(True, True, 2) is False
+    # neither qualified nor already applied
+    assert up.should_apply_dp340(False, False, 1) is False
