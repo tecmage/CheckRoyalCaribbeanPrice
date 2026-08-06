@@ -177,10 +177,24 @@ def sail_to_browse_display(sail):
         return None
 
 
+def normalize_ship_name(name):
+    """New ships arrive from the fleet API in ALL CAPS ('HERO OF THE SEAS') until
+    someone fixes the casing; normalize to the display form the scripts match
+    against ('Hero of the Seas' - "of the" stays lowercase because Browse's
+    --ship matcher compares literally)."""
+    name = name or ''
+    if name.isupper():
+        name = name.title()
+    return name.replace(' Of The ', ' of the ')
+
+
 def real_ships(fleet):
-    """Drop the API's internal placeholder entries (their names are ALL CAPS,
-    e.g. 'CELEBRITY COMPASS'; real ships are title-case)."""
-    return [s for s in fleet if (s.get('name') or '') and not s['name'].isupper()]
+    """Fleet entries with display-normalized names; only empty-name rows drop.
+    (All-caps entries used to be internal placeholders and were filtered out,
+    but they are now real new ships - e.g. Hero of the Seas, Celebrity Compass
+    - so their casing is normalized instead.)"""
+    return [{**s, 'name': normalize_ship_name(s['name'])}
+            for s in fleet if (s.get('name') or '')]
 
 
 def short_ship_name(name):

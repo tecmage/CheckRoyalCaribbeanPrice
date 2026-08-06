@@ -109,14 +109,29 @@ def test_script_whitelist_matches_table():
         assert os.path.isfile(os.path.join(gui.SCRIPT_DIR, s.filename)), s.filename
 
 
-def test_real_ships_drops_all_caps_placeholders():
+def test_real_ships_normalizes_all_caps_names():
+    """All-caps fleet entries are now real new ships (Hero, Compass, Seeker), not
+    placeholders - keep them with normalized casing; only empty names drop."""
     fleet = [
         {'code': 'RC', 'name': 'CELEBRITY COMPASS', 'brand': 'C'},
+        {'code': 'HE', 'name': 'HERO OF THE SEAS', 'brand': 'R'},
         {'code': 'AX', 'name': 'Celebrity Apex', 'brand': 'C'},
         {'code': 'OV', 'name': 'Ovation of the Seas', 'brand': 'R'},
         {'code': 'ZZ', 'name': '', 'brand': 'R'},
     ]
-    assert [s['code'] for s in gui.real_ships(fleet)] == ['AX', 'OV']
+    ships = gui.real_ships(fleet)
+    assert [s['code'] for s in ships] == ['RC', 'HE', 'AX', 'OV']
+    assert ships[0]['name'] == 'Celebrity Compass'
+    assert ships[1]['name'] == 'Hero of the Seas'      # "of the" stays lowercase
+    assert ships[2]['name'] == 'Celebrity Apex'        # already-cased names untouched
+    assert ships[3]['name'] == 'Ovation of the Seas'
+
+
+def test_normalize_ship_name_feeds_short_ship_name():
+    """The normalized form must be matchable by short_ship_name, so the new
+    all-caps ships appear in the Browse dropdown."""
+    assert gui.short_ship_name(gui.normalize_ship_name('HERO OF THE SEAS')) == 'Hero'
+    assert gui.short_ship_name(gui.normalize_ship_name('CELEBRITY COMPASS')) == 'Compass'
 
 
 def test_short_ship_name_matches_browse_patterns():
