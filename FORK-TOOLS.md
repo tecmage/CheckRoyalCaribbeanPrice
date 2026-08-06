@@ -106,7 +106,10 @@ Notes: uses the first `accountInfo` entry in your config. Sailings with no inven
 for sale (sold out / too close to departure) are reported as such rather than priced.
 `--limit N` caps how many candidate categories are listed per booking (0 = all).
 Each booking's header shows `Reservation #id (name)` using `reservationFriendlyNames`
-from your config, same as the main price checker.
+from your config, same as the main price checker. On a 340+ point account, solo
+bookings are priced with the DP340 single-supplement code (same solo/Royal rule as
+the main checker; the quote header shows "+ DP340"), and a booking that already
+carries the code is called out.
 
 ---
 

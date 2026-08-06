@@ -207,3 +207,83 @@ def test_reservation_header_uses_friendly_names(monkeypatch):
     assert up.reservation_header("1234567") == "Reservation #1234567 (Summer Cruise)"
     # unnamed and non-string ids fall back to the bare number
     assert up.reservation_header(7654321) == "Reservation #7654321"
+
+
+##################################
+# DP340 detection and application
+##################################
+def test_dp340_eligibility_math():
+    import CheckRoyalCaribbeanUpgrades as up
+
+    class _Acct:
+        def __init__(self, royal): self.is_royal = royal
+
+    assert up.dp340_eligible(_Acct(True), 340) is True
+    assert up.dp340_eligible(_Acct(True), 339) is False
+    assert up.dp340_eligible(_Acct(True), None) is False
+    assert up.dp340_eligible(_Acct(False), 500) is False  # Royal-only benefit
+
+
+def test_read_ledger_records_dp340_promo(monkeypatch):
+    _patch_prices(monkeypatch, [
+        {"priceTypeCode": "DISCOUNT", "amount": -800.0, "priceItems": [
+            {"code": "DPLUS", "description": "Diamond Plus Single Supplement",
+             "amount": -800.0, "promoCd": "DP340", "refundability": "REFUNDABLE"},
+        ]},
+        {"priceTypeCode": "GROSS_TOTALS", "amount": 1200.0},
+    ])
+    ledger = read_ledger(None, {})
+    assert any(i.get("promo") == "DP340" for i in ledger["promo_items"])
+
+
+def test_sailing_inventory_sends_dp340_param_only_when_asked(monkeypatch):
+    import CheckRoyalCaribbeanUpgrades as up
+    captured = []
+
+    def fake_rsc_get(account, url, params):
+        captured.append(dict(params))
+        return None  # short-circuits after the request - params are what we test
+
+    monkeypatch.setattr(up, "_rsc_get", fake_rsc_get)
+    monkeypatch.setattr(up, "log", lambda *a, **k: None)
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+
+    booking = {"sailDate": "20270815", "packageCode": "WN07X123",
+               "passengersInStateroom": [{"firstName": "Solo"}]}
+    up.get_sailing_inventory(_Acct(), booking, "123456", dp340=True)
+    assert captured[0].get("r0i") == "DP340"
+    # empty result triggers the retry-without-code fallback
+    assert len(captured) == 2 and "r0i" not in captured[1]
+
+    captured.clear()
+    up.get_sailing_inventory(_Acct(), booking, "123456", dp340=False)
+    assert len(captured) == 1 and "r0i" not in captured[0]
+
+
+def test_category_prices_sends_coupon_code_only_when_asked(monkeypatch):
+    import json as _json
+    import CheckRoyalCaribbeanUpgrades as up
+    captured = []
+
+    class _Sess:
+        def get(self, url, params=None, headers=None):
+            captured.append(_json.loads(params["filter"]))
+            return None  # short-circuits after the request
+
+    class _Access:
+        session = _Sess()
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+        is_royal = True
+        access = _Access()
+
+    booking = {"sailDate": "20270815", "packageCode": "WN07X123",
+               "passengersInStateroom": [{"firstName": "Solo"}]}
+    up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456", dp340=True)
+    assert captured[0]["rooms"][0].get("couponCode") == "DP340"
+
+    up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456", dp340=False)
+    assert "couponCode" not in captured[1]["rooms"][0]
