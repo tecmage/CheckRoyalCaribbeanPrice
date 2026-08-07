@@ -22,10 +22,17 @@ import traceback
 import time
 import yaml
 
+# Apprise is optional (e.g. the iOS full install runs without it): when the
+# package is missing, notifications are disabled and everything else works
+# normally. apobj is only ever constructed when the import succeeded.
 # NotifyFormat.TEXT declares notification bodies as plain text so Apprise converts
 # them per-service: HTML email renders the \n line breaks instead of collapsing
 # them to one line (issue #76); plain-text services are passed through unchanged
-from apprise import Apprise, NotifyFormat
+try:
+    from apprise import Apprise, NotifyFormat
+except ImportError:
+    Apprise = None
+    NotifyFormat = None
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -3311,9 +3318,12 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
     # Parse Apprise URLs safely
     apprise_urls = [item["url"] for item in data.get("apprise", []) if "url" in item]
 
-    # Build the apprise object natively
+    # Build the apprise object natively (apprise is an optional dependency)
     apobj = None
-    if apprise_urls:
+    if apprise_urls and Apprise is None:
+        logging.warning("apprise: is configured in config.yaml but the apprise package "
+                        "is not installed - notifications are disabled. pip install apprise")
+    elif apprise_urls:
         apobj = Apprise()
         for url in apprise_urls:
             apobj.add(url)
