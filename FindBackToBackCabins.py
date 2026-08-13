@@ -515,6 +515,105 @@ def deck_close_spans(leg_cabins: List[List[Dict[str, Any]]], min_legs: int
 
 
 ##################################
+# Chain pricing (no same-cabin requirement)
+##################################
+# Display order and labels for the API's stateroom class codes; unknown codes
+# are appended after these in whatever order they arrive.
+CLASS_ORDER = ["INTERIOR", "OUTSIDE", "BALCONY", "DELUXE"]
+CLASS_LABELS = {"INTERIOR": "Interior", "OUTSIDE": "Ocean View",
+                "BALCONY": "Balcony", "DELUXE": "Suite"}
+
+
+def class_minimums(stateroom_types: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Cheapest priced subtype per stateroom class for one sailing.
+
+    Guarantees are INCLUDED here (tagged gty=True): unlike the same-cabin hunt,
+    chain pricing allows moving cabins between legs, so a guarantee rate - often
+    the cheapest - is perfectly bookable. Returns
+    {class_code: {"total": float, "category": str, "gty": bool}}."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in stateroom_types or []:
+        tc = t.get("code")
+        for s in t.get("stateroomSubtypes", []) or []:
+            total = ((s.get("pricing") or {}).get("invoice") or {}).get("total")
+            if not isinstance(total, (int, float)):
+                continue
+            cur = out.get(tc)
+            if cur is None or total < cur["total"]:
+                out[tc] = {"total": float(total),
+                           "category": s.get("categoryCode") or s.get("code") or "?",
+                           "gty": bool(s.get("guarantee"))}
+    return out
+
+
+def chain_class_totals(leg_minimums: List[Dict[str, Dict[str, Any]]]
+                       ) -> Dict[str, Optional[float]]:
+    """Per-class totals across a chain's legs; None when a class is missing on
+    any leg (an incomplete chain price must not masquerade as a full one)."""
+    classes = set().union(*[set(m) for m in leg_minimums]) if leg_minimums else set()
+    out: Dict[str, Optional[float]] = {}
+    for c in classes:
+        if all(c in m for m in leg_minimums):
+            out[c] = round(sum(m[c]["total"] for m in leg_minimums), 2)
+        else:
+            out[c] = None
+    return out
+
+
+def _class_display_order(classes) -> List[str]:
+    return [c for c in CLASS_ORDER if c in classes] + \
+           sorted(c for c in classes if c not in CLASS_ORDER)
+
+
+def price_chains_mode(ship: str, brand: str, chains: List[List[Dict[str, Any]]],
+                      adults: int, children: int, limit: int) -> None:
+    """Price every consecutive chain leg-by-leg: the cheapest category per class
+    on each leg (guarantees included, tagged [GTY]) with per-night breakdowns
+    and per-class chain totals. One API call per leg; no cabin continuity."""
+    party = adults + children
+    print(f"\nPricing {len(chains)} chain(s) leg-by-leg for {party} guest(s) - cheapest "
+          f"category per class, cabin moves allowed. Prices are the tax-included party "
+          f"total; [GTY] = guarantee (the line assigns your cabin).\n")
+    shown = 0
+    for chain in chains:
+        if limit and shown >= limit:
+            print(f"... and {len(chains) - shown} more chain(s) (raise --limit to see them)")
+            break
+        shown += 1
+        start = _dash(chain[0]["sailDate"])
+        end = _dash(chain[-1].get("sailEndDate") or chain[-1]["sailDate"])
+        chain_nights = sum(int(v.get("duration") or 0) for v in chain)
+        print(f"{BLUE}{'=' * 70}{RESET}")
+        print(f"{BLUE}{len(chain)} sailing(s)  {start} -> {end}  ({chain_nights} nights){RESET}")
+        leg_minimums = []
+        for v in chain:
+            nights = int(v.get("duration") or 0)
+            mins = class_minimums(get_stateroom_types(
+                ship + v["voyageCode"], v["sailDate"], ship, brand, adults, children))
+            leg_minimums.append(mins)
+            print(f"  {_dash(v['sailDate'])} ({nights}n) {v.get('voyageDescription', '')}")
+            if not mins:
+                print(f"      {YELLOW}no priced inventory returned (sold out?){RESET}")
+                continue
+            for c in _class_display_order(mins):
+                m = mins[c]
+                per_night = f"  ({m['total'] / nights:,.2f}/night)" if nights else ""
+                gty = " [GTY]" if m["gty"] else ""
+                print(f"      {CLASS_LABELS.get(c, c):10} {m['category']:>3}{gty:6} "
+                      f"{m['total']:>12,.2f}{per_night}")
+        if len(chain) > 1:
+            totals = chain_class_totals(leg_minimums)
+            print(f"  {GREEN}Chain totals:{RESET}")
+            for c in _class_display_order(totals):
+                if totals[c] is None:
+                    print(f"      {CLASS_LABELS.get(c, c):10} n/a (not for sale on every leg)")
+                else:
+                    per_night = f"  ({totals[c] / chain_nights:,.2f}/night)" if chain_nights else ""
+                    print(f"      {CLASS_LABELS.get(c, c):10} {totals[c]:>16,.2f}{per_night}")
+        print()
+
+
+##################################
 # Prompt helpers
 ##################################
 def parse_decks(raw: Optional[str]) -> Optional[set]:
@@ -600,6 +699,10 @@ def main() -> None:
     ap.add_argument("--before", help="Only sailings on/before this date (YYYY-MM-DD)")
     ap.add_argument("--saildate", help="A single sailing date (YYYY-MM-DD): list its open cabins "
                                        "instead of hunting back-to-backs")
+    ap.add_argument("--price-chains", action="store_true",
+                    help="Price each consecutive chain leg-by-leg (cheapest category per class, "
+                         "cabin moves allowed, guarantees included) instead of hunting "
+                         "same-cabin runs. Type/category/side/deck filters do not apply.")
     ap.add_argument("--debug-pricing", action="store_true",
                     help="Dump the raw category pricing fields the API returns (stderr)")
     args = ap.parse_args()
@@ -705,6 +808,12 @@ def main() -> None:
               f"(longest {max((len(c) for c in chains), default=0)} legs).")
         if not chains:
             return
+
+    # Chain pricing mode: per-leg cheapest-per-class quotes, no cabin continuity -
+    # skips the type/subtype/side/deck flow (and its interactive prompts) entirely
+    if args.price_chains:
+        price_chains_mode(ship, args.brand, chains, args.adults, args.children, args.limit)
+        return
 
     # --- Stateroom type / subtype (probe a sailing that has inventory for this ship's codes) ---
     types, sample = discover_types(ship, args.brand, voyages, args.adults, args.children)

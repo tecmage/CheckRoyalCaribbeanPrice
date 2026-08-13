@@ -229,3 +229,51 @@ def test_extract_json_array_missing_or_unclosed():
 ])
 def test_norm(raw, expect):
     assert m._norm(raw) == expect
+
+
+##################################
+# Chain pricing (--price-chains)
+##################################
+def _subtype(code, category, total, gty=False):
+    return {"code": code, "categoryCode": category, "guarantee": gty,
+            "pricing": {"invoice": {"total": total}}}
+
+
+def test_class_minimums_picks_cheapest_including_guarantees():
+    types = [
+        {"code": "INTERIOR", "stateroomSubtypes": [
+            _subtype("V", "4V", 1500.0),
+            _subtype("XN", "XN", 1299.0, gty=True),   # guarantee undercuts - must win
+        ]},
+        {"code": "BALCONY", "stateroomSubtypes": [
+            _subtype("D", "4D", 2100.0),
+            _subtype("B", "2B", 2350.0),
+        ]},
+    ]
+    mins = m.class_minimums(types)
+    assert mins["INTERIOR"] == {"total": 1299.0, "category": "XN", "gty": True}
+    assert mins["BALCONY"] == {"total": 2100.0, "category": "4D", "gty": False}
+
+
+def test_class_minimums_skips_unpriced_subtypes():
+    types = [{"code": "DELUXE", "stateroomSubtypes": [
+        {"code": "GS", "categoryCode": "GS", "guarantee": False,
+         "pricing": {"invoice": {"total": None}}},
+    ]}]
+    assert m.class_minimums(types) == {}
+    assert m.class_minimums([]) == {}
+
+
+def test_chain_class_totals_requires_every_leg():
+    leg1 = {"INTERIOR": {"total": 1000.0, "category": "4V", "gty": False},
+            "BALCONY": {"total": 2000.0, "category": "4D", "gty": False}}
+    leg2 = {"INTERIOR": {"total": 1100.0, "category": "4V", "gty": False}}
+    totals = m.chain_class_totals([leg1, leg2])
+    assert totals["INTERIOR"] == 2100.0
+    assert totals["BALCONY"] is None       # missing on leg 2 -> no fake full-chain price
+    assert m.chain_class_totals([]) == {}
+
+
+def test_class_display_order_known_first_then_alpha():
+    assert m._class_display_order({"DELUXE", "INTERIOR", "ZZTOP"}) == \
+        ["INTERIOR", "DELUXE", "ZZTOP"]

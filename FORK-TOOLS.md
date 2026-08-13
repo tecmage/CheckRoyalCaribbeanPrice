@@ -55,6 +55,7 @@ Filters and tags:
 | `--connecting-permitted` | connecting staterooms are excluded by default; this re-includes them (tagged `[connecting]`) |
 | `--adults` / `--children`, `--min-legs`, `--limit` | occupancy, minimum chain length, output cap |
 | `--brand`, `--sub` | force `R`/`C` when not giving `--ship` (auto-detected otherwise); raw subtype code for power users (usually use `--category`) |
+| `--price-chains` | price each consecutive chain leg-by-leg instead of hunting same-cabin runs: cheapest category per class on every leg with per-night breakdowns and per-class chain totals. Cabin moves are allowed, so guarantee (`[GTY]`) rates are included. Type/category/side/deck filters do not apply |
 
 All values are case-insensitive. Prices are the tax-inclusive party total at the public
 rate (current promos included, no loyalty/qualifier discounts). Guarantee categories

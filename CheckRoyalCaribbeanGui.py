@@ -273,6 +273,11 @@ SCRIPTS = [
               tip='Minimum consecutive sailings a cabin must be open for (default 2).'),
         Field('Limit', '--limit', kind='int', width=4,
               tip='Max cabins listed per result (0 or blank = all).'),
+        Field('Price chains (cabin moves OK)', '--price-chains', kind='check',
+              tip='Price each consecutive sailing separately instead of hunting same-cabin runs: '
+                  'cheapest category per class on every leg with per-night breakdowns and chain '
+                  'totals; includes guarantee (GTY) rates. Type/Category/Side/Deck filters are '
+                  'ignored in this mode.'),
         Field('Flip sides OK', '--flip-sides', kind='check',
               tip='Accept chains that switch between port and starboard mid-run.'),
         Field('Hide avoid-list', '--hide-avoid', kind='check',
