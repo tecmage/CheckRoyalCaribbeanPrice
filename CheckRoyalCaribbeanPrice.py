@@ -14,25 +14,33 @@ import re
 try:
     from curl_cffi import requests
     impersonate_args = {"impersonate": "chrome"}
+    # Plain requests kept alongside for the few endpoints that misbehave under
+    # curl_cffi on some networks (room availability, issue #88)
+    import requests as requests_normal
 except ImportError:
     import requests
     impersonate_args = {}
+    # Without curl_cffi, plain requests IS the only engine - alias it so the
+    # requests_normal call sites work instead of raising NameError
+    requests_normal = requests
+
 import sys
 import traceback
 import time
 import yaml
 
-# Apprise is optional (e.g. the iOS full install runs without it): when the
-# package is missing, notifications are disabled and everything else works
-# normally. apobj is only ever constructed when the import succeeded.
-# NotifyFormat.TEXT declares notification bodies as plain text so Apprise converts
-# them per-service: HTML email renders the \n line breaks instead of collapsing
-# them to one line (issue #76); plain-text services are passed through unchanged
+# Apprise is optional (e.g. the iOS full install runs without it). The None
+# sentinels matter: the config parser checks "Apprise is None" to warn-and-disable
+# when apprise: is configured without the package - undefined names would turn
+# that check into a NameError crash (issue #85). NotifyFormat.TEXT declares
+# notification bodies as plain text so Apprise converts them per-service: HTML
+# email renders the \n line breaks instead of collapsing them (issue #76).
 try:
     from apprise import Apprise, NotifyFormat
 except ImportError:
     Apprise = None
     NotifyFormat = None
+
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -1901,8 +1909,10 @@ def check_if_room_is_available(params: CruiseURLParams) -> tuple[bool, List[Dict
     # scope completely isolated and test-stabilized.
     api_URL = f'https://www.{params.url_brand}.com/room-selection/type-and-subtype'
     try:
-        response = requests.get(api_URL, params=request_params, headers=headers,
-                                timeout=config.request_timeout if config else REQUEST_TIMEOUT)
+        # Plain requests on purpose: this endpoint misbehaves under curl_cffi on
+        # some networks (jdeath issue #88, reproduced on Windows and Docker)
+        response = requests_normal.get(api_URL, params=request_params, headers=headers,
+                                       timeout=config.request_timeout if config else REQUEST_TIMEOUT)
     except Exception as err:
         log (f"Unable to check room availability with server ({err})")
         return False, []
