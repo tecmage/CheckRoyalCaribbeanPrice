@@ -10,3 +10,6 @@ output-celebrity.txt
 output-json-celebrity.txt
 output-json-royal.txt
 output-royal.txt
+*.db
+*.db-wal
+*.db-shm
