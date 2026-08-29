@@ -530,3 +530,77 @@ def test_get_new_order_price_records_not_available_for_passenger():
     assert kwargs["item_kind"] == "watchlist"
     assert kwargs["item_code"] == "pt_beverage/3005"
     assert kwargs["current_price"] is None and kwargs["notified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Observation completeness: promos on best-price rows, distinct cabin kinds
+# ---------------------------------------------------------------------------
+def _order_price_ctx():
+    """Shared scaffolding for driving get_new_order_price with a mocked payload."""
+    from unittest.mock import MagicMock
+    account = MagicMock()
+    account.username = "user@example.com"
+    account.api_brand = "royal"
+    account.url_brand = "royalcaribbean"
+    ctx = MagicMock()
+    ctx.reservation_id = "1234567"
+    ctx.reservations = None
+    ctx.passenger_ID = "33333333"
+    ctx.passenger_name = "Matt"
+    ctx.paid_price = 55.99
+    ctx.sales_unit = "ONE_TIME"
+    ctx.for_watch = False
+    ctx.prefix, ctx.product = "pt_beverage", "3005"
+    ctx.room = "7123"
+    ctx.owner = True
+    ctx.guest_age_string = "adult"
+    ctx.order_code, ctx.order_date = "12345678", "05/24/2026"
+    booking = {"bookingId": "1234567", "sailDate": "20270320", "shipCode": "HM",
+               "numberOfNights": 7, "bookingCurrency": "USD"}
+    return account, ctx, booking
+
+
+def _order_payload(current_price, promo_title=None):
+    payload = {
+        "title": "Deluxe Beverage Package",
+        "bookingEligibility": {},
+        "startingFromPrice": {"adultPromotionalPrice": current_price},
+    }
+    if promo_title:
+        payload["promoDescription"] = {"displayName": promo_title}
+    return {"payload": payload}
+
+
+def test_promo_recorded_on_best_price_rows_too():
+    """An active promo is a fact about the observation, not the price direction:
+    a best-price row (current >= paid) must still carry discount_applied."""
+    import CheckRoyalCaribbeanPrice as crccl
+    from unittest.mock import MagicMock
+
+    account, ctx, booking = _order_price_ctx()
+    resp = MagicMock()
+    resp.json.return_value = _order_payload(current_price=79.99, promo_title="(30% OFF) EXCLUSIVE OFFER")
+
+    mock_cfg = MagicMock()
+    mock_cfg.minimum_saving_alert = None
+    with patch("CheckRoyalCaribbeanPrice.config", mock_cfg), \
+         patch("CheckRoyalCaribbeanPrice._execute_api_request", return_value=resp), \
+         patch("CheckRoyalCaribbeanPrice.log"):
+        crccl.get_new_order_price(account, booking, None, ctx)
+
+    kwargs = mock_cfg.history.record_addon.call_args.kwargs
+    assert kwargs["rebook_decision"] == "best_price"          # paid 55.99 < current 79.99
+    assert kwargs["discount_applied"] == "(30% OFF) EXCLUSIVE OFFER"
+
+
+def test_cabin_watchlist_rows_use_distinct_item_kind(tmp_path):
+    """Prospective cruise-URL watches record item_kind=cabin_watchlist; a NULL
+    reservation_id alone is too subtle to query against."""
+    db_path = tmp_path / "h.db"
+    history = PriceHistory(str(db_path))
+    history.start_run()
+    history.record_cabin_fare(item_kind="cabin_watchlist", reservation_id=None, status="priced")
+    history.record_cabin_fare(reservation_id="1234567", status="priced")  # default: booked
+    kinds = sqlite3.connect(db_path).execute(
+        "SELECT item_kind, reservation_id FROM price_points ORDER BY id").fetchall()
+    assert kinds == [("cabin_watchlist", None), ("cabin_fare", "1234567")]

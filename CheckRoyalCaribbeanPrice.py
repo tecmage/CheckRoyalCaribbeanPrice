@@ -688,10 +688,13 @@ class PriceHistory:
             self._disable(e)
 
     def record_cabin_fare(self, **fields: Any) -> None:
-        """Appends one `price_points` row for a cabin-fare observation."""
+        """Appends one `price_points` row for a cabin-fare observation.
+        Callers may pass item_kind="cabin_watchlist" for prospective (unbooked)
+        cruise-URL watches; booked cruises default to "cabin_fare"."""
         if not self.enabled or self._current_run_id is None:
             return
-        self._insert(item_kind="cabin_fare", **fields)
+        fields.setdefault("item_kind", "cabin_fare")
+        self._insert(**fields)
 
     def record_addon(self, **fields: Any) -> None:
         """Appends one `price_points` row for an addon/watchlist observation."""
@@ -1797,6 +1800,9 @@ def get_cruise_price(account_info: AccountInfo,
     # Fields shared by every PriceHistory.record_cabin_fare() call below;
     # each call site only adds current_price/status/rebook_decision/notified
     history_common = {
+        # Booked cruises vs prospective cruise-URL watches are different item
+        # kinds - a NULL reservation_id alone is too subtle to query against
+        "item_kind": "cabin_fare" if automatic_URL else "cabin_watchlist",
         # str-coerced to match the addon rows, so the two kinds join cleanly
         "reservation_id": str(reservation_id) if reservation_id is not None else None,
         "account_label": account_info.username,
@@ -2385,11 +2391,16 @@ def get_new_order_price(
     })
 
     # Process Deal Alerts
-    # rebook_decision / notified / history_discount_applied are computed inline below,
-    # then recorded once after the branch (see B.3/C.2) - the alert logic itself is untouched.
+    # rebook_decision / notified are computed inline below, then recorded once
+    # after the branch (see B.3/C.2) - the alert logic itself is untouched.
     rebook_decision: Optional[str] = None
     notified = False
-    history_discount_applied: Optional[str] = None
+    # An active promo is a fact about the observation, not about the price
+    # direction - read it here so best-price rows carry it too, not only drops
+    # (the console line still mentions it only on the drop path, as before)
+    promo_description = payload.get("promoDescription")
+    history_discount_applied: Optional[str] = (
+        promo_description.get("displayName") if promo_description else None)
     if current_price < paid_price:
         # Current price on server is lower than the paid price (rebooking alert path)
         saving = round(paid_price - current_price, 2)
@@ -2410,11 +2421,8 @@ def get_new_order_price(
         if config.minimum_saving_alert is not None:
             text += f" ({saving_label})"
 
-        promo_description = payload.get("promoDescription")
         if promo_description:
-            promotion_title = promo_description.get("displayName")
-            text += f'\n\t\tPromotion:{promotion_title}'
-            history_discount_applied = promotion_title
+            text += f'\n\t\tPromotion:{history_discount_applied}'
 
         if for_watch:
             text += f'\n\tBook at https://www.{account_info.url_brand}.com/account/cruise-planner/category/{prefix}/product/{product}?bookingId={reservation_ID}&shipCode={ship}&sailDate={start_date}'
