@@ -11,14 +11,16 @@ import time
 
 # curl_cffi impersonates a real browser's TLS fingerprint so the cruise line's
 # edge servers do not reject some IPs/systems as bots with 403 Access Denied
-# (see jdeath/CheckRoyalCaribbeanPrice issue #64, where the Browse script was
-# confirmed affected). Fall back to plain requests where it is not installed
-# (e.g. iOS), which works fine for most people.
+# (see jdeath/CheckRoyalCaribbeanPrice issue #64). Fall back to plain requests
+# where it is not installed (e.g. iOS), which works fine for most people.
+# Keep standard requests available alongside curl_cffi for endpoints that
+# misbehave under TLS impersonation/headers on some networks (e.g. issue #88)
+import requests as plain_requests
 try:
     from curl_cffi import requests
     IMPERSONATE_ARGS = {"impersonate": "chrome"}
 except ImportError:
-    import requests
+    requests = plain_requests
     IMPERSONATE_ARGS = {}
 
 from datetime import datetime, date
@@ -36,6 +38,24 @@ USER_AGENT_MOBILE_GRAPH = 'okhttp/4.12.0'
 
 APPKEY_WEB = 'hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm'
 USER_AGENT_WEB = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0'
+
+# API timeout / retry behavior
+# Seconds before giving up on an API call so a stalled connection cannot hang the run
+# forever. Override with requestTimeout in config.yaml if the API is slow for you.
+REQUEST_TIMEOUT = 30
+
+# Shorter timeout for quick auxiliary endpoints (check-in status, loyalty summary,
+# sample-config download) where a long wait is not worth it
+SHORT_REQUEST_TIMEOUT = 10
+
+# How API failures are handled when a call site does not choose explicitly:
+# "retry" (back off and try again), "skip" (log and move on), "exit" (stop the run)
+DEFAULT_ON_FAILURE = "retry"
+
+# Retry attempts and exponential backoff base for on_failure="retry" calls
+# (sleep = RETRY_BACKOFF_BASE ** attempt seconds between attempts: 2s, 4s)
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2
 
 # ANSI color codes
 # Original values
@@ -57,14 +77,11 @@ RESET = '\033[0m' # Resets color to default
 #YELLOW = '\033[1;33;40m' # Standard yellow text, black background, bold weight
 #BLUE = '\033[1;34;40m'   # Standard dark blue text, black background, bold weight
 
-# Environmental overrides for terminals struggling with Unicode glyphs (e.g., MobaXterm)
+# Environmental overrides for terminals struggling with Unicode glyphs such as ↑ (e.g., MobaXterm)
 PROBLEM_ENVS = ["MOBAEXTRACTONTHEFLY", "MOBANOACL"]
-
-# Transient failures worth retrying: throttling and server-side errors
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 3
-
 has_terminal_issues = False;
+
+# Define global logging hooks so they are available everywhere in the script module
 log = None
 log_warn = None
 log_err = None
@@ -85,6 +102,7 @@ class EasyLogger:
     def __init__(self, logger_instance: logging.Logger) -> None:
         self._logger = logger_instance
 
+
     def __call__(self, message: Any, *args: Any, **kwargs: Any) -> None:
         """
         Maps log("text") directly to logger.info
@@ -93,13 +111,16 @@ class EasyLogger:
         """
         self._logger.info(message, *args, **kwargs)
 
+
     def warn(self, message: Any, *args: Any, **kwargs: Any) -> None:
         """Redirects log_warn("text") calls to logger.warning"""
         self._logger.warning(message, *args, **kwargs)
 
+
     def error(self, message: Any, *args: Any, **kwargs: Any) -> None:
         """Redirects log_err("text") calls to logger.error"""
         self._logger.error(message, *args, **kwargs)
+
 
 class PrintRedirector:
     """
@@ -116,6 +137,7 @@ class PrintRedirector:
     def __init__(self, logger_func: Any) -> None:
         self.logger_func = logger_func
 
+
     def write(self, buf: str) -> None:
         # Python's print() appends content and trailing newlines sequentially.
         # Strip trailing line breaks to avoid logging empty string rows.
@@ -123,8 +145,10 @@ class PrintRedirector:
         if content:
             self.logger_func(content)
 
+
     def flush(self) -> None:
         pass  # Standard log handlers manage their own flushing mechanics
+
 
 class StripAnsiFilter(logging.Filter):
     """
@@ -136,6 +160,7 @@ class StripAnsiFilter(logging.Filter):
     """
     ANSI_REGEX: re.Pattern[str] = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
+
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
             record.msg = self.ANSI_REGEX.sub('', record.msg)
@@ -145,88 +170,141 @@ class StripAnsiFilter(logging.Filter):
 ##################################
 # Helper functions
 ##################################
+def new_api_session(use_impersonation: bool = True) -> plain_requests.Session:
+    """
+    Creates a network session that impersonates a real browser's TLS fingerprint
+    when curl_cffi is available and requested, falling back to standard requests.
+    """
+    if use_impersonation and IMPERSONATE_ARGS:
+        return requests.Session(**IMPERSONATE_ARGS)
+    return plain_requests.Session()
+
+
 def _execute_api_request(
-    method: str,
-    url: str,
+    account_info: Optional[AccountInfo] = None,
+    method: str = "GET",
+    url: str = "",
     params: Optional[dict] = None,
     data: Optional[Union[str, dict]] = None,
     json_data: Optional[dict] = None,
     headers: Optional[dict] = None,
-    timeout: int = 15,
-    exit_on_fail: bool = True
-) -> Optional[requests.Response]:
+    timeout: Optional[int] = None,
+    on_failure: str = DEFAULT_ON_FAILURE,
+    exit_on_fail: Optional[bool] = None,
+    max_retries: int = MAX_RETRIES,
+    use_impersonation: bool = True
+) -> Optional[plain_requests.Response]:
     """
-    Unified API execution engine for anonymous browser network interactions.
+    Unified API execution engine for all cruise line network interactions.
 
-    Centralizes connection tracking parameters, developer keys, connect timeouts,
-    and handles graceful handling or program exit states during connection issues.
+    Centralizes tracking parameters, developer keys, and connect timeouts.
+    If an active session profile exists, it automatically injects 'Access-Token'
+    and account tracking headers into the request context.
 
-    Transient failures (connection errors, timeouts, throttling, and server-side
-    errors) are retried with exponential backoff so a single API blip does not
-    abort or truncate a long browsing session. Definitive HTTP answers such as
-    404 are not retried: they signal terminal pagination boundaries.
+    Supported strategies for on_failure:
+    - "retry": Automatically retries transient errors with exponential backoff.
+    - "skip" : Logs the warning and returns None on failure.
+    - "exit" : Logs the error and terminates the script entirely on failure.
     """
-    def _report_failure(error: Exception) -> Optional[requests.Response]:
-        error_msg = f"Can't contact cruise line servers; please try again later\n(program exception '{error}')"
-        if exit_on_fail:
-            log(error_msg)
-            sys.exit(1)
-        logging.warning(f"Non-critical API interaction skipped (exception: {error})")
-        return None
+    # Backwards compatibility helper for existing exit_on_fail parameter callers
+    if exit_on_fail is not None:
+        on_failure = "exit" if exit_on_fail else "skip"
 
-    # Start with any caller-specified override headers, or an empty base
+    # Resolve effective timeout: explicit override -> config setting -> default baseline
+    if timeout is None:
+        timeout = getattr(config, "request_timeout", REQUEST_TIMEOUT) if 'config' in globals() else REQUEST_TIMEOUT
+
+    # Start with caller override headers or an empty dictionary
     final_headers = headers.copy() if headers else {}
 
-    # Always include the baseline developer web key if not overridden
-    if "appkey" not in final_headers:
-        final_headers["appkey"] = APPKEY_WEB
+    # Inject corporate authentication layers if a live session exists
+    if account_info and getattr(account_info, "access", None):
+        if "Access-Token" not in final_headers and account_info.access.token:
+            final_headers["Access-Token"] = account_info.access.token
+        if "vds-id" not in final_headers and account_info.access.id:
+            final_headers["vds-id"] = account_info.access.id
+        if "account-id" not in final_headers and account_info.access.id:
+            final_headers["account-id"] = account_info.access.id
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        failure = None
-        response = None  # Prevent UnboundLocalError if request raises an exception before assignment
-        try:
-            response = requests.request(
-                method=method.upper(),
-                url=url,
-                params=params,
-                data=data,
-                json=json_data,
-                headers=final_headers,
-                timeout=timeout,
-                **IMPERSONATE_ARGS
-            )
-            # Explicitly catch 5xx server codes to trigger retries even on unconfigured test mocks
-            if response.status_code >= 500:
-                raise requests.exceptions.HTTPError(f"Server Error {response.status_code}", response=response)
+    # Always include baseline developer web key
+    if "AppKey" not in final_headers and "appkey" not in final_headers:
+        final_headers["AppKey"] = APPKEY_WEB
 
-            response.raise_for_status()
-            return response
+    # Target session selection: existing session token or new engine session
+    if account_info and getattr(account_info, "access", None) and account_info.access.session:
+        session_context = account_info.access.session
+    else:
+        session_context = new_api_session(use_impersonation=use_impersonation)
 
-        except Exception as e:
-            failure = e
+    def _handle_terminal_failure(error: Exception) -> Optional[plain_requests.Response]:
+        error_msg = f"Can't contact cruise line servers; please try again later\n(program exception '{error}')"
+        if on_failure == "exit":
+            log(error_msg)
+            sys.exit(1)
+        else:
+            logging.warning(f"Non-critical API interaction skipped (exception: {error})")
+            return None
 
-            # 1. Resolve response object attached to exception, local response, or test mock
-            resp_obj = getattr(e, "response", None) or response
-            status_code = getattr(resp_obj, "status_code", None)
+    # --- STRATEGY A: RESILIENT RETRY LOOP ---
+    if on_failure == "retry":
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = session_context.request(
+                    method=method.upper(),
+                    url=url,
+                    params=params,
+                    data=data,
+                    json=json_data,
+                    headers=final_headers,
+                    timeout=timeout
+                )
 
-            # 2. Fallback: Parse status code from exception string for sparse mocks ("404 Not Found")
-            if status_code is None:
-                match = re.search(r"\b([45]\d\d)\b", str(e))
-                if match:
-                    status_code = int(match.group(1))
+                # Treat 5xx server errors as transient retriable errors
+                if response.status_code >= 500:
+                    raise plain_requests.exceptions.HTTPError(
+                        f"Server Error {response.status_code}", response=response
+                    )
 
-            # Strictly 4xx client errors (400–499) are terminal and must NOT retry
-            if status_code is not None and 400 <= status_code < 500:
-                return _report_failure(e)
+                response.raise_for_status()
+                return response  # Success!
 
-        # Transient failures (connection errors, timeouts, 5xx) reach this backoff loop:
-        if attempt < MAX_ATTEMPTS:
-            wait = 2 ** attempt
-            logging.warning(f"API request failed ({failure}); retrying in {wait}s (attempt {attempt} of {MAX_ATTEMPTS})")
-            time.sleep(wait)
+            except Exception as e:
+                # Terminal 4xx client errors (e.g. 401, 403, 404) fail fast without retrying
+                resp_obj = getattr(e, "response", None)
+                status_code = getattr(resp_obj, "status_code", None)
+                # Fallback: curl_cffi's HTTPError does not always attach .response -
+                # parse the status out of the exception text ("404 Not Found") so a
+                # definitive client error is never misread as transient and retried
+                if status_code is None:
+                    match = re.search(r"\b([45]\d\d)\b", str(e))
+                    if match:
+                        status_code = int(match.group(1))
+                if status_code and 400 <= status_code < 500:
+                    return _handle_terminal_failure(e)
 
-    # --- We only reach this point if the loop finished and ALL attempts failed ---
-    return _report_failure(failure)
+                if attempt < max_retries:
+                    backoff_time = RETRY_BACKOFF_BASE ** attempt
+                    logging.warning(f"Attempt {attempt}/{max_retries} failed for {url}: {e}. Retrying in {backoff_time}s...")
+                    time.sleep(backoff_time)
+                else:
+                    logging.warning(f"All {max_retries} retry attempts exhausted for {url}.")
+                    return _handle_terminal_failure(e)
+
+    # --- STRATEGY B: STATIC SINGLE-SHOT ACTIONS ("skip" or "exit") ---
+    try:
+        response = session_context.request(
+            method=method.upper(),
+            url=url,
+            params=params,
+            data=data,
+            json=json_data,
+            headers=final_headers,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        return response
+    except Exception as e:
+        return _handle_terminal_failure(e)
 
 
 def print_response(response: Union[Dict[str, Any], List[Any], str, requests.Response]) -> None:
@@ -305,7 +383,7 @@ def get_ships_web() -> List[Dict[str, str]]:
     headers = {
         'User-Agent': USER_AGENT_WEB,
         'Accept': 'application/json',
-        'appkey': APPKEY_WEB,
+        'AppKey': APPKEY_WEB,
     }
 
     params = {
@@ -316,7 +394,8 @@ def get_ships_web() -> List[Dict[str, str]]:
         method="GET",
         url="https://aws-prd.api.rccl.com/en/royal/web/v2/ships",
         params=params,
-        headers=headers
+        headers=headers,
+        on_failure="retry"
     )
 
     if not response:
@@ -368,13 +447,14 @@ def get_sailings_web(ship_code: str) -> List[Dict[str, Any]]:
     headers = {
         'User-Agent': USER_AGENT_WEB,
         'Accept': 'application/json',
-        'appkey': APPKEY_WEB,
+        'AppKey': APPKEY_WEB,
     }
 
     response = _execute_api_request(
         method="GET",
         url=f"https://aws-prd.api.rccl.com/en/royal/web/v3/ships/{ship_code}/voyages",
-        headers=headers
+        headers=headers,
+        on_failure="retry"
     )
 
     if not response:
@@ -432,13 +512,14 @@ def get_sailing_details_web(ship_code: str, sail_date: str) -> Dict[int, str]:
     headers = {
         'User-Agent': USER_AGENT_WEB,
         'Accept': 'application/json',
-        'appkey': APPKEY_WEB,
+        'AppKey': APPKEY_WEB,
     }
 
     response = _execute_api_request(
         method="GET",
         url=f"https://aws-prd.api.rccl.com/en/royal/web/v3/ships/{ship_code}/sailDate/{sail_date}",
-        headers=headers
+        headers=headers,
+        on_failure="retry"
     )
 
     ports = {}
@@ -527,7 +608,7 @@ def get_web_categories(ship: str, saildate: str) -> Dict[str, str]:
     headers = {
         'User-Agent': USER_AGENT_WEB,
         'Accept': 'application/json',
-        'appkey': APPKEY_WEB,
+        'AppKey': APPKEY_WEB,
     }
 
     # DESIGN NOTE: Breaking the query into a multi-line string exposes the expected GraphQL schema.
@@ -557,7 +638,8 @@ def get_web_categories(ship: str, saildate: str) -> Dict[str, str]:
         method="POST",
         url="https://aws-prd.api.rccl.com/en/royal/web/graphql",
         headers=headers,
-        json_data=json_data
+        json_data=json_data,
+        on_failure="retry"
     )
 
     product_map = {}
@@ -614,7 +696,7 @@ def get_products_graph_all_pages(
     headers = {
         'User-Agent': USER_AGENT_WEB,
         'Accept': 'application/json',
-        'appkey': APPKEY_WEB,
+        'AppKey': APPKEY_WEB,
     }
 
     # Map application-friendly sort choices to the strict backend GraphQL Enum types
@@ -721,7 +803,7 @@ def get_products_graph_all_pages(
             url="https://aws-prd.api.rccl.com/en/royal/web/graphql",
             headers=headers,
             json_data=json_data,
-            exit_on_fail=False
+            on_failure="skip"
         )
 
         if not response:
@@ -912,7 +994,7 @@ def get_all_activities_web(ship_code: str, sail_date: str) -> List[Dict[str, Any
     headers = {
         'User-Agent': USER_AGENT_WEB,
         'Accept': 'application/json',
-        'appkey': APPKEY_WEB,
+        'AppKey': APPKEY_WEB,
     }
 
     products = []
@@ -935,7 +1017,7 @@ def get_all_activities_web(ship_code: str, sail_date: str) -> List[Dict[str, Any
             url="https://aws-prd.api.rccl.com/en/royal/web/v3/products",
             params=params,
             headers=headers,
-            exit_on_fail=False
+            on_failure="skip"
         )
 
         if not response:
@@ -1083,7 +1165,7 @@ def _extract_json_array(text: str, key: str) -> Optional[List[Any]]:
             elif ch == "]":
                 depth -= 1
                 if depth == 0:
-                    # Successfully isolated the exact substring boundaries of the array
+                    # Succ0essfully isolated the exact substring boundaries of the array
                     try:
                         return json.loads(text[start:i + 1])
                     except json.JSONDecodeError:
@@ -1159,7 +1241,7 @@ def get_cruise_price_from_API(
         url=f"https://www.{base_host}/room-selection/type-and-subtype",
         params=params,
         headers=headers,
-        exit_on_fail=False
+        on_failure="skip"
     )
 
     rooms = _extract_json_array(response.text, "rooms") if response else None
@@ -1209,7 +1291,7 @@ def get_MDR_locations(ship_code: str, sail_date: str, is_royal: bool) -> List[st
     """
     # This gets the main dining room name to reduce API data request
     headers = {
-        'appkey': APPKEY_MOBILE_GRAPH,
+        'AppKey': APPKEY_MOBILE_GRAPH,
         'content-type': 'application/json',
         'user-agent': USER_AGENT_MOBILE_GRAPH,
     }
@@ -1278,7 +1360,8 @@ def get_MDR_locations(ship_code: str, sail_date: str, is_royal: bool) -> List[st
         method="POST",
         url="https://api.rccl.com/en/royal/mobile/graphql",
         headers=headers,
-        json_data=json_data
+        json_data=json_data,
+        on_failure="skip"
     )
 
     venue_ids = []
@@ -1326,7 +1409,7 @@ def print_MDR_menus(ship_code: str, sail_date: str, venue_ids: List[str], ports:
     room menus day-by-day, cross-referencing daily port itineraries.
     """
     headers = {
-        'appkey': APPKEY_MOBILE_GRAPH,
+        'AppKey': APPKEY_MOBILE_GRAPH,
         'content-type': 'application/json',
         'user-agent': USER_AGENT_MOBILE_GRAPH,
     }
@@ -1384,7 +1467,7 @@ def print_MDR_menus(ship_code: str, sail_date: str, venue_ids: List[str], ports:
         url="https://api.rccl.com/en/royal/mobile/graphql",
         headers=headers,
         json_data=json_data,
-        exit_on_fail=False
+        on_failure="skip"
     )
 
     if not response:
@@ -1505,7 +1588,12 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
 
-    # Terminal Stream Handler (Keeps original ANSI terminal colors)
+    # 4. Terminal Stream Handler (Keeps original ANSI terminal colors)
+    # Extract underlying real stdout stream to prevent recursion on re-initialization calls
+    real_stdout = sys.stdout
+    while isinstance(real_stdout, PrintRedirector):
+        real_stdout = getattr(real_stdout, '_wrapped_stream', None) or sys.__stdout__
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter('%(message)s'))
     if platform.system() == "iOS":
@@ -1513,7 +1601,7 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
 
     root_logger.addHandler(console_handler)
 
-    # 4. Plain Text File Handler (Only built if a log file path string is passed)
+    # 5. Plain Text File Handler (Only built if a log file path string is passed)
     if log_file_path:
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         delimiter = f"\n{'='*60}\n--- RUN STARTED: {timestamp_str} ---\n{'='*60}\n"
@@ -1529,7 +1617,7 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
         except IOError as e:
             sys.stderr.write(f"Warning: Could not open log file '{log_file_path}': {e}\n")
 
-    # 5. Initialize the shortcut execution instances and map to module globals
+    # 6. Initialize the shortcut execution instances and map to module globals
     easy_log_instance = EasyLogger(root_logger)
     log = easy_log_instance
     log_warn = easy_log_instance.warn
@@ -1539,7 +1627,7 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
     sys.stdout = PrintRedirector(root_logger.info)
 
 
-def main() -> None:
+def main(args: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Browse Royal Caribbean Price")
     parser.add_argument('-c', '--currency', type=str, default='System', help='currency (default: System Setting)')
     parser.add_argument('-s', '--ship', type=str, help='Ship')
@@ -1549,7 +1637,7 @@ def main() -> None:
     parser.add_argument('-w', '--watchlistcodes', action='store_true', dest="watchlist_codes", help='Show Codes For Watchlist')
     parser.add_argument('-a', '--activitysort', choices=['date', 'alpha', 'default'], default="default", dest="activity_sort", help='Set activity sorting metric')
     parser.add_argument('-l', '--logfile', type=str, nargs='?', const='output.txt', dest="log_file", help='optional logfile, eg. output.txt')
-    args = parser.parse_args()
+    args = parser.parse_args(args)
 
     # Logging must exist before get_system_currency: its locale-failure branch
     # calls log(), which is None until setup_hybrid_logging has run
@@ -1683,6 +1771,7 @@ def main() -> None:
 ##################################
 # Dead/Obsolete/Unused functions
 ##################################
+'''
 appkey_mobile = 'cdCNc04srNq4rBvKofw1aC50dsdSaPuc' # royal
 appversion_mobile = '1.73.4'
 user_agent_mobile = 'royal/1.73.4 (com.rccl.royalcaribbean; build:2528; android 16) okhttp/4.12.0'
@@ -1895,7 +1984,7 @@ def printThemeNights(shipCode,sailDate,duration):
     elif foundTheme < duration:
         log("Themes Not Fully Loaded")
 #    flush_print_buffer()
-
+'''
 ##################################
 # End Dead/Obsolete/Unused functions
 ##################################

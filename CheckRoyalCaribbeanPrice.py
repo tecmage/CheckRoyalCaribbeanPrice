@@ -7,34 +7,33 @@ import logging
 import os
 import platform
 import re
+
 # curl_cffi impersonates a real browser's TLS fingerprint so the cruise line's
 # edge servers do not reject some IPs/systems as bots with 403 Access Denied
 # (see jdeath/CheckRoyalCaribbeanPrice issue #64). Fall back to plain requests
 # where it is not installed (e.g. iOS), which works fine for most people.
+# Keep standard requests available alongside curl_cffi for endpoints that
+# misbehave under TLS impersonation/headers on some networks (e.g. issue #88)
+import requests as plain_requests
 try:
     from curl_cffi import requests
-    impersonate_args = {"impersonate": "chrome"}
-    # Plain requests kept alongside for the few endpoints that misbehave under
-    # curl_cffi on some networks (room availability, issue #88)
-    import requests as requests_normal
+    IMPERSONATE_ARGS = {"impersonate": "chrome"}
 except ImportError:
-    import requests
-    impersonate_args = {}
-    # Without curl_cffi, plain requests IS the only engine - alias it so the
-    # requests_normal call sites work instead of raising NameError
-    requests_normal = requests
+    requests = plain_requests
+    IMPERSONATE_ARGS = {}
 
 import sys
 import traceback
 import time
 import yaml
 
+# NotifyFormat.TEXT declares notification bodies as plain text so Apprise converts
+# them per-service: HTML email renders the \n line breaks instead of collapsing
+# them to one line (issue #76); plain-text services are passed through unchanged
 # Apprise is optional (e.g. the iOS full install runs without it). The None
 # sentinels matter: the config parser checks "Apprise is None" to warn-and-disable
-# when apprise: is configured without the package - undefined names would turn
-# that check into a NameError crash (issue #85). NotifyFormat.TEXT declares
-# notification bodies as plain text so Apprise converts them per-service: HTML
-# email renders the \n line breaks instead of collapsing them (issue #76).
+# when apprise: is configured without the package - a bare "except: pass" leaves
+# the names undefined and turns that check into a NameError crash (issue #85).
 try:
     from apprise import Apprise, NotifyFormat
 except ImportError:
@@ -58,16 +57,20 @@ APPKEY_WEB = 'hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm'
 # Seconds before giving up on an API call so a stalled connection cannot hang the run
 # forever. Override with requestTimeout in config.yaml if the API is slow for you.
 REQUEST_TIMEOUT = 30
+
 # Shorter timeout for quick auxiliary endpoints (check-in status, loyalty summary,
 # sample-config download) where a long wait is not worth it
 SHORT_REQUEST_TIMEOUT = 10
+
 # How API failures are handled when a call site does not choose explicitly:
 # "retry" (back off and try again), "skip" (log and move on), "exit" (stop the run)
 DEFAULT_ON_FAILURE = "retry"
+
 # Retry attempts and exponential backoff base for on_failure="retry" calls
 # (sleep = RETRY_BACKOFF_BASE ** attempt seconds between attempts: 2s, 4s)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2
+
 # Cool-down between accounts when checking more than one, to avoid hammering the API
 ACCOUNT_COOLDOWN_SECONDS = 5
 
@@ -95,6 +98,10 @@ BLUE = '\033[94m'        # Bright blue text, default background, normal weight
 # Global storage of user config read from YAML
 config: CruiseAppConfig = None
 
+# Environmental overrides for terminals struggling with Unicode glyphs such as ↑ (e.g., MobaXterm)
+PROBLEM_ENVS = ["MOBAEXTRACTONTHEFLY", "MOBANOACL"]
+has_terminal_issues = False;
+
 # Define global logging hooks so they are available everywhere in the script module
 log = None
 log_warn = None
@@ -103,6 +110,9 @@ log_err = None
 # Rows collected across all accounts/bookings during a run, printed at the end as a
 # compact check-in + final-payment summary table (see print_checkin_payment_table)
 checkin_payment_rows: List[Dict[str, Any]] = []
+
+# Add-on watch prices collected during the current run for machine-readable output
+watch_price_rows: List[Dict[str, Any]] = []
 
 ##################################
 # Classes (Structural and Logging)
@@ -373,7 +383,6 @@ class WatchItemContext:
     passenger_name: str
     room: Optional[str]
     paid_price: float
-    currency: str
     guest_age_string: str
     sales_unit: Optional[Any] = None
     for_watch: bool = True
@@ -419,6 +428,11 @@ class AccountInfo:
     access: Optional[APIAccess] = None
     found_items: Set[str] = field(default_factory=set)
 
+    # Live Runtime Object (excluded from the YAML mapping, like config.apobj).
+    # Per-account Apprise object; falls back to the global config.apobj via
+    # notifier_for() when this account has no apprise: list of its own.
+    apobj: Optional[Apprise] = None
+
 
     @property
     def is_royal(self) -> bool:
@@ -463,7 +477,6 @@ class WatchListItem:
     price: float
     enabled: bool = True
     guest_age_string: str = "adult"
-    currency: str = "USD"
     reservations: Optional[List[str]] = field(default_factory=list)
 
 
@@ -493,14 +506,15 @@ class CruiseAppConfig:
     date_display_format: Optional[str] = "%x"
     request_timeout: int = REQUEST_TIMEOUT
     log_file: Optional[str] = None
+    output_watch_as_json: bool = False
+    output_json_watch_file: Optional[str] = "output-json-watch.txt"
     apprise_urls: List[str] = field(default_factory=list)
     notify_on_error: bool = False
     apprise_test: Optional[bool] = None
-    currency_override: Optional[str] = None
 
     display_cruise_prices: bool = True
     minimum_saving_alert: Optional[float] = None
-    show_promos: bool = True
+    show_promos: bool = False
 
     # Complex Objects
     accounts: List[AccountInfo] = field(default_factory=list)
@@ -543,25 +557,30 @@ class CruiseAppConfig:
 ############################################
 # Low-level Network Engine & Data Harvesters
 ############################################
-def new_api_session() -> requests.Session:
+def new_api_session(use_impersonation: bool = True) -> plain_requests.Session:
     """
     Creates a network session that impersonates a real browser's TLS fingerprint
-    when curl_cffi is available, falling back to a standard requests session.
+    when curl_cffi is available and requested, falling back to standard requests.
     """
-    return requests.Session(**impersonate_args)
+    if use_impersonation and IMPERSONATE_ARGS:
+        return requests.Session(**IMPERSONATE_ARGS)
+    return plain_requests.Session()
 
 
 def _execute_api_request(
-    account_info: Optional[AccountInfo],
-    method: str,
-    url: str,
+    account_info: Optional[AccountInfo] = None,
+    method: str = "GET",
+    url: str = "",
     params: Optional[dict] = None,
     data: Optional[Union[str, dict]] = None,
+    json_data: Optional[dict] = None,
     headers: Optional[dict] = None,
     timeout: Optional[int] = None,
     on_failure: str = DEFAULT_ON_FAILURE,
-    max_retries: int = MAX_RETRIES
-) -> Optional[requests.Response]:
+    exit_on_fail: Optional[bool] = None,
+    max_retries: int = MAX_RETRIES,
+    use_impersonation: bool = True
+) -> Optional[plain_requests.Response]:
     """
     Unified API execution engine for all cruise line network interactions.
 
@@ -571,19 +590,22 @@ def _execute_api_request(
 
     Supported strategies for on_failure:
     - "retry": Automatically retries transient errors with exponential backoff.
-    - "skip" : Logs the warning and returns None.
-    - "exit" : Logs the error and terminates the script entirely.
+    - "skip" : Logs the warning and returns None on failure.
+    - "exit" : Logs the error and terminates the script entirely on failure.
     """
-    # Resolve the effective timeout: an explicit caller override wins, then the
-    # user-configured requestTimeout, then the 30-second baseline default
-    if timeout is None:
-        timeout = config.request_timeout if config else REQUEST_TIMEOUT
+    # Backwards compatibility helper for existing exit_on_fail parameter callers
+    if exit_on_fail is not None:
+        on_failure = "exit" if exit_on_fail else "skip"
 
-    # Start with any caller-specified override headers, or an empty base
+    # Resolve effective timeout: explicit override -> config setting -> default baseline
+    if timeout is None:
+        timeout = getattr(config, "request_timeout", REQUEST_TIMEOUT) if 'config' in globals() else REQUEST_TIMEOUT
+
+    # Start with caller override headers or an empty dictionary
     final_headers = headers.copy() if headers else {}
 
     # Inject corporate authentication layers if a live session exists
-    if account_info and account_info.access:
+    if account_info and getattr(account_info, "access", None):
         if "Access-Token" not in final_headers and account_info.access.token:
             final_headers["Access-Token"] = account_info.access.token
         if "vds-id" not in final_headers and account_info.access.id:
@@ -591,12 +613,24 @@ def _execute_api_request(
         if "account-id" not in final_headers and account_info.access.id:
             final_headers["account-id"] = account_info.access.id
 
-    # Always include the baseline developer key
-    if "AppKey" not in final_headers:
+    # Always include baseline developer web key
+    if "AppKey" not in final_headers and "appkey" not in final_headers:
         final_headers["AppKey"] = APPKEY_WEB
 
-    # Choose the target network session channel
-    session_context = account_info.access.session if (account_info and account_info.access) else new_api_session()
+    # Target session selection: existing session token or new engine session
+    if account_info and getattr(account_info, "access", None) and account_info.access.session:
+        session_context = account_info.access.session
+    else:
+        session_context = new_api_session(use_impersonation=use_impersonation)
+
+    def _handle_terminal_failure(error: Exception) -> Optional[plain_requests.Response]:
+        error_msg = f"Can't contact cruise line servers; please try again later\n(program exception '{error}')"
+        if on_failure == "exit":
+            log(error_msg)
+            sys.exit(1)
+        else:
+            logging.warning(f"Non-critical API interaction skipped (exception: {error})")
+            return None
 
     # --- STRATEGY A: RESILIENT RETRY LOOP ---
     if on_failure == "retry":
@@ -607,19 +641,41 @@ def _execute_api_request(
                     url=url,
                     params=params,
                     data=data,
+                    json=json_data,
                     headers=final_headers,
                     timeout=timeout
                 )
+
+                # Treat 5xx server errors as transient retriable errors
+                if response.status_code >= 500:
+                    raise plain_requests.exceptions.HTTPError(
+                        f"Server Error {response.status_code}", response=response
+                    )
+
                 response.raise_for_status()
                 return response  # Success!
+
             except Exception as e:
+                # Terminal 4xx client errors (e.g. 401, 403, 404) fail fast without retrying
+                resp_obj = getattr(e, "response", None)
+                status_code = getattr(resp_obj, "status_code", None)
+                # Fallback: curl_cffi's HTTPError does not always attach .response -
+                # parse the status out of the exception text ("404 Not Found") so a
+                # definitive client error is never misread as transient and retried
+                if status_code is None:
+                    match = re.search(r"\b([45]\d\d)\b", str(e))
+                    if match:
+                        status_code = int(match.group(1))
+                if status_code and 400 <= status_code < 500:
+                    return _handle_terminal_failure(e)
+
                 if attempt < max_retries:
                     backoff_time = RETRY_BACKOFF_BASE ** attempt
                     logging.warning(f"Attempt {attempt}/{max_retries} failed for {url}: {e}. Retrying in {backoff_time}s...")
                     time.sleep(backoff_time)
                 else:
-                    logging.warning(f"All {max_retries} retry attempts exhausted for {url}. Falling back to 'skip' safety.")
-                    return None
+                    logging.warning(f"All {max_retries} retry attempts exhausted for {url}.")
+                    return _handle_terminal_failure(e)
 
     # --- STRATEGY B: STATIC SINGLE-SHOT ACTIONS ("skip" or "exit") ---
     try:
@@ -628,21 +684,14 @@ def _execute_api_request(
             url=url,
             params=params,
             data=data,
+            json=json_data,
             headers=final_headers,
             timeout=timeout
         )
         response.raise_for_status()
         return response
     except Exception as e:
-        error_msg = f"Can't contact cruise line servers; please try again later\n(program exception '{e}')"
-
-        if on_failure == "exit":
-            log(error_msg)
-            sys.exit(1)
-        else:
-            # Matches legacy exit_on_fail=False behavior
-            logging.warning(f"Non-critical API interaction skipped (exception: {e})")
-            return None
+        return _handle_terminal_failure(e)
 
 
 def _extract_json_array(text: str, key: str) -> Optional[list[Any]]:
@@ -877,6 +926,20 @@ def parse_provided_URL(url: str) -> CruiseURLParams:
         cabin_string = r0d_list[0]
     else:
         cabin_string = ""
+
+    # Some Countries List Cabin String as B, causing issue with room lookup
+    parsed_cabin_string = _parse_stateroom_type(cabin_string)
+    cabin_string = parsed_cabin_string if parsed_cabin_string != "NONE" else cabin_string
+#    if cabin_string == "I":
+#        cabin_string = "INTERIOR"
+#    if cabin_string == "O":
+#        cabin_string = "OUTSIDE"
+#    if cabin_string == "B":
+#        cabin_string = "BALCONY"
+#    if cabin_string == "D":
+#        cabin_string = "DELUXE"
+#    if cabin_string == "C":
+#        cabin_string = "CONCIERGE"
 
     # Parse the URL parameters and save in a class instance
     return CruiseURLParams(
@@ -1154,7 +1217,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
     session = account_info.access.session
 
     # Pull the needed items from the global config
-    apobj = config.apobj
+    apobj = notifier_for(account_info)
     watch_list_items = config.watch_list
     display_cruise_prices = config.display_cruise_prices
     reservation_price_paid = config.reservation_prices
@@ -1239,6 +1302,9 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         all_included_flag = False
         cruise_paid_price_from_API = result.get("prices", [])
 
+        final_payment_date = get_final_payment_date(number_of_nights, sail_date)
+        final_payment_date_display = final_payment_date.strftime(date_display_format)
+
         for cur_price in cruise_paid_price_from_API:
             price_type_code = cur_price.get("priceTypeCode", "")
             amount = cur_price.get("amount")
@@ -1258,7 +1324,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
                 all_included_flag = True
                 payment_string += f" Including: {amount:.2f} All Included Drinks/WiFi"
             elif price_type_code == "BALANCE_DUE":
-                payment_string += f" You Still Owe: {amount:.2f}"
+                payment_string += f" {YELLOW}You Still Owe: {amount:.2f} due {final_payment_date_display}{RESET}"
 
         # Store the parsed information into a dictionary for easy passing around
         paid_price_struct = {}
@@ -1270,9 +1336,6 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
             paid_price_struct['all_in_upgrade'] = all_included_flag
             log(f"Cruise Fare - Total {gross_totals:.2f}{payment_string}")
 
-        final_payment_date = get_final_payment_date(number_of_nights, sail_date)
-        final_payment_date_display = final_payment_date.strftime(date_display_format)
-
         # Record this booking for the end-of-run check-in / final-payment summary table.
         # Include the room number so multiple cabins on the same sailing are distinct.
         summary_name = ship_dictionary.get_ship(ship_code)
@@ -1281,7 +1344,8 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         summary_reservation = str(reservation_ID)
         if summary_reservation in reservation_friendly_names:
             summary_reservation += f" ({reservation_friendly_names.get(summary_reservation)})"
-        balance_due = derive_balance_due(booking)
+
+        balance_due = derive_balance_due(booking, cruise_paid_price_from_API)
         balance_due_amount = booking.get("balanceDueAmount")
         if str(reservation_ID) in config.paid_reservations:
             balance_due = False   # user vouches for it (reservationsPaidInFull)
@@ -1299,7 +1363,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         if balance_due is True:
             owed = (f"{balance_due_amount:.2f}" if isinstance(balance_due_amount, (int, float))
                     else "unknown")
-            log(YELLOW + f"Remaining Cruise Payment Balance is {owed} due {final_payment_date_display}" + RESET)
+            log(YELLOW + f"Remaining net-to-line balance {owed} due {final_payment_date_display} (Difference is TA's commission/fronted deposit)" + RESET)
 
         paid_price_struct['booked_obc'] = get_OBC(account_info, booking)
 
@@ -1321,8 +1385,11 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
                     # str-compare: a missing/non-numeric 'reservation' key must
                     # not crash the whole booking loop
                     if str(reservation_ID) == str(reservation.get("reservation")):
-                        for item in reservation:
-                            paid_price_struct[item] = reservation.get(item)
+                        for key, val in reservation.items():
+                            if key == "paidPrice":
+                                paid_price_struct["paid_price"] = float(val) if val is not None else None
+                            else:
+                                paid_price_struct[key] = val
 
             if booking.get("stateroomType") != "NONE":
                 get_cruise_price(account_info,
@@ -1415,7 +1482,7 @@ def get_cruise_price(account_info: AccountInfo,
     """
     # Pull properties from the foundational domain entities
     session = account_info.access.session
-    apobj = config.apobj
+    apobj = notifier_for(account_info)
     if paid_price_struct is None:
         paid_price_struct = booking.get("paidPriceStruct")  # Dict containing target metrics
 
@@ -1505,16 +1572,17 @@ def get_cruise_price(account_info: AccountInfo,
         if temp_discounts.dp340:
             url_params.coupon_code = 'DP340'
 
-#        if have_a_senior:
-#            url_params.senior = True
-#
     # Absorb any YAML overrides safely now that url_params is guaranteed to be an object
     url_params.apply_overrides(paid_price_struct)
 
     # Capture target price bounds if they exist
     # NOTE: both paid_price and paidPrice are valid keys,
     #       depending on booked vs. prospective cruises
-    paid_price = paid_price_struct.get("paid_price") or paid_price_struct.get("paidPrice") if paid_price_struct else None
+    paid_price = None
+    if paid_price_struct:
+        paid_price = paid_price_struct.get("paid_price", None) # get price retrieved from API
+        paid_price = paid_price_struct.get("paidPrice", paid_price) #override with user provided
+
     room_number = None
 
     # Primary API pricing check pass
@@ -1737,7 +1805,6 @@ def get_cruise_price(account_info: AccountInfo,
 def get_room_price_via_API(url_params: CruiseURLParams, room_number: Optional[str] = None) -> Dict[str, Any]:
     # Check room availability against the downstream checker
     room_available, available_rooms = check_if_room_is_available(url_params)
-
     results = {
         'sailing_nights': 0,
         'room_available': room_available
@@ -1759,7 +1826,6 @@ def get_room_price_via_API(url_params: CruiseURLParams, room_number: Optional[st
         'packageId': url_params.package_code,
         'sailDate': url_params.sail_date,
         'currencyCode': url_params.currency_code,
-        'language': 'en',
         'rooms': [
             {
                 # DO NOT Use the realigned type code here
@@ -1903,18 +1969,20 @@ def check_if_room_is_available(params: CruiseURLParams) -> tuple[bool, List[Dict
         'r0C': 'y',
     }
 
-    # TODO: Migrate to _execute_api_request() with on_failure="retry".
-    # This loop lookup is an excellent candidate for our new exponential backoff
-    # engine, but is left single-shot for this PR to keep the price-tracking loop
-    # scope completely isolated and test-stabilized.
     api_URL = f'https://www.{params.url_brand}.com/room-selection/type-and-subtype'
-    try:
-        # Plain requests on purpose: this endpoint misbehaves under curl_cffi on
-        # some networks (jdeath issue #88, reproduced on Windows and Docker)
-        response = requests_normal.get(api_URL, params=request_params, headers=headers,
-                                       timeout=config.request_timeout if config else REQUEST_TIMEOUT)
-    except Exception as err:
-        log (f"Unable to check room availability with server ({err})")
+
+    response = _execute_api_request(
+        method="GET",
+        url=api_URL,
+        params=request_params,
+        headers=headers,
+        timeout=config.request_timeout if config else REQUEST_TIMEOUT,
+        on_failure="skip",
+        use_impersonation=False
+    )
+
+    if response is None:
+        log("Unable to check room availability with server")
         return False, []
 
     # Extract structural array matrix out of the component text stream
@@ -1999,7 +2067,7 @@ def get_new_order_price(
     start_date = booking.get("sailDate", "")
     number_of_nights = int(booking.get("numberOfNights") or 0)
 
-    currency = config.currency_override if config.currency_override else ctx.currency
+    currency = booking.get("bookingCurrency", "USD")
     prefix = ctx.prefix or ""
     product = ctx.product or ""
 
@@ -2020,7 +2088,6 @@ def get_new_order_price(
     params = {
         'reservationId': reservation_ID,
         'startDate': start_date,
-        'currencyIso': currency,
         'passengerId': passenger_ID,
     }
 
@@ -2047,6 +2114,11 @@ def get_new_order_price(
 
     if "Bottles" in variant:
         title = f"{title} ({variant})"
+
+    booking_eligibility = payload.get("bookingEligibility") or {}
+    if booking_eligibility.get("reason") == "NO_STARTING_FROM_PRICE":
+        log(YELLOW + f"\t{title}: Server returned no pricing data (currency mismatch or unavailable for reservation)." + RESET)
+        return
 
     per_day_price = sales_unit in ['PER_NIGHT', 'PER_DAY']
     new_price_payload = payload.get("startingFromPrice")
@@ -2076,6 +2148,15 @@ def get_new_order_price(
         log(YELLOW + f"\t{title}: no current price returned; cannot compare" + RESET)
         return
 
+    watch_price_rows.append({
+        "SailDate": start_date,
+        "ReservationID": reservation_ID,
+        "Passenger": passenger_name,
+        "ProductID": product,
+        "ProductTitle": title,
+        "CurrentPrice": current_price,
+    })
+
     # Process Deal Alerts
     if current_price < paid_price:
         # Current price on server is lower than the paid price (rebooking alert path)
@@ -2092,16 +2173,6 @@ def get_new_order_price(
         if per_day_price:
             text += "per night "
         text += f"is lower: {current_price} {currency} than {paid_price} {currency}"
-#        if for_watch:
-#            text = f"{passenger_name}: Book! {title} Price "
-#            if per_day_price:
-#                text += "per night "
-#            text += f"is lower: {current_price} {currency} than {paid_price} {currency}"
-#        else:
-#            text = f"{passenger_name}: Rebook! {title} Price "
-#            if per_day_price:
-#                text += "per night "
-#            text += f"is lower: {current_price} {currency} than {paid_price} {currency}"
 
         # Reaching into global config for alerts configuration
         if config.minimum_saving_alert is not None:
@@ -2130,25 +2201,33 @@ def get_new_order_price(
     else:
         # Current price on server is higher than the paid price ("currently best price" path)
         if for_watch:
-            temp_string = GREEN + f"[WATCH] {display_name} (Cabin {room}) {title} price is higher than watch price: {paid_price:.2f} {currency}" + RESET
+            if current_price == paid_price:
+                comp_string = "the same as"
+            else:
+                comp_string = "higher than"
+            temp_string = GREEN + f"[WATCH] {display_name} (Cabin {room}) {title} price is {comp_string} watch price: {paid_price:.2f} {currency}" + RESET
         else:
             temp_string = GREEN + f"{display_name} (Cabin {room}) has best price "
             if per_day_price:
                 temp_string += "per night "
             temp_string += f"for {title} of: {paid_price:.2f} {currency}" + RESET
-#        if for_watch:
-#            temp_string = GREEN + f"{passenger_name.ljust(10)} {title} price "
-#            if per_day_price:
-#                temp_string += "per night "
-#            temp_string += f"is higher than watch price: {paid_price:.2f} {currency}" + RESET
-#        else:
-#            temp_string = GREEN + f"{passenger_name.ljust(10)} (Cabin {room}) has best price "
-#            if per_day_price:
-#                temp_string += "per night "
-#            temp_string += f"for {title} of: {paid_price:.2f} {currency}" + RESET
         if current_price > paid_price:
             temp_string += f" (now {current_price:.2f} {currency})"
         log(temp_string)
+
+
+def write_watch_price_json(output_path: str) -> None:
+    """Write the add-on watch prices collected during this run as a JSON array."""
+    if platform.system() == "iOS":
+        output_path = os.path.expanduser('~/Documents') + "/" + output_path
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            json.dump(watch_price_rows, output_file, indent=2)
+            output_file.write("\n")
+        log(f"\n{BLUE}Writing watchlist JSON to {output_path}" + RESET) 
+    except OSError as error:
+        log(f"{YELLOW}Warning: Could not write JSON watch output '{output_path}': {error}{RESET}")
 
 
 def process_watch_list_for_booking(
@@ -2181,7 +2260,6 @@ def process_watch_list_for_booking(
         watch_price = float(getattr(watch_item, 'price', 0))
         enabled = getattr(watch_item, 'enabled', True)  # Default to True if not specified
         guest_age_string = str(getattr(watch_item, 'guest_age_string', "adult")).lower()
-        currency = getattr(watch_item, 'currency', "USD")
 
         reservation_list = getattr(watch_item, 'reservations', None)
         reservation_ID = booking.get("bookingId")
@@ -2207,7 +2285,6 @@ def process_watch_list_for_booking(
             passenger_name=passenger_name,
             room=room,
             paid_price=watch_price,
-            currency=currency,
             guest_age_string=guest_age_string,
             sales_unit=None,
             for_watch=True,
@@ -2234,12 +2311,7 @@ def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict
     ship = booking.get("shipCode", "")
     start_date = booking.get("sailDate", "")
     number_of_nights = int(booking.get("numberOfNights") or 0)
-
-    # Handle global currency overrides cleanly
-    if config.currency_override:
-        currency = config.currency_override
-    else:
-        currency = booking.get("bookingCurrency", "USD")
+    currency = booking.get("bookingCurrency", "USD")
 
     # Build dynamic guest/reservation lookups
     guest_registry = {}
@@ -2283,7 +2355,6 @@ def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict
             'passengerId': current_passenger_id,
             'reservationId': current_res_id,
             'sailingId': f"{ship}{start_date}",
-            'currencyIso': currency,
             'includeMedia': 'false',
         }
 
@@ -2373,7 +2444,6 @@ def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict
                             # Divide by package headcount to isolate the final per-guest daily rate
                             paid_price = round(paid_price / paid_quantity, 2)
 
-                        currency = guest.get("priceDetails", {}).get("currency")
                         room = guest_registry.get(guest_passenger_ID, {}).get("cabin")
                         if not room or room == "None":
                             room = guest.get("stateroomNumber") or None
@@ -2386,7 +2456,6 @@ def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict
                             passenger_name=first_name,
                             room=room,
                             paid_price=paid_price,
-                            currency=currency,
                             guest_age_string=guest_age_string,
                             sales_unit=sales_unit,
                             for_watch=False,
@@ -2397,7 +2466,7 @@ def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict
                             reservation_id=guestreservation_ID
                         )
 
-                        get_new_order_price(account_info, booking, config.apobj, ctx)
+                        get_new_order_price(account_info, booking, notifier_for(account_info), ctx)
 
 
 def get_all_promotions(account_info: AccountInfo, booking: Dict[str, Any]) -> None:
@@ -2531,7 +2600,6 @@ def get_OBC(account_info: AccountInfo, booking: Dict[str, Any]) -> float:
     params = {
         'passengerId': booking.get("passengerId"),
         'sailingId': f"{ship_code}{sail_date}",
-        'currencyIso': booking.get("bookingCurrency"),
     }
 
     url = f'https://aws-prd.api.rccl.com/en/{account_info.api_brand}/web/commerce-api/cart/v1/obc/reservations/{reservation_ID}'
@@ -2594,7 +2662,6 @@ def _build_checkout_url(
         'r0b': 'n',
         'r0r': is_police,
         'r0s': is_fire,
-#        'r0s': 'n', # Formerly hardcoded; kept for a revert in case of problems
         'r0q': is_military,
         'r0t': is_senior,
         'r0D': 'y'
@@ -3172,16 +3239,20 @@ def get_cruise_price_from_API(
 def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
     """
     Initializes the tracking environment, functional logging aliases, and file captures.
-
-    Configures two destination tracks: a standard terminal console output stream
-    preserving live ANSI text colors, and an optional plaintext file log tracking
-    run milestones with ANSI styling expressions filtered out.
     """
-    # On Windows consoles (notably Windows PowerShell 5.x / classic conhost) ANSI color
-    # escapes are printed literally (e.g. a raw "<-[33m...") unless virtual-terminal
-    # processing is enabled. Turn it on so the color codes render as colors. Harmless if
-    # already enabled (Windows Terminal) or unsupported - failures are ignored.
+    global log, log_warn, log_err, has_terminal_issues
+
+    # 1. Determine terminal safety based on module-level configuration constant
+    has_terminal_issues = any(k in os.environ for k in PROBLEM_ENVS)
+
+    # 2. Safely attempt stream reconfiguration and ANSI enablement on Windows
     if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+            sys.stderr.reconfigure(encoding='utf-8')
+        except AttributeError:
+            has_terminal_issues = True
+
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -3193,17 +3264,17 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
         except Exception:
             pass
 
+    # 3. Construct and clear out active root logging context
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    root_logger.handlers.clear()  # Avoid handler duplication
+    root_logger.handlers.clear()
 
-    # Terminal Stream Handler (Keeps original ANSI terminal colors)
-    # Use the REAL stdout: on a second in-process call sys.stdout is already the
-    # PrintRedirector, and a StreamHandler wrapping it would recurse
-    # (emit -> write -> logger.info -> emit ...)
+    # 4. Terminal Stream Handler (Keeps original ANSI terminal colors)
+    # Extract underlying real stdout stream to prevent recursion on re-initialization calls
     real_stdout = sys.stdout
     while isinstance(real_stdout, PrintRedirector):
         real_stdout = getattr(real_stdout, '_wrapped_stream', None) or sys.__stdout__
+
     console_handler = logging.StreamHandler(real_stdout)
     console_handler.setFormatter(logging.Formatter('%(message)s'))
     if platform.system() == "iOS":
@@ -3211,11 +3282,13 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
 
     root_logger.addHandler(console_handler)
 
-    # Plain Text File Handler (Only built if a log file path is supplied)
+    # 5. Plain Text File Handler
     if log_file_path:
-        # Write the run execution start sequence first
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         delimiter = f"\n{'='*60}\n--- RUN STARTED: {timestamp_str} ---\n{'='*60}\n"
+
+        if platform.system() == "iOS":
+            log_file_path = os.path.expanduser('~/Documents') + "/" + log_file_path
 
         try:
             with open(log_file_path, "a", encoding="utf-8") as f:
@@ -3223,25 +3296,18 @@ def setup_hybrid_logging(log_file_path: Optional[str] = None) -> None:
 
             file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
             file_handler.setFormatter(logging.Formatter('%(message)s'))
-
-            # Keep the validated filter that strips ANSI color symbols out of text files
             file_handler.addFilter(StripAnsiFilter())
             root_logger.addHandler(file_handler)
-
         except IOError as e:
             sys.stderr.write(f"Warning: Could not open log file '{log_file_path}': {e}\n")
 
-    # Activate the Hybrid "Magic Core"
+    # 6. Initialize shortcut execution instances and map to module globals
     easy_log_instance = EasyLogger(root_logger)
-
-    # Create the "ease of use" aliases
-    global log, log_warn, log_err
     log = easy_log_instance
     log_warn = easy_log_instance.warn
     log_err = easy_log_instance.error
 
-    # Safely Intercept Standard print() System-Wide
-    # This redirects stdout to the custom logger
+    # 7. Intercept raw standard print statements system-wide
     sys.stdout = PrintRedirector(root_logger.info)
 
 
@@ -3263,6 +3329,34 @@ def expand_env_vars(value: Any) -> Any:
     return value
 
 
+def _build_apprise(items: List[Dict]) -> Optional[Apprise]:
+    """
+    Builds an Apprise object from a list of {url: ...} dicts, as found under an
+    apprise: key in config.yaml (top-level or per-account). Apprise is an
+    optional dependency, so this mirrors the existing None-sentinel handling.
+
+    Returns None when the list is empty, or when apprise: is configured but the
+    apprise package is not installed (notifications are disabled with a warning).
+    """
+    urls = [item["url"] for item in items if "url" in item]
+    apobj = None
+    if urls and Apprise is None:
+        logging.warning("apprise: is configured in config.yaml but the apprise package "
+                        "is not installed - notifications are disabled. pip install apprise")
+    elif urls:
+        apobj = Apprise()
+        for url in urls:
+            apobj.add(url)
+    return apobj
+
+
+def notifier_for(account_info: Optional[AccountInfo]) -> Optional[Apprise]:
+    """Per-account Apprise object if configured, else the global one."""
+    if account_info is not None and getattr(account_info, "apobj", None) is not None:
+        return account_info.apobj
+    return config.apobj
+
+
 def load_config_objects(config_path: str) -> CruiseAppConfig:
     """
     Loads, sanitizes, and maps YAML configuration elements into structural dataclass attributes.
@@ -3271,6 +3365,9 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
     and addon tracking lists. Pre-configures functional notification managers (Apprise)
     and handles fractional logic safely (like differentiating a 0.0 value alert from None).
     """
+    currency_present = False
+    currency_override_present = False
+
     with open(config_path, 'r') as file:
         # an empty config.yaml parses to None - fail with clear messages below,
         # not an AttributeError on data.get
@@ -3286,7 +3383,8 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
             military=a.get("military", False),
             fire=a.get("fire", False),
             police=a.get("police", False),
-            cruise_line=a.get("cruiseLine", "royalcaribbean")
+            cruise_line=a.get("cruiseLine", "royalcaribbean"),
+            apobj=_build_apprise(a.get("apprise", []))
         )
         for a in data.get("accountInfo", [])
     ]
@@ -3319,8 +3417,10 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         # Otherwise, fall back onto default values
         if "enabled" in w:         item_kwargs["enabled"] = w["enabled"]
         if "guestAgeString" in w:  item_kwargs["guest_age_string"] = w["guestAgeString"]
-        if "currency" in w:        item_kwargs["currency"] = w["currency"]
         if "reservations" in w:    item_kwargs["reservations"] = w["reservations"]
+
+        if "currency" in w:
+            currency_present = True
 
         # Unpack into the constructor
         watch_list.append(WatchListItem(**item_kwargs))
@@ -3329,29 +3429,26 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
     apprise_urls = [item["url"] for item in data.get("apprise", []) if "url" in item]
 
     # Build the apprise object natively (apprise is an optional dependency)
-    apobj = None
-    if apprise_urls and Apprise is None:
-        logging.warning("apprise: is configured in config.yaml but the apprise package "
-                        "is not installed - notifications are disabled. pip install apprise")
-    elif apprise_urls:
-        apobj = Apprise()
-        for url in apprise_urls:
-            apobj.add(url)
+    apobj = _build_apprise(data.get("apprise", []))
 
     # Safe initialization of minimum_saving_alert to allow None as well as 0.0
     raw_alert = data.get("minimumSavingAlert", None)
     minimum_saving_alert = float(raw_alert) if raw_alert is not None else None
 
+    if data.get("currencyOverride", None) is not None:
+        currency_override_present = True
+
     # Build and return the global master config object using data.get() for fallback defaults
     config = CruiseAppConfig(
         display_cruise_prices=data.get("displayCruisePrices", True),
-        currency_override=data.get("currencyOverride", None),
         minimum_saving_alert=minimum_saving_alert,
         notify_on_error=data.get("notifyOnError", False),
-        show_promos=data.get("showPromos", True),
+        show_promos=data.get("showPromos", False),
         request_timeout=int(data.get("requestTimeout", REQUEST_TIMEOUT)),
         date_display_format=data.get("dateDisplayFormat", "%x"),
         log_file=data.get("logFile"),
+        output_watch_as_json=data.get("outputWatchAsJson",False),
+        output_json_watch_file=data.get("outputJsonFile","output-json-watch.txt"),
         apobj=apobj,
         accounts=accounts,
         watch_list=watch_list,
@@ -3367,26 +3464,68 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
     # Set up the custom logger
     setup_hybrid_logging(config.log_file)
 
+    if currency_override_present:
+        log(YELLOW + f"Due to RCCL API updates, config file option 'currencyOverride' is deprecated" + RESET)
+    if currency_present:
+        log(YELLOW + f"Due to RCCL API updates, config file watchlist option 'currency' is deprecated" + RESET)
+
     return config
 
 
-def derive_balance_due(booking: dict) -> Optional[bool]:
+def is_agency_booking(booking: dict) -> bool:
+    """Returns True if booking payload indicates Travel Agent or Group handling."""
+    # 1. Explicit Direct flag override from RC API
+    if booking.get("isDirect") is False:
+        return True
+
+    # 2. Agency ID fields
+    if booking.get("agencyId") or booking.get("travelAgencyId") or booking.get("agencyName"):
+        return True
+
+    # 3. Booking Type codes ("G" = Group, "AGENCY", "GROUP", "TA")
+    booking_type = str(booking.get("bookingType", "")).upper()
+    if booking_type in ("G", "AGENCY", "GROUP", "TA"):
+        return True
+
+    # 4. Group boolean flags
+    if booking.get("groupBooking") is True or booking.get("groupBookingFlag") is True:
+        return True
+
+    return False
+
+
+def derive_balance_due(booking: dict, cruise_paid_price_from_api: Optional[List[dict]] = None) -> Optional[str]:
     """
-    Whether a booking still owes money: True / False, or None when the API
-    doesn't say. balanceDue is True/False on direct bookings but omitted on
-    agency/TA ones. paidInFull is only trusted when True: on agency bookings
-    the web channel has no payment data at all and paidInFull comes back False
-    even on settled bookings (verified against a paid-in-full TA booking), so
-    False is the serializer's default there, not a real assertion of debt.
+    Whether a booking still owes money: True / False, or "TA_UNKNOWN" / None.
     """
+    # 1. Direct explicit boolean check
     balance_due = booking.get("balanceDue")
-    if balance_due is None:
-        if booking.get("paidInFull") is True:
-            return False
-        amount = booking.get("balanceDueAmount")
-        if isinstance(amount, (int, float)):
-            return amount > 0
-    return balance_due
+    if balance_due is not None:
+        return balance_due
+
+    # 2. Check paidInFull
+    if booking.get("paidInFull") is True:
+        return False
+
+    # 3. Check explicit amount field
+    amount = booking.get("balanceDueAmount")
+    if isinstance(amount, (int, float)):
+        return amount > 0
+
+    # 4. Check API pricing array fallback
+    if cruise_paid_price_from_api:
+        for cur_price in cruise_paid_price_from_api:
+            if isinstance(cur_price, dict) and cur_price.get("priceTypeCode") == "BALANCE_DUE":
+                bal_amount = cur_price.get("amount")
+                if isinstance(bal_amount, (int, float)):
+                    return bal_amount > 0
+
+    # 5. If data is still missing, it's expected if explicit agency/group indicators are present,
+    #    so return "TA_UNKNOWN"
+    if is_agency_booking(booking):
+        return "TA_UNKNOWN"
+
+    return None
 
 
 def record_checkin_payment_row(row: Dict[str, Any]) -> None:
@@ -3404,7 +3543,7 @@ def record_checkin_payment_row(row: Dict[str, Any]) -> None:
     key = row.get("dedupe_key")
     for existing in checkin_payment_rows:
         if key is not None and existing.get("dedupe_key") == key:
-            if existing.get("balance_due") is None and row.get("balance_due") is not None:
+            if existing.get("balance_due") not in (True, False) and row.get("balance_due") in (True, False):
                 existing["balance_due"] = row["balance_due"]
                 existing["past_final_payment"] = row["past_final_payment"]
             if existing.get("checkin_label") in (None, "TBD") and row.get("checkin_label") not in (None, "TBD"):
@@ -3437,9 +3576,7 @@ def print_checkin_payment_table() -> None:
             # balance is now past the final payment deadline. "(paid)" is only shown
             # when the API explicitly said the balance is settled - a missing/null
             # balanceDue must not masquerade as paid in full.
-            # No amount in the label: with a travel agent involved the exact
-            # remaining payment is uncertain, so the table only flags the state.
-            if r["balance_due"]:
+            if r["balance_due"] is True:
                 if r["past_final_payment"]:
                     pay += " (PAST DUE)"
                     pay_colors.append(RED)
@@ -3449,7 +3586,10 @@ def print_checkin_payment_table() -> None:
             elif r["balance_due"] is False:
                 pay += " (paid)"
                 pay_colors.append(GREEN)
-            else:
+            elif r["balance_due"] == "TA_UNKNOWN":
+                pay += " (contact TA for balance)"
+                pay_colors.append(YELLOW)
+            elif r["balance_due"] is None:
                 pay += " (status unknown)"
                 pay_colors.append(YELLOW)
         else:
@@ -3492,6 +3632,7 @@ def main() -> None:
     try:
         # Start each run with an empty check-in / payment summary collector
         checkin_payment_rows.clear()
+        watch_price_rows.clear()
 
         # Set Time with AM/PM or 24h based on locale
         locale.setlocale(locale.LC_TIME,'')
@@ -3503,16 +3644,26 @@ def main() -> None:
         # Since timestamp is a datetime object, convert it to a string or update format_date to handle both
         log(f"Report generated {config.format_date(timestamp.strftime('%Y%m%d'))} {timestamp.strftime('%X')}")
 
-        if config.apobj is not None and config.apprise_test:
-            config.apobj.notify(body="This is only a test. Apprise is set up correctly", title='Cruise Price Notification Test', body_format=NotifyFormat.TEXT)
+        # A per-account-only setup (no global apprise:) must still trigger the
+        # self-test - otherwise the script silently falls through into a real
+        # pricing pass instead of confirming notifications are wired up.
+        any_notifier = config.apobj is not None or any(a.apobj is not None for a in config.accounts)
+        if config.apprise_test and any_notifier:
+            if config.apobj is not None:
+                config.apobj.notify(body="This is only a test. Apprise is set up correctly", title='Cruise Price Notification Test', body_format=NotifyFormat.TEXT)
             log("Apprise Notification Sent...quitting")
+
+            # Also exercise each account's own notifier, so a misconfigured
+            # per-account URL is caught before a real alert is missed.
+            for account in config.accounts:
+                if account.apobj is not None:
+                    account.apobj.notify(body=f"This is only a test for account {account.username}. Apprise is set up correctly",
+                                          title='Cruise Price Notification Test', body_format=NotifyFormat.TEXT)
+
             sys.exit(0)   # quit() is a site-builtin, absent in frozen builds
 
         if config.minimum_saving_alert is not None:
             log(YELLOW + f"Only alerting for savings >= {config.minimum_saving_alert:.2f}" + RESET)
-
-        if config.currency_override:
-            log(YELLOW + f"Overriding Current Price Currency to {config.currency_override}" + RESET)
 
         # Generate the list of ship codes
         ship_dictionary = ShipRegistry()
@@ -3603,6 +3754,10 @@ def main() -> None:
 
         # Summary table of upcoming check-in and final-payment dates for booked sailings
         print_checkin_payment_table()
+
+        # Write the watchlist price results to JSON for external consumption
+        if config.output_watch_as_json:
+            write_watch_price_json(config.output_json_watch_file)
 
     except Exception as e:
         # Let the global catch-all at the module entry point handle unexpected execution faults
