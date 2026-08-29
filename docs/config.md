@@ -146,6 +146,10 @@ historyDb: "/app/data/price_history.db"
 ```
 The file only ever grows (nothing is deleted automatically) - you manage it. Each row is roughly 300 bytes, so even tracking ~10 items twice a day for a 5-month sailing stays well under 2 MB.
 
+Each script run adds one row to the `runs` table with a final status: `ok` (completed), `error` (the run died - the exception is saved alongside), or `apprise_test` (an `appriseTest: true` run, which sends the test notification and exits without checking prices). A row whose `finished_at` is empty means the process exited without finalizing (e.g. a login failure) - treat it as an aborted run. If the database itself cannot be opened or written (bad path, locked file), the run continues without history and a warning is logged; price checking is never affected.
+
+**Privacy note:** the history file contains your account login emails and real reservation numbers. Keep it out of anything public - do not commit it to git or attach it to GitHub issues.
+
 To keep passwords out of your config file, any config value that is exactly `${VAR_NAME}` is replaced with that environment variable when the config is loaded. Useful for Docker/Home Assistant setups or shared machines.
 ```yaml
 accountInfo:
