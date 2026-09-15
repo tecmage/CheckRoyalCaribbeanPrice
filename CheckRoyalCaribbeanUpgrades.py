@@ -412,6 +412,20 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
     booked_type: Optional[str] = None
     if booked_sub:
         booked_type = next((r["type"] for r in inventory if r["subtype"] == booked_sub), None)
+        if booked_type is None:
+            # Royal renames funnel subtype codes (OV interiors U -> V, NV balconies
+            # D -> DW): a booking-era code that no longer exists resolves via the
+            # subtype whose lead-in category shares its letters, same fallback the
+            # main checker's availability gate uses
+            wanted = re.sub(r"[^A-Za-z]", "", booked_sub or booked_cat or "").upper()
+            renamed = next((r for r in inventory
+                            if not r["guarantee"] and wanted
+                            and re.sub(r"[^A-Za-z]", "", r["category"] or "").upper() == wanted), None)
+            if renamed:
+                log(f"  Subtype code {booked_sub} no longer offered under that name; "
+                    f"using current code {renamed['subtype']}")
+                booked_sub = renamed["subtype"]
+                booked_type = renamed["type"]
         if booked_type:
             cat_prices = get_category_prices(account, booking, booked_sub, booked_type, loyalty,
                                              dp340=apply_dp340)
