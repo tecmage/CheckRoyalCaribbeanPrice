@@ -22,6 +22,7 @@ except ImportError:
     requests = plain_requests
     IMPERSONATE_ARGS = {}
 
+import sqlite3
 import sys
 import traceback
 import time
@@ -40,6 +41,7 @@ except ImportError:
     Apprise = None
     NotifyFormat = None
 
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -74,6 +76,86 @@ RETRY_BACKOFF_BASE = 2
 # Cool-down between accounts when checking more than one, to avoid hammering the API
 ACCOUNT_COOLDOWN_SECONDS = 5
 
+# Module-level constant for room type translations
+STATEROOM_TYPE_MAPPING = {
+    "I": "INTERIOR",
+    "O": "OUTSIDE",
+    "B": "BALCONY",
+    "D": "DELUXE",
+    "C": "CONCIERGE",
+}
+
+# Macro classifications / generic terms that cause HTTP 500 when sent as r0e / r0f
+CHECKOUT_FORBIDDEN_CATEGORY_CODES = (
+    set(STATEROOM_TYPE_MAPPING.keys())   |
+    set(STATEROOM_TYPE_MAPPING.values()) |
+    {"S", "SUITE", "OCEANVIEW", "NONE"}
+)
+
+# Type alias for duration-based lead-time rules: list of (max_nights, days_before)
+DurationRules = list[Tuple[float, int]]
+
+# Market-specific final payment lead times (days before departure)
+# Flat integer for markets with uniform policies; duration-tiered lists for others.
+MARKET_RULES: dict[str, Union[int, DurationRules]] = {
+    # Central & Northern European markets: flat 30 days
+    "DEU": 30, "DE": 30,  # Germany
+    "CHE": 30, "CH": 30,  # Switzerland
+    "NOR": 30, "NO": 30,  # Norway
+    "SWE": 30, "SE": 30,  # Sweden
+    "DNK": 30, "DK": 30,  # Denmark
+    "FIN": 30, "FI": 30,  # Finland
+
+    # Austria: 15 days for 1-14 nights; 120 days for 15+ nights
+    "AUT": [(14, 15), (float("inf"), 120)],
+    "AT":  [(14, 15), (float("inf"), 120)],
+
+    # UK & Ireland: 56 days (8 weeks) for standard sailings, 70 days for 15+ nights
+    "GBR": [(14, 56), (float("inf"), 70)],
+    "GB":  [(14, 56), (float("inf"), 70)],
+    "UK":  [(14, 56), (float("inf"), 70)],
+    "IRL": [(14, 56), (float("inf"), 70)],
+    "IE":  [(14, 56), (float("inf"), 70)],
+
+    # Australia & New Zealand: 90 days for standard sailings, 120 days for 15+ nights
+    "AUS": [(14, 90), (float("inf"), 120)],
+    "AU":  [(14, 90), (float("inf"), 120)],
+    "NZL": [(14, 90), (float("inf"), 120)],
+    "NZ":  [(14, 90), (float("inf"), 120)],
+
+    # Default / US / North America rules (1-4 nights: 75 days, 5-14: 90 days, 15+: 120 days)
+    "USA": [(4, 75), (14, 90), (float("inf"), 120)],
+    "US":  [(4, 75), (14, 90), (float("inf"), 120)],
+    "CAN": [(4, 75), (14, 90), (float("inf"), 120)],
+    "CA":  [(4, 75), (14, 90), (float("inf"), 120)],
+}
+
+# Process exit code contract for main() - a supervising scheduler can rely on
+# these three outcomes meaning exactly this and nothing else:
+#   0                    - full success: every account was checked
+#   1                    - fatal/total failure: an unhandled exception, or a
+#                          module-level setup failure. This can happen before
+#                          any pricing ran, or partway through a multi-account
+#                          run after earlier accounts already succeeded and
+#                          had their price-drop alerts sent - the exit code
+#                          alone doesn't say how far the run got. Don't
+#                          blindly auto-retry on this code (that risks
+#                          re-alerting accounts that already succeeded);
+#                          surface it to a human and check the log first.
+#   EXIT_PARTIAL_FAILURE - the run COMPLETED, but one or more accounts were
+#                          SKIPPED after a login or post-login profile-fetch
+#                          failure. Data already written for the accounts
+#                          that DID succeed (price points committed,
+#                          price-drop alerts sent, the watchlist JSON) is
+#                          real and must not be redone.
+#                          A scheduler that treats this the same as exit 1
+#                          and blindly retries the whole run will re-price
+#                          already-priced accounts and can send duplicate
+#                          price-drop notifications to real users - so this
+#                          code is deliberately distinct from the fatal (1)
+#                          and success (0) cases.
+EXIT_PARTIAL_FAILURE = 2
+
 # ANSI color codes
 RESET = '\033[0m' # Resets color to default
 
@@ -106,13 +188,6 @@ has_terminal_issues = False;
 log = None
 log_warn = None
 log_err = None
-
-# Rows collected across all accounts/bookings during a run, printed at the end as a
-# compact check-in + final-payment summary table (see print_checkin_payment_table)
-checkin_payment_rows: List[Dict[str, Any]] = []
-
-# Add-on watch prices collected during the current run for machine-readable output
-watch_price_rows: List[Dict[str, Any]] = []
 
 ##################################
 # Classes (Structural and Logging)
@@ -344,6 +419,10 @@ class CruiseURLParams:
         self.loyalty_number = overrides.get("loyaltyNumber", self.loyalty_number)
         self.state = overrides.get("state", self.state)
 
+        # Mirror categoryOverride to subtype if subcategoryOverride was omitted
+        if overrides.get("categoryOverride") and not overrides.get("subcategoryOverride"):
+            self.stateroom_subtype = self.stateroom_category_code
+
         # Enforce corporate structural constraints natively
         if self.all_included and self.is_royal:
             log("Royal Does Not Have All In Fare\nRemoving All In Fare. Check Documentation")
@@ -428,6 +507,12 @@ class AccountInfo:
     access: Optional[APIAccess] = None
     found_items: Set[str] = field(default_factory=set)
 
+    # Populated in main() right after get_profile(); history-layer snapshot
+    # fields only (C&A/Captain's Club tier label + individual points) - not
+    # used anywhere in alert/discount logic.
+    loyalty_tier: Optional[str] = None
+    loyalty_points: Optional[int] = None
+
     # Live Runtime Object (excluded from the YAML mapping, like config.apobj).
     # Per-account Apprise object; falls back to the global config.apobj via
     # notifier_for() when this account has no apprise: list of its own.
@@ -506,6 +591,7 @@ class CruiseAppConfig:
     date_display_format: Optional[str] = "%x"
     request_timeout: int = REQUEST_TIMEOUT
     log_file: Optional[str] = None
+    history_db: Optional[str] = None
     output_watch_as_json: bool = False
     output_json_watch_file: Optional[str] = "output-json-watch.txt"
     apprise_urls: List[str] = field(default_factory=list)
@@ -530,6 +616,7 @@ class CruiseAppConfig:
 
     # Live Runtime Objects (Excluded from the initial YAML mapping)
     apobj: Optional[Apprise] = None
+    history: "PriceHistory" = field(default_factory=lambda: PriceHistory(None))
 
 
     def __str__(self):
@@ -552,6 +639,293 @@ class CruiseAppConfig:
             return datetime.strptime(clean_str, "%Y%m%d").strftime(self.date_display_format)
         except ValueError:
             return str(date_str)   # malformed API date: show it raw, don't crash the run
+
+
+_PRICE_HISTORY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at       TEXT NOT NULL,
+    finished_at      TEXT,
+    status           TEXT NOT NULL DEFAULT 'started',
+    error_summary    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS price_points (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES runs(run_id),
+    observed_at      TEXT NOT NULL,
+    account_label    TEXT,
+    reservation_id   TEXT,
+    ship_code        TEXT,
+    sail_date        TEXT,
+    nights           INTEGER,
+    item_kind        TEXT NOT NULL,
+    item_code        TEXT,
+    item_name        TEXT,
+    guest_id         TEXT,
+    guest_name       TEXT,
+    paid_price       REAL,
+    current_price    REAL,
+    currency         TEXT,
+    per_night        INTEGER NOT NULL DEFAULT 0,
+    discount_applied TEXT,
+    status           TEXT NOT NULL,
+    rebook_decision  TEXT,
+    notified         INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_points_latest
+    ON price_points (reservation_id, item_code, guest_id, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_price_points_history
+    ON price_points (item_code, sail_date, observed_at);
+
+CREATE INDEX IF NOT EXISTS idx_price_points_run
+    ON price_points (run_id);
+
+CREATE TABLE IF NOT EXISTS bookings (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES runs(run_id),
+    observed_at      TEXT NOT NULL,
+    account_label    TEXT,                 -- account_info.username
+    reservation_id   TEXT NOT NULL,
+    ship_code        TEXT,
+    ship_name        TEXT,                 -- from the ShipRegistry the run already built
+    sail_date        TEXT,                 -- YYYYMMDD
+    nights           INTEGER,
+    stateroom_type   TEXT,                 -- e.g. BALCONY / INTERIOR / GTY label as the script prints it
+    stateroom_number TEXT,                 -- may be NULL (GTY not yet assigned)
+    stateroom_category TEXT,               -- e.g. 4D
+    guest_count      INTEGER,
+    guests_json      TEXT,                 -- [{"name": "...", "id": "...", "age_bracket": "adult"}]
+    loyalty_tier     TEXT,                 -- from get_profile(): C&A tier label; NULL if unknown
+    loyalty_points   INTEGER,
+    checkin_label    TEXT,                 -- the string the summary table prints (e.g. "Opens Dec 10 8:00 AM")
+    final_payment_date TEXT,               -- YYYYMMDD, from get_final_payment_date
+    past_final_payment INTEGER,            -- 0/1
+    balance_due      INTEGER,              -- 1 / 0 / NULL (unknown, TA bookings)
+    booking_currency TEXT,
+    friendly_name    TEXT                  -- reservationFriendlyNames entry if configured
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_latest ON bookings (reservation_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS promos (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES runs(run_id),
+    observed_at      TEXT NOT NULL,
+    account_label    TEXT,
+    ship_code        TEXT,
+    sail_date        TEXT,
+    promo_id         TEXT,
+    promo_title      TEXT,
+    promo_line       TEXT,                 -- the human-readable line the script logs
+    promo_start      TEXT,
+    promo_end        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_promos_run ON promos (run_id);
+"""
+
+
+class PriceHistory:
+    """
+    Opt-in, append-only SQLite price-history sink (config: historyDb).
+
+    Every public method is a silent no-op when db_path is falsy, so the ~10
+    call sites throughout this script never need an `if config.history:`
+    guard - the object itself absorbs "feature off" and touches the
+    filesystem not at all in that case. When enabled, each observation is
+    committed immediately (one connection per call, WAL mode) so a crash
+    mid-run loses nothing already recorded - this script is a short-lived
+    process invoked fresh per run, so there is no long-lived connection to
+    manage. A `runs` row whose finished_at is still NULL means the process
+    exited without ever finalizing it (e.g. a crash or a killed process,
+    before main()'s own error handler could run) - treat such rows as an
+    aborted run, not a currently-in-progress one. A login failure no longer
+    leaves finished_at NULL: main() catches it per account and finalizes the
+    run as "partial_failure" instead.
+    """
+
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        self.enabled = bool(db_path)
+        self.db_path = db_path
+        self._current_run_id: Optional[int] = None
+        if self.enabled:
+            try:
+                with closing(self._connect()) as conn:
+                    conn.executescript(_PRICE_HISTORY_SCHEMA_SQL)
+            except (sqlite3.Error, OSError) as e:
+                self._disable(e)
+
+    def __repr__(self) -> str:
+        if not self.enabled:
+            return "<PriceHistory enabled=False>"
+        return f"<PriceHistory db={self.db_path!r} enabled=True run_id={self._current_run_id}>"
+
+    def _disable(self, error: Exception) -> None:
+        """A history sink must never take down the price run it observes: on any
+        database error, log one warning and degrade to the no-op object the
+        disabled path already is. Price checking continues without history."""
+        self.enabled = False
+        logging.warning(
+            f"Price history disabled for the rest of this run: could not write "
+            f"{self.db_path!r} ({type(error).__name__}: {error}). Price checking "
+            f"is unaffected; check the historyDb path/permissions."
+        )
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        # busy_timeout must be armed BEFORE switching journal modes: the WAL
+        # switch itself needs a lock, and without a timeout a concurrent run
+        # (e.g. a scheduled task overlapping a manual one) fails immediately
+        # with "database is locked" on some filesystems (seen on WSL /mnt/c)
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def start_run(self) -> Optional[int]:
+        """Opens a new `runs` row and remembers it as the active run."""
+        if not self.enabled:
+            return None
+        try:
+            with closing(self._connect()) as conn:
+                cur = conn.execute(
+                    "INSERT INTO runs (started_at, status) VALUES (?, 'started')",
+                    (datetime.now(timezone.utc).isoformat(),),
+                )
+                conn.commit()
+                self._current_run_id = cur.lastrowid
+                return self._current_run_id
+        except (sqlite3.Error, OSError) as e:
+            self._disable(e)
+            return None
+
+    def finish_run(self, status: str, error_summary: Optional[str] = None) -> None:
+        """Closes out the active `runs` row opened by the last start_run()."""
+        if not self.enabled or self._current_run_id is None:
+            return
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(
+                    "UPDATE runs SET finished_at=?, status=?, error_summary=? WHERE run_id=?",
+                    (datetime.now(timezone.utc).isoformat(), status, error_summary, self._current_run_id),
+                )
+                conn.commit()
+        except (sqlite3.Error, OSError) as e:
+            self._disable(e)
+
+    def record_cabin_fare(self, **fields: Any) -> None:
+        """Appends one `price_points` row for a cabin-fare observation."""
+        if not self.enabled or self._current_run_id is None:
+            return
+        self._insert("price_points", item_kind="cabin_fare", **fields)
+
+    def record_addon(self, **fields: Any) -> None:
+        """Appends one `price_points` row for an addon/watchlist observation."""
+        if not self.enabled or self._current_run_id is None:
+            return
+        self._insert("price_points", **fields)
+
+    def record_booking(self, **fields: Any) -> None:
+        """Appends one `bookings` row: a full snapshot of one reservation this run."""
+        if not self.enabled or self._current_run_id is None:
+            return
+        self._insert("bookings", **fields)
+
+    def record_promo(self, **fields: Any) -> None:
+        """Appends one `promos` row for one active sitewide promotion this run."""
+        if not self.enabled or self._current_run_id is None:
+            return
+        self._insert("promos", **fields)
+
+    def _insert(self, table: str, **fields: Any) -> None:
+        fields.setdefault("observed_at", datetime.now(timezone.utc).isoformat())
+        fields["run_id"] = self._current_run_id
+        cols = ", ".join(fields)
+        placeholders = ", ".join("?" for _ in fields)
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute(f"INSERT INTO {table} ({cols}) VALUES ({placeholders})", tuple(fields.values()))
+                conn.commit()
+        except (sqlite3.Error, OSError) as e:
+            self._disable(e)
+
+
+class CheckinPaymentTracker:
+    """
+    Tracks and deduplicates check-in and final payment metrics across accounts/bookings,
+    rendering an end-of-run summary table.
+    """
+    def __init__(self) -> None:
+        self.rows: List[Dict[str, Any]] = []
+
+    def record_row(self, row: Dict[str, Any]) -> None:
+        """
+        Adds a booking to the end-of-run summary table, merging duplicate linked reservations.
+        """
+        key = row.get("dedupe_key")
+        for existing in self.rows:
+            if key is not None and existing.get("dedupe_key") == key:
+                if existing.get("balance_due") not in (True, False) and row.get("balance_due") in (True, False):
+                    existing["balance_due"] = row["balance_due"]
+                    existing["past_final_payment"] = row["past_final_payment"]
+                if existing.get("checkin_label") in (None, "TBD") and row.get("checkin_label") not in (None, "TBD"):
+                    existing["checkin_label"] = row["checkin_label"]
+                return
+        self.rows.append(row)
+
+    def print_table(self) -> None:
+        """
+        Prints a compact end-of-run summary table sorted by sail date.
+        """
+        if not self.rows:
+            return
+
+        rows = sorted(self.rows, key=lambda r: r["sail_date"] or "")
+
+        headers = ("Sail Date", "Ship (Room)", "Reservation", "Check-In", "Final Payment")
+        table = []
+        pay_colors = []
+        for r in rows:
+            sail = config.format_date(r["sail_date"]) if r["sail_date"] else "?"
+            if r["final_payment"] is not None:
+                pay = r["final_payment"].strftime(config.date_display_format)
+                if r["balance_due"] is True:
+                    if r["past_final_payment"]:
+                        pay += " (PAST DUE)"
+                        pay_colors.append(RED)
+                    else:
+                        pay += " (balance due)"
+                        pay_colors.append(YELLOW)
+                elif r["balance_due"] is False:
+                    pay += " (paid)"
+                    pay_colors.append(GREEN)
+                elif r["balance_due"] == "TA_UNKNOWN":
+                    pay += " (contact TA for balance)"
+                    pay_colors.append(YELLOW)
+                elif r["balance_due"] is None:
+                    pay += " (status unknown)"
+                    pay_colors.append(YELLOW)
+            else:
+                pay = "-"
+                pay_colors.append("")
+            table.append((sail, r["name"], r.get("reservation", "-"), r["checkin_label"], pay))
+
+        widths = [max(len(str(row[i])) for row in ([headers] + table)) for i in range(len(headers))]
+
+        def fmt(cells: Tuple[str, ...], pay_color: str = "") -> str:
+            padded = [str(c).ljust(widths[i]) for i, c in enumerate(cells)]
+            if pay_color:
+                padded[-1] = f"{pay_color}{padded[-1]}{RESET}"
+            return "  ".join(padded)
+
+        log(f"\n{BLUE}Upcoming Check-In & Final Payment Dates{RESET}")
+        log(fmt(headers))
+        log("  ".join("-" * w for w in widths))
+        prev_sail = None
+        for row, pay_color in zip(table, pay_colors):
+            display_row = ("" if row[0] == prev_sail else row[0],) + row[1:]
+            prev_sail = row[0]
+            log(fmt(display_row, pay_color))
 
 
 ############################################
@@ -786,21 +1160,36 @@ def _discount_flag_on(value: Any) -> bool:
         return True
     return str(value).strip().lower() in ("y", "yes", "true")
 
+def resolve_lead_time(number_of_nights: int, market_code: Optional[str] = None) -> int:
+    """Resolves lead time days using market-specific duration tiers."""
+    code = market_code.upper() if market_code else "US"
+    rule = MARKET_RULES.get(code, MARKET_RULES["US"])
 
-def get_final_payment_date(number_of_nights: int, sail_date: Union[str, date, datetime]) -> date:
-    """
-    Calculates final payment settlement timelines based on duration rules.
+    # If the market has a flat rule (e.g., DEU = 30)
+    if isinstance(rule, int):
+        return rule
 
-    Accepts string timestamps or explicit date objects. Computes strict policy deadlines
-    by calculating offsets from the ship's departure date (75 days for short sailings,
-    90 days for standard voyages, 120 days for extended itineraries).
+    # Otherwise, evaluate duration tiers
+    for max_nights, days in rule:
+        if number_of_nights <= max_nights:
+            return days
+
+    return 90  # Safe fallback
+
+def get_final_payment_date(
+    number_of_nights: int,
+    sail_date: Union[str, date, datetime],
+    market_code: Optional[str] = None,
+    final_payment_date_override: Optional[Union[int, str, date, datetime]] = None,
+) -> date:
     """
-    # Standardize the input into a solid date object defensively
+    Calculates final payment settlement timelines based on duration and market rules,
+    or accepts an explicit date/days override from user config.
+    """
+    # 1. Standardize date_of_sailing first
     if isinstance(sail_date, (datetime, date)):
-        # If it's a datetime, extract just the date portion
         date_of_sailing = sail_date.date() if isinstance(sail_date, datetime) else sail_date
     elif isinstance(sail_date, str):
-        # Strip out any potential dash or slash delimiters left over by the caller
         clean_date_str = sail_date.replace("-", "").replace("/", "")
         try:
             date_of_sailing = datetime.strptime(clean_date_str, "%Y%m%d").date()
@@ -809,15 +1198,34 @@ def get_final_payment_date(number_of_nights: int, sail_date: Union[str, date, da
     else:
         raise TypeError("sail_date must be a string, date, or datetime object.")
 
-    # Apply final payment window rules (from Royal Caribbean FAQ)
-    if number_of_nights < 5:
-        final_payment_deadline = 75
-    elif number_of_nights < 15:
-        final_payment_deadline = 90
-    else:
-        final_payment_deadline = 120
+    # 2. Highest Priority: Explicit User Date Override
+    if final_payment_date_override is not None:
+        if isinstance(final_payment_date_override, int):
+            return date_of_sailing - timedelta(days=final_payment_date_override)
 
-    return date_of_sailing - timedelta(days=final_payment_deadline)
+        if isinstance(final_payment_date_override, (datetime, date)):
+            return (
+                final_payment_date_override.date()
+                if isinstance(final_payment_date_override, datetime)
+                else final_payment_date_override
+            )
+
+        if isinstance(final_payment_date_override, str):
+            clean_override = final_payment_date_override.strip()
+            if clean_override.isdigit() and len(clean_override) <= 3:
+                return date_of_sailing - timedelta(days=int(clean_override))
+
+            clean_override = clean_override.replace("-", "").replace("/", "")
+            try:
+                return datetime.strptime(clean_override, "%Y%m%d").date()
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid finalPaymentDate string format '{final_payment_date_override}'. Expected YYYY-MM-DD or lead days."
+                ) from e
+
+    # 3. Compute Days Before Departure via Market Rules
+    lead_time_days = resolve_lead_time(number_of_nights, market_code)
+    return date_of_sailing - timedelta(days=lead_time_days)
 
 
 def get_config_path() -> str:
@@ -930,16 +1338,14 @@ def parse_provided_URL(url: str) -> CruiseURLParams:
     # Some Countries List Cabin String as B, causing issue with room lookup
     parsed_cabin_string = _parse_stateroom_type(cabin_string)
     cabin_string = parsed_cabin_string if parsed_cabin_string != "NONE" else cabin_string
-#    if cabin_string == "I":
-#        cabin_string = "INTERIOR"
-#    if cabin_string == "O":
-#        cabin_string = "OUTSIDE"
-#    if cabin_string == "B":
-#        cabin_string = "BALCONY"
-#    if cabin_string == "D":
-#        cabin_string = "DELUXE"
-#    if cabin_string == "C":
-#        cabin_string = "CONCIERGE"
+
+    # Extract sub-type (r0e) and category code (r0f) with fallbacks for Guarantee (GTY) codes
+    raw_r0e = params.get("r0e", [None])[0]
+    raw_r0f = params.get("r0f", [None])[0]
+
+    # If r0e or r0f are missing, fallback to r0d / cabin_string if it's a specific category code (e.g. XB)
+    stateroom_subtype = raw_r0e
+    stateroom_category_code = raw_r0f
 
     # Parse the URL parameters and save in a class instance
     return CruiseURLParams(
@@ -947,12 +1353,12 @@ def parse_provided_URL(url: str) -> CruiseURLParams:
         sail_date=params.get("sailDate", [None])[0],
         currency_code=params.get("selectedCurrencyCode", ["USD"])[0],
         booking_office_country_code=params.get("country", ["USA"])[0],
-        ship_code=params.get("ship_code", [None])[0],
+        ship_code=params.get("shipCode", [None])[0],
         cabin_class_string=cabin_string,
         stateroom_type_name=r0d_list[0] if r0d_list else None,
-        stateroom_subtype=params.get("r0e", [None])[0],
-        stateroom_category_code=params.get("r0f", [None])[0],
-        package_code=params.get("package_code", [None])[0],
+        stateroom_subtype=stateroom_subtype,
+        stateroom_category_code=stateroom_category_code,
+        package_code=params.get("packageCode", [None])[0],
         number_of_adults=params.get("r0a", ["2"])[0],
         number_of_children=params.get("r0c", ["0"])[0],
         loyalty_number=params.get("r0l", [None])[0],
@@ -977,14 +1383,53 @@ def _parse_stateroom_type(room_type_code: Optional[str]) -> str:
     Maps internal character letters (such as 'I', 'O', 'B') to explicit structural
     keywords expected by corporate inventory checkout paths (e.g., 'INTERIOR', 'OUTSIDE', 'BALCONY').
     """
-    mapping = {
-        "I": "INTERIOR",
-        "O": "OUTSIDE",
-        "B": "BALCONY",
-        "D": "DELUXE",
-        "C": "CONCIERGE"
-    }
-    return mapping.get(room_type_code, "NONE")
+    if not room_type_code:
+            return "NONE"
+    return STATEROOM_TYPE_MAPPING.get(room_type_code.upper(), "NONE")
+
+
+def sanitize_category_code(code: Optional[str]) -> Optional[str]:
+    """
+    Validates that a string is a genuine subcategory/rate code (e.g., 'XB', '2D', 'CB')
+    and not a macro stateroom type or single-character classification.
+    """
+    if not code:
+        return None
+
+    # Reject known generic classification words/letters
+    cleaned = code.strip().upper()
+    if cleaned in CHECKOUT_FORBIDDEN_CATEGORY_CODES:
+        return None
+
+    # Caribbean category codes are at least 2 characters (e.g., 'XB', '2D', 'CB')
+    if len(cleaned) < 2:
+        return None
+
+    return cleaned
+
+
+def _booking_country_code(booking: Dict[str, Any]) -> Optional[str]:
+    """
+    Resolves the country code a pricing/availability request should send.
+
+    International/TA bookings carry two country fields: bookingOfficeCountryCode
+    (the travel agent's own office, e.g. a German agency) and
+    bookingMarketCountryCode (the market the guest actually bought in, e.g.
+    Switzerland). The checkout API validates country against the booking
+    currency, so an office/currency pair that isn't itself a sales market gets
+    rejected (400/500) even though the market code prices fine. Prefer the
+    market code, fall back to the office code, and return None -- not the
+    literal string "None" -- when neither is present so callers can omit the
+    parameter and let downstream defaults (e.g. parse_provided_URL()'s "USA") apply.
+    """
+    # The API validates this against ^[A-Z]{3}$, so normalise here: a padded or
+    # lower-case value would 400 just like the wrong country does, and a
+    # whitespace-only value must fall through rather than "win" the preference.
+    for key in ("bookingMarketCountryCode", "bookingOfficeCountryCode"):
+        value = (booking.get(key) or "").strip().upper()
+        if value:
+            return value
+    return None
 
 
 #
@@ -1030,7 +1475,20 @@ def login(account_info: AccountInfo) -> APIAccess:
         sys.exit(1)
 
     if response.status_code != 200:
-        log(f"Login attempt got return code {response.status_code}")
+        log(f"Login attempt got return code {response.status_code} for user {account_info.username}")
+
+        # The status code alone cannot distinguish a rejected password
+        # ("invalid_grant") from a malformed request ("invalid_request") or an
+        # edge/WAF block that returns HTML - which makes a login failure very
+        # hard to diagnose. Surface the server's own error text; the OAuth
+        # error body carries no credentials, and the password is scrubbed
+        # defensively in case an echo is ever added.
+        detail = (response.text or "").strip()
+        if password and password in detail:
+            detail = detail.replace(password, "***")
+        if detail:
+            log(f"	Server said: {detail[:300]}")
+
         log(f"{account_info.cruise_line} website might be down, username/password incorrect, or have unsupported symbol in password. Quitting.")
         sys.exit(1)
 
@@ -1064,7 +1522,10 @@ def get_profile(account_info: AccountInfo) -> Tuple[Optional[str], Optional[str]
 
     Inspects user contact records to locate primary residency states and tracks concurrent
     loyalty modules (Crown & Anchor, Club Royale, Captain's Club, and Blue Chip). Returns
-    the active brand tracking index to route downstream web requests correctly.
+    the active brand tracking index to route downstream web requests correctly. Also stashes
+    the active-brand loyalty tier label and individual points directly onto account_info
+    (history-layer snapshot fields only - never read by any discount/alert logic) since
+    account_info is already in hand here and get_voyages()'s signature must not change.
     """
     url = f"https://aws-prd.api.rccl.com/en/{account_info.api_brand}/web/v3/guestAccounts/{account_info.access.id}"
     response = _execute_api_request(account_info, "GET", url)
@@ -1108,6 +1569,8 @@ def get_profile(account_info: AccountInfo) -> Tuple[Optional[str], Optional[str]
             log(f"\tCasino Royale Tier: {club_royale_loyalty_tier} - {casino_points} Credits")
 
     # Get and display Celebrity (Captain's Club and Blue Chip) information
+    cc_level = None
+    cc_individual = 0
     if captains_club_ID:
         cc_level = loyalty.get("captainsClubLoyaltyTier")
         cc_individual = loyalty.get("captainsClubLoyaltyIndividualPoints", 0)
@@ -1125,6 +1588,12 @@ def get_profile(account_info: AccountInfo) -> Tuple[Optional[str], Optional[str]
 
     # Return the correct loyality number based on the account being used
     loyalty_number_to_use = captains_club_ID if account_info.is_celebrity else c_and_a_number
+
+    # History-layer snapshot only (bookings.loyalty_tier / loyalty_points) - stashed
+    # directly on account_info since it's already in hand; not used in any
+    # discount/alert calculation and not part of this function's return contract
+    account_info.loyalty_tier = cc_level if account_info.is_celebrity else c_and_a_level
+    account_info.loyalty_points = cc_individual if account_info.is_celebrity else c_and_a_points
 
     # Return Royal Crown and Anchor shared points to determine if eligible for dp340
     return state, loyalty_number_to_use, c_and_a_shared_points
@@ -1203,7 +1672,13 @@ def get_checkin_info(account_info: AccountInfo,
 #
 # Reservation Tracking and Data Scraping Functions #
 #
-def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dictionary: ShipRegistry) -> None:
+def get_voyages(
+    account_info: AccountInfo,
+    discounts: CruiseURLParams,
+    ship_dictionary: ShipRegistry,
+    payment_tracker: Optional[CheckinPaymentTracker] = None,
+    collected_watch_rows: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     """
     Extracts all current, valid upcoming cruise bookings linked to an active account profile.
 
@@ -1259,7 +1734,11 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         stateroom_type_name = _parse_stateroom_type(booking.get("stateroomType"))
 
         # Unpack cabin occupants & boarding windows safely
-        metrics = _calculate_passenger_metrics(guests, sail_date, booking, brand_code, display_cruise_prices)
+        metrics = _calculate_passenger_metrics(guests, sail_date, booking, brand_code)
+
+        # Preserve resolved GTY category code for downstream pricing checks
+        if metrics.get("category_code") and not booking.get("stateroomCategoryCode"):
+            booking["stateroomCategoryCode"] = metrics["category_code"]
 
         # Display Reservation Information Header
         reservation_display = f"Reservation #{reservation_ID}"
@@ -1302,7 +1781,44 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         all_included_flag = False
         cruise_paid_price_from_API = result.get("prices", [])
 
-        final_payment_date = get_final_payment_date(number_of_nights, sail_date)
+        # Extract direct YAML overrides for this reservation ID (if configured)
+        # The full reservation_price_paid structure will get extracted later
+        yaml_payment_override = None
+        if isinstance(reservation_price_paid, list):
+            for res_entry in reservation_price_paid:
+                if str(reservation_ID) == str(res_entry.get("reservation")):
+                    yaml_payment_override = (
+                        res_entry.get("finalPaymentDaysBeforeSailing")
+                        or res_entry.get("finalPaymentDate")
+                    )
+                    break
+        elif isinstance(reservation_price_paid, dict) and str(reservation_ID) in reservation_price_paid:
+            res_entry = reservation_price_paid.get(str(reservation_ID))
+            if isinstance(res_entry, dict):
+                yaml_payment_override = (
+                    res_entry.get("finalPaymentDaysBeforeSailing")
+                    or res_entry.get("finalPaymentDate")
+                )
+
+        # Extract booking market indicators
+        market_code = (
+            booking.get("bookingOfficeCountryCode")
+            or booking.get("bookingMarketCountryCode")
+            or booking.get("countryCode")
+        )
+
+        final_payment_override = (
+            yaml_payment_override
+            or booking.get("finalPaymentDaysBeforeSailing")
+            or booking.get("finalPaymentDate")
+        )
+
+        final_payment_date = get_final_payment_date(
+            number_of_nights,
+            sail_date,
+            market_code=market_code,
+            final_payment_date_override=final_payment_override,
+        )
         final_payment_date_display = final_payment_date.strftime(date_display_format)
 
         for cur_price in cruise_paid_price_from_API:
@@ -1338,7 +1854,8 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
 
         # Record this booking for the end-of-run check-in / final-payment summary table.
         # Include the room number so multiple cabins on the same sailing are distinct.
-        summary_name = ship_dictionary.get_ship(ship_code)
+        ship_name = ship_dictionary.get_ship(ship_code)
+        summary_name = ship_name
         if stateroom_number:
             summary_name += f" ({stateroom_number})"
         summary_reservation = str(reservation_ID)
@@ -1349,16 +1866,51 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         balance_due_amount = booking.get("balanceDueAmount")
         if str(reservation_ID) in config.paid_reservations:
             balance_due = False   # user vouches for it (reservationsPaidInFull)
-        record_checkin_payment_row({
-            "name": summary_name,
-            "reservation": summary_reservation,
-            "sail_date": sail_date,
-            "checkin_label": checkin_label or "TBD",
-            "final_payment": final_payment_date,
-            "past_final_payment": date.today() > final_payment_date,
-            "balance_due": balance_due,
-            "dedupe_key": f"{reservation_ID}|{sail_date}",
+
+        past_final_payment = date.today() > final_payment_date
+        if payment_tracker is not None:
+            payment_tracker.record_row({
+                    "name": summary_name,
+                    "reservation": summary_reservation,
+                    "sail_date": sail_date,
+                    "checkin_label": checkin_label or "TBD",
+                    "final_payment": final_payment_date,
+                    "past_final_payment": past_final_payment,
+                    "balance_due": balance_due,
+                    "dedupe_key": f"{reservation_ID}|{sail_date}",
         })
+
+        # Snapshot this booking for the history layer (opt-in, no-op when disabled).
+        # 1/0/NULL tri-state matches the summary table's balance_due handling above.
+        guests_json = json.dumps([
+            {
+                "name": g.get("firstName", "").capitalize(),
+                "id": g.get("passengerId"),
+                "age_bracket": "adult" if above_age_on_sail_date(g.get("birthdate"), sail_date, 12) else "child",
+            }
+            for g in guests
+        ])
+        config.history.record_booking(
+            reservation_id=str(reservation_ID),
+            ship_code=ship_code,
+            ship_name=ship_name,
+            sail_date=sail_date,
+            nights=number_of_nights,
+            stateroom_type=stateroom_type_name,
+            stateroom_number=stateroom_number if stateroom_number and stateroom_number != "GTY" else None,
+            stateroom_category=metrics.get('category_code'),
+            guest_count=len(guests),
+            guests_json=guests_json,
+            loyalty_tier=account_info.loyalty_tier,
+            loyalty_points=account_info.loyalty_points,
+            checkin_label=checkin_label or "TBD",
+            final_payment_date=final_payment_date.strftime("%Y%m%d"),
+            past_final_payment=int(past_final_payment),
+            balance_due={True: 1, False: 0}.get(balance_due),
+            booking_currency=booking_currency,
+            friendly_name=reservation_friendly_names.get(str(reservation_ID)),
+            account_label=account_info.username,
+        )
 
         if balance_due is True:
             owed = (f"{balance_due_amount:.2f}" if isinstance(balance_due_amount, (int, float))
@@ -1373,6 +1925,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
         # Current Web Market Pricing Block
         if display_cruise_prices:
             # Build the complex Checkout/Room Selection URL
+            has_api_category = bool(metrics.get("category_code") or metrics.get("sub_type"))
 
             # Map legacy manual pricing text overrides from configuration yaml
             if isinstance(reservation_price_paid, dict) and reservation_price_paid:
@@ -1392,6 +1945,11 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
                                 paid_price_struct[key] = val
 
             if booking.get("stateroomType") != "NONE":
+                has_override = bool(paid_price_struct.get("categoryOverride") or paid_price_struct.get("subcategoryOverride"))
+                if not (has_api_category or has_override):
+                    log(YELLOW + "No stateroom category code could be resolved from API payload." + RESET)
+                    log(YELLOW + "Please set categoryOverride in your config YAML for this reservation." + RESET)
+
                 get_cruise_price(account_info,
                                  booking,
                                  ship_dictionary,
@@ -1402,7 +1960,7 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
                 log(YELLOW + "Cannot Check Cruise Price - Use Manual URL Method" + RESET)
 
         # Get the extra add-ons purchased for this voyage
-        get_orders(account_info, booking, metrics)
+        get_orders(account_info, booking, collected_watch_rows=collected_watch_rows)
         log(" ")
 
         # Process watchlists on a per-occupant layout instead of per-booking line
@@ -1415,7 +1973,14 @@ def get_voyages(account_info: AccountInfo, discounts: CruiseURLParams, ship_dict
                 }
 
                 # Handle any watch list items for this guest's booking
-                process_watch_list_for_booking(account_info, booking, watch_list_items, apobj, passenger_info)
+                process_watch_list_for_booking(
+                    account_info,
+                    booking,
+                    watch_list_items,
+                    apobj,
+                    passenger_info,
+                    collected_watch_rows=collected_watch_rows
+                )
 
             log(" ")
 
@@ -1428,9 +1993,11 @@ def get_dining_and_prices(account_info: AccountInfo, booking: Dict[str, Any]) ->
     safety fallbacks to return blank lists if network timeouts or structural processing
     faults occur, ensuring downstream processes don't break.
     """
-    # Safely pull the token and country straight from the booking payload
+    # Safely pull the token and country straight from the booking payload.
+    # Prefer the market country (matches the booking currency) over the TA's
+    # office country -- see _booking_country_code().
     amendtoken = booking.get("amendToken")
-    country = booking.get("bookingOfficeCountryCode", "USA")
+    country = _booking_country_code(booking) or "USA"
 
     RSC_URL = f"https://www.{account_info.url_brand}.com/usa/en/booked/overview"
 
@@ -1483,6 +2050,8 @@ def get_cruise_price(account_info: AccountInfo,
     # Pull properties from the foundational domain entities
     session = account_info.access.session
     apobj = notifier_for(account_info)
+    # None for the synthetic prospective-cruise booking dict (no real reservation)
+    reservation_id = booking.get("bookingId")
     if paid_price_struct is None:
         paid_price_struct = booking.get("paidPriceStruct")  # Dict containing target metrics
 
@@ -1610,14 +2179,29 @@ def get_cruise_price(account_info: AccountInfo,
     # A watchlist URL can omit or mangle sailDate; a far-future fallback keeps
     # the "past final payment" comparisons meaning "not past" instead of crashing
     try:
-        final_payment_date = get_final_payment_date(resolved_nights, url_params.sail_date)
+        # Attempt extraction from url_params or booking payload if available in scope
+        market_code = getattr(url_params, "market_code", None)
+        final_payment_override = None
+        if paid_price_struct:
+            final_payment_override = (
+                paid_price_struct.get("finalPaymentDaysBeforeSailing")
+                or paid_price_struct.get("finalPaymentDate")
+            )
+
+        final_payment_date = get_final_payment_date(
+            resolved_nights,
+            url_params.sail_date,
+            market_code=market_code,
+            final_payment_date_override=final_payment_override,
+        )
     except (TypeError, ValueError):
         final_payment_date = date.max
 
     # Reach into the global ship mapper object natively
     ship_name = ship_dictionary.get_ship(url_params.ship_code)
     sail_date_display = config.format_date(url_params.sail_date)
-    pre_string = f"{sail_date_display} {ship_name} {url_params.cabin_class_string} {url_params.stateroom_category_code}"
+    category_display = url_params.stateroom_category_code or url_params.stateroom_subtype or "Unassigned/GTY"
+    pre_string = f"{sail_date_display} {ship_name} {url_params.cabin_class_string} {category_display}"
 
     # Build active discount labels
     used_discounts = ""
@@ -1633,6 +2217,37 @@ def get_cruise_price(account_info: AccountInfo,
 
     if used_discounts != "":
         pre_string = f"{pre_string} ({used_discounts[:-2]} Discount)"
+
+    # History must record sail_date/nights in the SAME form the addon/promo/
+    # booking-snapshot paths already use (the booking's raw YYYYMMDD sailDate
+    # and bare numberOfNights), not url_params.sail_date - that's the dashed
+    # date parsed back out of the checkout URL. Recording the dashed form
+    # here made a reservation with an add-on purchase produce two history
+    # rows that disagree on sail_date/nights for the same sailing, so a
+    # downstream viewer grouping on (reservation_id, ship_code, sail_date,
+    # nights) showed it as two separate cards. url_params.sail_date/
+    # resolved_nights stay exactly as-is for the final-payment computation
+    # above and everything else in this function; only what gets written to
+    # history changes. The synthetic prospective/watchlist booking (see the
+    # `prospective_booking` dict built for config.prospective_cruises) has no
+    # sailDate/numberOfNights of its own, so fall back to those already-
+    # resolved URL/API-derived values for that case, same as before.
+    history_number_of_nights = int(booking.get("numberOfNights") or 0) or None
+    if not booking.get("sailDate"):
+        history_number_of_nights = resolved_nights
+    history_sail_date = booking.get("sailDate") or url_params.sail_date
+
+    # Fields shared by every PriceHistory.record_cabin_fare() call below;
+    # each call site only adds current_price/status/rebook_decision/notified
+    history_common = {
+        # str-coerced to match the addon rows, so the two kinds join cleanly
+        "reservation_id": str(reservation_id) if reservation_id is not None else None,
+        "account_label": account_info.username,
+        "ship_code": url_params.ship_code, "sail_date": history_sail_date, "nights": history_number_of_nights,
+        "item_code": f"{url_params.package_code}/{url_params.stateroom_category_code}",
+        "paid_price": paid_price, "currency": url_params.currency_code,
+        "discount_applied": used_discounts[:-2] if used_discounts else None,
+    }
 
     addons = ""
     refund_not_found = False
@@ -1650,6 +2265,8 @@ def get_cruise_price(account_info: AccountInfo,
             # No fare data at all: bail out rather than comparing against a phantom
             # 0.00 price, which would fire a false "Rebook! New price of 0.00" alert
             log(f"{YELLOW}{pre_string}: No fare pricing returned; cannot compare price{RESET}")
+            config.history.record_cabin_fare(**history_common, current_price=None,
+                                              status="no_price_data", rebook_decision=None, notified=False)
             return
 
         # The keys always exist (so .get defaults never apply) but their values
@@ -1657,6 +2274,8 @@ def get_cruise_price(account_info: AccountInfo,
         # crashing on the first {price:.2f} format below
         if fare_struct.get("fare") is None:
             log(f"{YELLOW}{pre_string}: No fare pricing returned; cannot compare price{RESET}")
+            config.history.record_cabin_fare(**history_common, current_price=None,
+                                              status="no_price_data", rebook_decision=None, notified=False)
             return
         price = fare_struct.get("fare") or 0.0
         grats = fare_struct.get("gratuities") or 0.0
@@ -1715,8 +2334,6 @@ def get_cruise_price(account_info: AccountInfo,
         if not automatic_URL and apobj is not None:
             apobj.notify(body=text_string, title='Cruise Room Not Available', body_format=NotifyFormat.TEXT)
 
-        # TODO: This code block will print the "Available Rooms" line even if the count is 0;
-        #       do we want to use this commented-out block instead
         if url_params.package_code and not automatic_URL:
             # Pre-filter rooms that actually have inventory available
             # (key is 'rooms_left' as produced by check_if_room_is_available; price may be None)
@@ -1732,6 +2349,9 @@ def get_cruise_price(account_info: AccountInfo,
                     log(f"\t{available_room.get('name')} {available_room.get('price'):.2f} - Rooms Left {available_room.get('rooms_left')}")
             else:
                 log(f"\tNo alternative room inventory returned by the booking engine.")
+
+        config.history.record_cabin_fare(**history_common, current_price=None, status="not_for_sale",
+                                          rebook_decision=None, notified=(not automatic_URL and apobj is not None))
         return
 
     obc_value = float(obc or 0.0)
@@ -1740,7 +2360,14 @@ def get_cruise_price(account_info: AccountInfo,
     # Path 2: Standard Pricing Evaluation
     if paid_price is None:
         log(GREEN + f"{pre_string}:" + RESET + f" Current Price {price:.2f} {url_params.currency_code}")
+        config.history.record_cabin_fare(**history_common, current_price=price, status="priced",
+                                          rebook_decision=None, notified=False)
         return
+
+    # rebook_decision / notified are computed inline below, then recorded once
+    # after the branch (see B.3/C.2) - the alert logic itself is untouched.
+    rebook_decision: Optional[str] = None
+    notified = False
 
     if price < paid_price:
         saving = round(paid_price - price, 2)
@@ -1755,10 +2382,13 @@ def get_cruise_price(account_info: AccountInfo,
             if config.minimum_saving_alert is not None and saving < config.minimum_saving_alert:
                 text_string += f" (Saving {saving:.2f} < minimumSavingAlert {config.minimum_saving_alert}; no notification sent)"
                 log(YELLOW + text_string + RESET)
+                rebook_decision = "suppressed_below_threshold"
             else:
                 log(RED + text_string + RESET)
                 if apobj is not None:
                     apobj.notify(body=text_string, title='Cruise Price Alert', body_format=NotifyFormat.TEXT)
+                    notified = True
+                rebook_decision = "rebook"
 
         # Sub-branch 2: Booked drop but locked behind final lock dates
         if automatic_URL and past_final_payment_date:
@@ -1767,6 +2397,7 @@ def get_cruise_price(account_info: AccountInfo,
                 text_string += f", not including {obc_string} USD OBC,"
             text_string += f" is lower than {paid_price:.2f}"
             log(YELLOW + text_string + RESET)
+            rebook_decision = "past_final_payment"
 
         # Sub-branch 3: Speculative prospective watchlist match
         if not automatic_URL:
@@ -1778,12 +2409,16 @@ def get_cruise_price(account_info: AccountInfo,
             if config.minimum_saving_alert is not None and saving < config.minimum_saving_alert:
                 text_string += f" (Saving {saving:.2f} < minimumSavingAlert {config.minimum_saving_alert:.2f}; no notification sent)"
                 log(YELLOW + text_string + RESET)
+                rebook_decision = "suppressed_below_threshold"
             else:
                 log(RED + text_string + RESET)
                 if apobj is not None:
                     apobj.notify(body=text_string, title='Cruise Price Alert', body_format=NotifyFormat.TEXT)
+                    notified = True
+                rebook_decision = "consider_booking"
     else:
         # Current catalog price is equal to or higher than target price thresholds
+        rebook_decision = "best_price"
         temp_string = GREEN + f"{pre_string}: You have the best price of {paid_price:.2f} {url_params.currency_code}" + RESET
         if price > paid_price:
             temp_string += f" (now {price:.2f} {url_params.currency_code}"
@@ -1800,6 +2435,9 @@ def get_cruise_price(account_info: AccountInfo,
             temp_string += f" Non-refundable price is {base_price:.2f} {url_params.currency_code}"
 
         log(temp_string)
+
+    config.history.record_cabin_fare(**history_common, current_price=price, status="priced",
+                                      rebook_decision=rebook_decision, notified=notified)
 
 
 def get_room_price_via_API(url_params: CruiseURLParams, room_number: Optional[str] = None) -> Dict[str, Any]:
@@ -1997,6 +2635,21 @@ def check_if_room_is_available(params: CruiseURLParams) -> tuple[bool, List[Dict
     except (IndexError, AttributeError):
         return False, available_rooms
 
+    # --- GTY / CATEGORY OVERRIDE BYPASS ---
+    # Unassigned guarantee inventory (e.g. 'XB', 'ZI', 'YO') and explicit config overrides
+    # do not appear as physical subtype entries in the RSC response array. As long as
+    # stateroomTypes returned active options for the voyage, bypass the subtype loop.
+    gty_codes = {"GTY", "XB", "YO", "ZI", "WS", "XN", "CB"}
+    is_gty = (
+            params.stateroom_subtype in gty_codes
+            or params.stateroom_category_code in gty_codes
+            or (params.stateroom_subtype and params.stateroom_subtype.endswith("GTY"))
+            or (params.stateroom_category_code and params.stateroom_category_code.endswith("GTY"))
+    )
+
+    if is_gty and stateroom_types:
+        return True, []
+
     # Royal has begun renaming funnel subtype codes so they no longer equal the
     # letters of their categories (Ovation interiors: booking-era code U with
     # categories 2U/4U is now funnel subtype V; Navigator balconies: D -> DW).
@@ -2078,7 +2731,7 @@ def get_new_order_price(
     booking: Dict[str, Any],
     apobj: Optional[Apprise],
     ctx: WatchItemContext
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """
     Compares active promotional planner prices against a passenger's purchased cost.
 
@@ -2090,6 +2743,7 @@ def get_new_order_price(
     # Explicit check: If this context item targets specific bookings, enforce isolation
     # Fall back to using extracting the ID from booking if not listed in the ctx structure
     reservation_ID = ctx.reservation_id or booking.get("bookingId")
+
     # str-coerce both sides: YAML ints vs API string bookingIds must still match
     if ctx.reservations and str(reservation_ID) not in {str(r) for r in ctx.reservations}:
         return
@@ -2116,6 +2770,7 @@ def get_new_order_price(
     owner = ctx.owner
 
     display_name = passenger_name.ljust(10)
+    per_day_price = sales_unit in ['PER_NIGHT', 'PER_DAY']
 
     params = {
         'reservationId': reservation_ID,
@@ -2134,6 +2789,18 @@ def get_new_order_price(
             raise ValueError
     except (AttributeError, ValueError, TypeError):
         log(f"{prefix} {product} not available for passenger")
+        # Record this too: for a watchlist item this is the "waiting for it to
+        # become bookable" state, exactly what a back-in-stock history query
+        # needs a row for. The payload never parsed, so item_name is unknown.
+        config.history.record_addon(
+            item_kind="watchlist" if for_watch else "addon",
+            reservation_id=str(reservation_ID) if reservation_ID is not None else None,
+            account_label=account_info.username, ship_code=ship, sail_date=start_date,
+            nights=number_of_nights or None,
+            item_code=f"{prefix}/{product}", guest_id=str(passenger_ID) if passenger_ID is not None else None,
+            guest_name=passenger_name, paid_price=paid_price, currency=currency,
+            per_night=int(per_day_price), current_price=None,
+            status="not_available_for_passenger", rebook_decision=None, notified=False)
         return
 
     # Parse the returned information for analysis and display
@@ -2147,12 +2814,25 @@ def get_new_order_price(
     if "Bottles" in variant:
         title = f"{title} ({variant})"
 
+    # Fields shared by every PriceHistory.record_addon() call below (title is
+    # final as of here); each call site only adds current_price/discount_applied/
+    # status/rebook_decision/notified
+    history_common = {
+        "item_kind": "watchlist" if for_watch else "addon",
+        "reservation_id": str(reservation_ID) if reservation_ID is not None else None,
+        "account_label": account_info.username, "ship_code": ship, "sail_date": start_date,
+        "nights": number_of_nights or None, "item_code": f"{prefix}/{product}", "item_name": title,
+        "guest_id": str(passenger_ID) if passenger_ID is not None else None, "guest_name": passenger_name,
+        "paid_price": paid_price, "currency": currency, "per_night": int(per_day_price),
+    }
+
     booking_eligibility = payload.get("bookingEligibility") or {}
     if booking_eligibility.get("reason") == "NO_STARTING_FROM_PRICE":
         log(YELLOW + f"\t{title}: Server returned no pricing data (currency mismatch or unavailable for reservation)." + RESET)
+        config.history.record_addon(**history_common, current_price=None, discount_applied=None,
+                                     status="no_price_data", rebook_decision=None, notified=False)
         return
 
-    per_day_price = sales_unit in ['PER_NIGHT', 'PER_DAY']
     new_price_payload = payload.get("startingFromPrice")
 
     # Item is no longer for sale or already purchased
@@ -2166,6 +2846,8 @@ def get_new_order_price(
             temp_string = YELLOW + f"\t{title} not available or already booked for {passenger_name.ljust(10)}" + RESET
 
         log(temp_string)
+        config.history.record_addon(**history_common, current_price=None, discount_applied=None,
+                                     status="no_longer_for_sale", rebook_decision=None, notified=False)
         return
 
     # Extract age-bracket targeted metrics
@@ -2178,18 +2860,25 @@ def get_new_order_price(
         # would fire a false "price is lower / Book!" alert (same failure mode
         # already guarded for cruise fares)
         log(YELLOW + f"\t{title}: no current price returned; cannot compare" + RESET)
+        config.history.record_addon(**history_common, current_price=None, discount_applied=None,
+                                     status="no_price_data", rebook_decision=None, notified=False)
         return
 
-    watch_price_rows.append({
+    watch_tracker_record = {
         "SailDate": start_date,
         "ReservationID": reservation_ID,
         "Passenger": passenger_name,
         "ProductID": product,
         "ProductTitle": title,
         "CurrentPrice": current_price,
-    })
+    }
 
     # Process Deal Alerts
+    # rebook_decision / notified / history_discount_applied are computed inline below,
+    # then recorded once after the branch (see B.3/C.2) - the alert logic itself is untouched.
+    rebook_decision: Optional[str] = None
+    notified = False
+    history_discount_applied: Optional[str] = None
     if current_price < paid_price:
         # Current price on server is lower than the paid price (rebooking alert path)
         saving = round(paid_price - current_price, 2)
@@ -2214,6 +2903,7 @@ def get_new_order_price(
         if promo_description:
             promotion_title = promo_description.get("displayName")
             text += f'\n\t\tPromotion:{promotion_title}'
+            history_discount_applied = promotion_title
 
         if for_watch:
             text += f'\n\tBook at https://www.{account_info.url_brand}.com/account/cruise-planner/category/{prefix}/product/{product}?bookingId={reservation_ID}&shipCode={ship}&sailDate={start_date}'
@@ -2226,12 +2916,16 @@ def get_new_order_price(
         if config.minimum_saving_alert is not None and saving_for_alert < config.minimum_saving_alert:
             text += f" ({saving_label} < minimumSavingAlert {config.minimum_saving_alert:.2f}; no notification sent)"
             log(YELLOW + text + RESET)
+            rebook_decision = "suppressed_below_threshold"
         else:
             log(RED + text + RESET)
             if apobj is not None:
                 apobj.notify(body=text, title='Cruise Addon Price Alert', body_format=NotifyFormat.TEXT)
+                notified = True
+            rebook_decision = "consider_booking" if for_watch else "rebook"
     else:
         # Current price on server is higher than the paid price ("currently best price" path)
+        rebook_decision = "best_price"
         if for_watch:
             if current_price == paid_price:
                 comp_string = "the same as"
@@ -2247,17 +2941,23 @@ def get_new_order_price(
             temp_string += f" (now {current_price:.2f} {currency})"
         log(temp_string)
 
+    config.history.record_addon(**history_common, current_price=current_price,
+                                 discount_applied=history_discount_applied, status="priced",
+                                 rebook_decision=rebook_decision, notified=notified)
 
-def write_watch_price_json(output_path: str) -> None:
+    return watch_tracker_record
+
+
+def write_watch_price_json(rows: List[Dict[str, Any]], output_path: str) -> None:
     """Write the add-on watch prices collected during this run as a JSON array."""
     if platform.system() == "iOS":
         output_path = os.path.expanduser('~/Documents') + "/" + output_path
 
     try:
         with open(output_path, "w", encoding="utf-8") as output_file:
-            json.dump(watch_price_rows, output_file, indent=2)
+            json.dump(rows, output_file, indent=2)
             output_file.write("\n")
-        log(f"\n{BLUE}Writing watchlist JSON to {output_path}" + RESET) 
+        log(f"\n{BLUE}Writing watchlist JSON to {output_path}" + RESET)
     except OSError as error:
         log(f"{YELLOW}Warning: Could not write JSON watch output '{output_path}': {error}{RESET}")
 
@@ -2267,7 +2967,8 @@ def process_watch_list_for_booking(
     booking: Dict[str, Any],
     watch_list_items: List[WatchListItem],
     apobj: Optional[Apprise],
-    passenger_info: Dict[str, Any]
+    passenger_info: Dict[str, Any],
+    collected_watch_rows: Optional[List[Dict[str, Any]]] = None
 ) -> None:
     """
     Evaluates individual user watchlist targets against active booking records.
@@ -2328,10 +3029,16 @@ def process_watch_list_for_booking(
         )
 
         # Check the item's current price
-        get_new_order_price(account_info, booking, apobj, ctx)
+        if watch_row := get_new_order_price(account_info, booking, apobj, ctx):
+            if collected_watch_rows is not None:
+                collected_watch_rows.append(watch_row)
 
 
-def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict[str, Any]) -> None:
+def get_orders(
+    account_info: AccountInfo,
+    booking: Dict[str, Any],
+    collected_watch_rows: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     """
     Retrieves the digital order history or itinerary manifest for an active booking.
 
@@ -2498,7 +3205,10 @@ def get_orders(account_info: AccountInfo, booking: Dict[str, Any], metrics: Dict
                             reservation_id=guestreservation_ID
                         )
 
-                        get_new_order_price(account_info, booking, notifier_for(account_info), ctx)
+                        # Check the item's current price
+                        if watch_row := get_new_order_price(account_info, booking, notifier_for(account_info), ctx):
+                            if collected_watch_rows is not None:
+                                collected_watch_rows.append(watch_row)
 
 
 def get_all_promotions(account_info: AccountInfo, booking: Dict[str, Any]) -> None:
@@ -2577,7 +3287,8 @@ def get_all_promotions(account_info: AccountInfo, booking: Dict[str, Any]) -> No
 
         banner = banner_by_id.get(promo_ID)
         if banner:
-            promo_line = f"[PROMO] {banner.get('heading3', '')} {banner.get('heading4', '')} - {banner.get('heading1', '')} {date_range}"
+            promo_title = f"{banner.get('heading3', '')} {banner.get('heading4', '')} - {banner.get('heading1', '')}"
+            promo_line = f"[PROMO] {promo_title} {date_range}"
         else:
             template = next((t for t in promo.get("templates", []) if isinstance(t, dict) and t.get("type") == "HOME_HERO_LOCKUP"), None)
             if not template:
@@ -2603,11 +3314,17 @@ def get_all_promotions(account_info: AccountInfo, booking: Dict[str, Any]) -> No
                     description = " ".join(words).upper()
 
             category_code = template.get("categoryCode", "")
-            promo_line = f"[PROMO] {description or promo_ID}"
+            promo_title = description or promo_ID
+            promo_line = f"[PROMO] {promo_title}"
             if category_code:
                 promo_line += f" ({category_code})"
             promo_line += f" {date_range}"
 
+        config.history.record_promo(
+            account_label=account_info.username, ship_code=ship, sail_date=start_date,
+            promo_id=promo_ID, promo_title=promo_title, promo_line=promo_line,
+            promo_start=promo_start, promo_end=promo_end,
+        )
         log(YELLOW + promo_line + RESET)
 
 
@@ -2678,11 +3395,18 @@ def _build_checkout_url(
     url_sail_date = f"{sail_date[0:4]}-{sail_date[4:6]}-{sail_date[6:8]}"
     stateroom_number = booking.get("stateroomNumber")
 
+    # Resolve stateroom type and subtype defaults safely
+    stateroom_type = _parse_stateroom_type(booking.get("stateroomType"))
+    fallback_category = metrics.get('category_code') or metrics.get('sub_type') or booking.get("stateroomType")
+
+    sub_type = metrics.get('sub_type') or fallback_category
+    category_code = metrics.get('category_code') or fallback_category
+
     # Build the dictionary of parameters that URLs for GTY and non-GTY share completely
     params = {
         'packageCode': booking.get("packageCode"),
         'sailDate': url_sail_date,
-        'country': booking.get("bookingOfficeCountryCode"),
+        'country': _booking_country_code(booking),
         'selectedCurrencyCode': booking.get("bookingCurrency"),
         'shipCode': booking.get("shipCode"),
         'roomIndex': '0',
@@ -2710,13 +3434,20 @@ def _build_checkout_url(
         params['r0k'] = discounts.state
 
     # Define the base URL and add the GTY-specific parameters as needed
+    base_url = f"https://www.{account_info.url_brand}.com/room-selection/room-location"
     if stateroom_number == "GTY":
-        base_url = f"https://www.{account_info.url_brand}.com/checkout/add-ons"
         params['r0g'] = 'BESTRATE'
         params['r0h'] = 'n'
         params['r0C'] = 'y'
-    else:
-        base_url = f"https://www.{account_info.url_brand}.com/room-selection/room-location"
+
+    # Drop parameters with no value: urlencode() would otherwise stringify
+    # None into the literal string "None" (e.g. travel-agent bookings that
+    # carry no bookingOfficeCountryCode). Downstream URL parsing would then
+    # forward countryCode="None" to the checkout API, which rejects it with
+    # HTTP 400 BAD_INPUT ("must match pattern ^[A-Z]{3}$") and the cabin
+    # reports "Room Price Not Found". Omitting the key lets
+    # parse_provided_URL() fall back to its defaults (country -> "USA").
+    params = {key: value for key, value in params.items() if value is not None and value != ""}
 
     # Seamlessly combine the base URL and the safely encoded string
     return f"{base_url}?{urlencode(params)}"
@@ -2844,7 +3575,7 @@ def _calculate_passenger_metrics(
     sail_date: str,
     booking: Dict[str, Any],
     brand_code: str,
-    display_prices: bool
+#    display_prices: bool
 ) -> Dict[str, Any]:
     """
     Parses structural guest files to calculate age milestones, check-in windows, and demographic flags.
@@ -2864,21 +3595,33 @@ def _calculate_passenger_metrics(
     stateroom_subtype = booking.get("stateroomSubtype")
     stateroom_category_code = None   # a booking with no guests must not leave this unbound
 
+    # Check top-level booking fallbacks for GTY reservations where guest-level keys are omitted
+    raw_category = (
+        booking.get("stateroomCategoryCode")
+        or booking.get("categoryCode")
+        or booking.get("subCategoryCode")
+    )
+
+    # Deep check in passengersInStateroom or passengers arrays if top-level is absent (common in GTY)
+    if not raw_category:
+        passenger_list = (booking.get("passengersInStateroom") or []) + (booking.get("passengers") or [])
+        for guest in passenger_list:
+            if isinstance(guest, dict):
+                raw_category = (
+                    guest.get("stateroomCategoryCode")
+                    or guest.get("subCategoryCode")
+                    or guest.get("categoryCode")
+                )
+                if raw_category:
+                    break
+
+    # Sanitize and validate candidate category code against CHECKOUT_FORBIDDEN_CATEGORY_CODES
+    booking_category_fallback = sanitize_category_code(raw_category)
+
     for guest in guests:
-        stateroom_category_code = guest.get("stateroomCategoryCode")
-
-        # Apply legacy GTY room structure workarounds
-        if stateroom_category_code is None and stateroom_subtype is None:
-            if display_prices:
-                log(YELLOW + "Data is missing from API. Code is taking a guess to fixing" + RESET)
-                log(YELLOW + "Add category override in config.yaml if wrong category" + RESET)
-
-            if stateroom_type == "B" and brand_code == "C":
-                stateroom_category_code = "XC"
-                stateroom_subtype = "XC"
-            elif stateroom_type == "I" and brand_code == "R":
-                stateroom_category_code = "ZI"
-                stateroom_subtype = "ZI"
+        guest_category = guest.get("stateroomCategoryCode")
+        stateroom_category_code = sanitize_category_code(guest_category) or booking_category_fallback
+        category_unresolved = (stateroom_category_code is None and stateroom_subtype is None)
 
         # Names & Demographic verification
         first_name = guest.get("firstName", "").capitalize()
@@ -2923,355 +3666,10 @@ def _calculate_passenger_metrics(
         "num_children": num_children,
         "have_a_senior": have_a_senior,
         "category_code": stateroom_category_code,
-        "sub_type": stateroom_subtype
-    }
-
-'''
-######################################################
-# Dead/Obsolete/Unused functions
-# WARNING: These were NOT refactored to use snake_case
-# or renamed functions; these will need to be updated
-# if resurrected
-######################################################
-appkey_mobile = 'cdCNc04srNq4rBvKofw1aC50dsdSaPuc'
-appversion_mobile = '1.73.4'
-user_agent_mobile = 'royal/1.73.4 (com.rccl.royalcaribbean; build:2528; android 16) okhttp/4.12.0'
-
-def string_to_float(s: str) -> float:
-    if not s:
-        return 0.0
-
-    s = s.strip()
-
-    if "," in s and "." in s:
-        # Both present → last one is decimal separator
-        if s.rfind(",") > s.rfind("."):
-            # European: 1.234,56
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            # American: 1,234.56
-            s = s.replace(",", "")
-    elif "," in s:
-        # Only comma present
-        parts = s.split(",")
-        if len(parts[-1]) == 3 and parts[-1].isdigit():
-            # 4,000 → thousands
-            s = s.replace(",", "")
-        else:
-            # 4,0 → decimal
-            s = s.replace(",", ".")
-    elif "." in s:
-        # Only dot present
-        parts = s.split(".")
-        if len(parts[-1]) == 3 and parts[-1].isdigit():
-            # 4.000 → thousands
-            s = s.replace(".", "")
-        # else: 4.0 or 4.00 → decimal → keep dot
-    # else: plain integer
-    return float(s)
-
-def days_between(d1, d2):
-    dt1 = datetime.strptime(d1, "%Y%m%d")
-    dt2 = datetime.strptime(d2, "%Y%m%d")
-    return (dt2 - dt1).days
-
-def getInCartPricePrice(access_token,accountId,session,reservationId,ship,startDate,prefix,quantity,paidPrice,currency,product,apobj, guest, passengerId,passengerName,room, orderCode, orderDate, owner):
-
-    headers = {
-    'User-Agent': USER_AGENT_WEB,
-    'Accept': 'application/json',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Access-Token': access_token,
-    'AppKey': APPKEY_WEB,
-    'vds-id': accountId,
-    'Account-Id': accountId,
-    'channel': 'web',
-    'Req-App-Id': 'Royal.Web.PlanMyCruise',
-    'Req-App-Vers': '1.81.3',
-    'Content-Type': 'application/json',
-    'Origin': 'https://www.royalcaribbean.com',
-    'DNT': '1',
-    'Sec-GPC': '1',
-    'Connection': 'keep-alive',
-    'Referer': 'https://www.royalcaribbean.com/',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'cross-site',
-    'Priority': 'u=0',
-    # Requests doesn't support trailers
-    # 'TE': 'trailers',
-    }
-
-    params = {
-        'sailingId': ship + startDate,
-        'currencyIso': currency,
-        'categoryId': prefix,
+        "sub_type": stateroom_subtype#,
     }
 
 
-    json_data = {
-        'productCode': product,
-        'quantity': quantity,
-        'signOnReservationId': reservationId,
-        'signOnPassengerId': passengerId,
-        'guests': [
-            {
-                'id': passengerId,
-                'firstName': guest.get("firstName"),
-                'lastName': guest.get("lastName"),
-                'selected': False,
-                'dob': guest.get("dob"),
-                'reservationId': reservationId,
-                'attachedToReservation': False,
-            },
-        ],
-        'offeringId': product,
-    }
-
-    try:
-        response = requests.post(
-            'https://aws-prd.api.rccl.com/en/royal/web/commerce-api/cart/v1/price',
-            params=params,
-            headers=headers,
-            json=json_data,
-        )
-    except Exception as e:
-        log(f"Can't contact cruise line servers; please try again later\n(program exception '{e}')")
-        sys.exit(1)
-
-    payload = response.json().get("payload")
-    if payload is None:
-        log("Payload Not Returned")
-        return
-
-    unitType = payload.get("prices")[0].get("unitType")
-
-    if unitType in [ 'perNight', 'perDay' ]:
-        price = payload.get("prices")[0].get("promoDailyPrice")
-    else:
-        price = payload.get("prices")[0].get("promoPrice")
-
-    log(f"Paid Price: {paidPrice} Cart Price: {price}")
-
-def getLoyalty(access_token,accountId,session):
-
-    loyaltyNumber = None
-    headers = {
-        'Access-Token': access_token,
-        'AppKey': APPKEY_WEB,
-        'account-id': accountId,
-    }
-
-    try:
-        response = session.get('https://aws-prd.api.rccl.com/en/royal/web/v1/guestAccounts/loyalty/info', headers=headers)
-    except Exception as e:
-        print(f"Can't contact cruise line servers; please try again later\n(program exception '{e}')")
-        sys.exit(1)
-
-    loyalty = response.json().get("payload").get("loyaltyInformation")
-    cAndANumber = loyalty.get("crownAndAnchorId")
-    c_and_a_level = loyalty.get("crownAndAnchorSocietyLoyaltyTier")
-    cAndAPoints = loyalty.get("crownAndAnchorSocietyLoyaltyIndividualPoints")
-    cAndASharedPoints = loyalty.get("crownAndAnchorSocietyLoyaltyRelationshipPoints")
-
-    if cAndANumber is not None and cAndASharedPoints is not None and cAndASharedPoints > 0:
-        print(f"\tC&A: {cAndANumber} {c_and_a_level} - {cAndASharedPoints} Shared Points ({cAndAPoints} Individual Points)")
-        loyaltyNumber = cAndANumber
-
-    clubRoyaleLoyaltyIndividualPoints = loyalty.get("clubRoyaleLoyaltyIndividualPoints")
-    if clubRoyaleLoyaltyIndividualPoints is not None and clubRoyaleLoyaltyIndividualPoints > 0:
-        clubRoyaleLoyaltyTier = loyalty.get("clubRoyaleLoyaltyTier")
-        print(f"\tCasino Royale Tier: {clubRoyaleLoyaltyTier} - {clubRoyaleLoyaltyIndividualPoints} Credits")
-
-    captainsClubId = loyalty.get("captainsClubId")
-    if captainsClubId is not None:
-        captainsClubLoyaltyTier = loyalty.get("captainsClubLoyaltyTier")
-        captainsClubLoyaltyIndividualPoints = loyalty.get("captainsClubLoyaltyIndividualPoints")
-        captainsClubLoyaltyRelationshipPoints = loyalty.get("captainsClubLoyaltyRelationshipPoints")
-        print(f"\tCaptain's Club Number: {captainsClubId} {captainsClubLoyaltyTier} TIER ({captainsClubLoyaltyRelationshipPoints} Shared Points, {captainsClubLoyaltyIndividualPoints} Individual Points)")
-        loyaltyNumber = captainsClubId
-        print("Using Captains Club Id To Check Cruise Prices")
-
-    celebrityBlueChipLoyaltyIndividualPoints = loyalty.get("celebrityBlueChipLoyaltyIndividualPoints")
-    if celebrityBlueChipLoyaltyIndividualPoints is not None and celebrityBlueChipLoyaltyIndividualPoints > 0:
-        clubRoyaleLoyaltyTier = loyalty.get("celebrityBlueChipLoyaltyTier","Unknown")
-        print(f"\tBlue Chip Tier: {clubRoyaleLoyaltyTier} - {celebrityBlueChipLoyaltyIndividualPoints} Credits")
-
-    return loyaltyNumber
-
-def getShipDictionary():
-
-    headers = {
-        'appkey': appkey_mobile,
-        'accept': 'application/json',
-        'appversion': appversion_mobile,
-        'accept-language': 'en',
-        'user-agent': user_agent_mobile,
-    }
-
-    params = {
-        'sort': 'name',
-    }
-
-    try:
-        response = requests.get('https://api.rccl.com/en/all/mobile/v2/ships', params=params, headers=headers)
-    except Exception as e:
-        print(f"Can't contact cruise line servers; please try again later\n(program exception '{e}')")
-        sys.exit(1)
-
-    ships = response.json().get("payload").get("ships")
-
-    shipCodes = {}
-    for ship in ships:
-        shipCode = ship.get("shipCode")
-        name = ship.get("name")
-        shipCodes[shipCode] = name
-    return shipCodes
-
-def getRoyalUp(access_token,accountId,cruiseLineName,session,apobj):
-    # Unused, need javascript parsing to see offer
-    # Could notify when Royal Up is available, but not too useful.
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.5',
-        # 'Accept-Encoding': 'gzip, deflate, br, zstd',
-        'X-Requested-With': 'XMLHttpRequest',
-        'AppKey': 'hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm',
-        'Access-Token': access_token,
-        'vds-id': accountId,
-        'Account-Id': accountId,
-        'X-Request-Id': '67e0a0c8e15b1c327581b154',
-        'Req-App-Id': 'Royal.Web.PlanMyCruise',
-        'Req-App-Vers': '1.73.0',
-        'Content-Type': 'application/json',
-        'Origin': 'https://www.'+cruiseLineName+'.com',
-        'DNT': '1',
-        'Sec-GPC': '1',
-        'Connection': 'keep-alive',
-        'Referer': 'https://www.'+cruiseLineName+'.com/',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site',
-        'Priority': 'u=0',
-        # Requests doesn't support trailers
-        # 'TE': 'trailers',
-    }
-
-    try:
-        response = requests.get('https://aws-prd.api.rccl.com/en/royal/web/v1/guestAccounts/upgrades', headers=headers)
-    except Exception as e:
-        print(f"Can't contact cruise line servers; please try again later\n(program exception '{e}')")
-        sys.exit(1)
-
-    for booking in response.json().get("payload"):
-        print( booking.get("bookingId") + " " + booking.get("offerUrl") )
-
-
-def get_cruise_price_from_API(
-    currency: str,
-    package_code: str,
-    sail_date: str,
-    booking_type: str,
-    num_adults: Union[int, str],
-    num_children: Union[int, str]
-) -> None:
-    """
-    High-level orchestration manager that pulls live retail cabin pricing directly via the API.
-
-    Acts as the main bridge between raw parsed parameters and structural request assemblies.
-    Pre-formats inventory query arrays and submits them through the target pricing API
-    endpoint to calculate current base fares, port taxes, and total room options.
-    """
-    cookies: Dict[str, str] = {
-        'currency': currency,
-    }
-
-    # Custom headers requested specifically by this GraphQL engine endpoint
-    headers: Dict[str, str] = {
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'currency': currency,
-    }
-
-    filter_string: str = f"id:{package_code}|adults:{num_adults}|children:{num_children}|startDate:{sail_date}~{sail_date}"
-
-    json_data: Dict[str, Any] = {
-        'operationName': 'cruiseSearch_Cruises',
-        'variables': {
-            'filters': filter_string,
-            'enableNewCasinoExperience': False,
-            'sort': {
-                'by': 'RECOMMENDED',
-            },
-            'pagination': {
-                'count': 100,
-                'skip': 0,
-            },
-        },
-        'query': 'query cruiseSearch_Cruises($filters: String) {cruiseSearch(filters: $filters) {results {cruises {id sailings {sailDate stateroomClassPricing {price {value currency { code }} stateroomClass {id name content { code } }}}}}}}',
-    }
-
-    # Route using the centralized execution platform
-    # Passing cookies as an additional named parameter via keyword args extraction or direct tracking
-    resp = _execute_api_request(
-        account_info=None, # Public consumer catalog endpoint, no authentication required
-        method="POST",
-        url='https://www.royalcaribbean.com/cruises/graph',
-        data=json.dumps(json_data),
-        headers=headers,
-        on_failure="retry" # Prevent a transient pricing lookup failure from killing the tracking pipeline
-    )
-
-    if resp is None:
-        log("\tUnable to fetch public live API pricing stream at this time.")
-        return
-
-    try:
-        response_json = resp.json()
-        cruises = response_json.get("data", {}).get("cruiseSearch", {}).get("results", {}).get("cruises", [])
-    except Exception:
-        cruises = []
-
-    if cruises:
-        sailings = cruises[0].get("sailings", [])
-    else:
-        log("         Sailing is sold out")
-        return
-
-    for sailing in sailings:
-        # Standardize matching criteria format
-        current_sail_date: str = sailing.get("sailDate", "")
-        if current_sail_date.replace("-", "") != sail_date and current_sail_date != sail_date:
-            continue
-
-        prices = sailing.get("stateroomClassPricing", [])
-        for price in prices:
-            stateroom_class = price.get("stateroomClass", {})
-            content_struct = stateroom_class.get("content", {}) if stateroom_class else {}
-            cabin_code = content_struct.get("code") if content_struct else None
-
-            if cabin_code == booking_type:
-                post_string = " (your current room class) "
-            else:
-                post_string = ""
-
-            cabin_type = stateroom_class.get("name", "Unknown Type") if stateroom_class else "Unknown Type"
-            price_data = price.get("price")
-
-            if price_data is None:
-                log(f"\t\t{cabin_type} sold out")
-            else:
-                num_passengers = int(num_adults) + int(num_children)
-                total_cabin_cost = float(price_data.get("value", 0.0)) * num_passengers
-                log(f"\t\t{total_cabin_cost} {currency}: Cheapest {cabin_type} Price for {num_passengers}" + post_string)
-
-
-####################################
-# End Dead/Obsolete/Unused functions
-####################################
-'''
 #####################################
 # Main execution path and Run Control
 #####################################
@@ -3486,6 +3884,7 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         request_timeout=int(data.get("requestTimeout", REQUEST_TIMEOUT)),
         date_display_format=data.get("dateDisplayFormat", "%x"),
         log_file=data.get("logFile"),
+        history_db=data.get("historyDb"),
         output_watch_as_json=data.get("outputWatchAsJson",False),
         output_json_watch_file=data.get("outputJsonFile","output-json-watch.txt"),
         apobj=apobj,
@@ -3502,6 +3901,12 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
 
     # Set up the custom logger
     setup_hybrid_logging(config.log_file)
+
+    # Opt-in SQLite price-history sink; PriceHistory is a no-op when history_db is unset
+    history_db_path = config.history_db
+    if history_db_path and platform.system() == "iOS":
+        history_db_path = os.path.expanduser('~/Documents') + "/" + history_db_path
+    config.history = PriceHistory(history_db_path)
 
     if currency_override_present:
         log(YELLOW + f"Due to RCCL API updates, config file option 'currencyOverride' is deprecated" + RESET)
@@ -3567,98 +3972,6 @@ def derive_balance_due(booking: dict, cruise_paid_price_from_api: Optional[List[
     return None
 
 
-def record_checkin_payment_row(row: Dict[str, Any]) -> None:
-    """
-    Adds a booking to the end-of-run summary table, merging duplicates.
-
-    Linked reservations appear in every linked account's booking list, so a
-    multi-account run sees the same reservation once per account. Rows are
-    keyed on reservation id + sail date ("dedupe_key"); when a duplicate
-    arrives, the more informative fields win - a definitive balance_due
-    (True/False) beats None, and a real check-in label beats the "TBD"
-    placeholder - because only the owning account's view reliably carries
-    payment data. This keeps the outcome independent of the accountInfo order.
-    """
-    key = row.get("dedupe_key")
-    for existing in checkin_payment_rows:
-        if key is not None and existing.get("dedupe_key") == key:
-            if existing.get("balance_due") not in (True, False) and row.get("balance_due") in (True, False):
-                existing["balance_due"] = row["balance_due"]
-                existing["past_final_payment"] = row["past_final_payment"]
-            if existing.get("checkin_label") in (None, "TBD") and row.get("checkin_label") not in (None, "TBD"):
-                existing["checkin_label"] = row["checkin_label"]
-            return
-    checkin_payment_rows.append(row)
-
-
-def print_checkin_payment_table() -> None:
-    """
-    Prints a compact end-of-run summary of upcoming check-in openings / boarding
-    times and final payment dates for every booked sailing, sorted by sail date.
-
-    Nothing is printed when no booked sailings were gathered (e.g. a watchlist-only
-    run), so it never adds noise to runs that have nothing to summarize.
-    """
-    if not checkin_payment_rows:
-        return
-
-    rows = sorted(checkin_payment_rows, key=lambda r: r["sail_date"] or "")
-
-    headers = ("Sail Date", "Ship (Room)", "Reservation", "Check-In", "Final Payment")
-    table = []
-    pay_colors = []
-    for r in rows:
-        sail = config.format_date(r["sail_date"]) if r["sail_date"] else "?"
-        if r["final_payment"] is not None:
-            pay = r["final_payment"].strftime(config.date_display_format)
-            # Green when settled, yellow when a balance is still owed, red when that
-            # balance is now past the final payment deadline. "(paid)" is only shown
-            # when the API explicitly said the balance is settled - a missing/null
-            # balanceDue must not masquerade as paid in full.
-            if r["balance_due"] is True:
-                if r["past_final_payment"]:
-                    pay += " (PAST DUE)"
-                    pay_colors.append(RED)
-                else:
-                    pay += " (balance due)"
-                    pay_colors.append(YELLOW)
-            elif r["balance_due"] is False:
-                pay += " (paid)"
-                pay_colors.append(GREEN)
-            elif r["balance_due"] == "TA_UNKNOWN":
-                pay += " (contact TA for balance)"
-                pay_colors.append(YELLOW)
-            elif r["balance_due"] is None:
-                pay += " (status unknown)"
-                pay_colors.append(YELLOW)
-        else:
-            pay = "-"
-            pay_colors.append("")
-        table.append((sail, r["name"], r.get("reservation", "-"), r["checkin_label"], pay))
-
-    # Size each column to the widest of its header/cells. The stored values are ANSI-free;
-    # color is applied only at print time so it never skews this width math.
-    widths = [max(len(str(row[i])) for row in ([headers] + table)) for i in range(len(headers))]
-
-    def fmt(cells: Tuple[str, ...], pay_color: str = "") -> str:
-        padded = [str(c).ljust(widths[i]) for i, c in enumerate(cells)]
-        if pay_color:
-            padded[-1] = f"{pay_color}{padded[-1]}{RESET}"
-        return "  ".join(padded)
-
-    log(f"\n{BLUE}Upcoming Check-In & Final Payment Dates{RESET}")
-    log(fmt(headers))
-    log("  ".join("-" * w for w in widths))
-    prev_sail = None
-    for row, pay_color in zip(table, pay_colors):
-        # Blank the sail date when it repeats the row above (linked cruises / multiple
-        # cabins on one sailing) so each date prints once. Rows are sorted by date, so
-        # same-date rows are always adjacent.
-        display_row = ("" if row[0] == prev_sail else row[0],) + row[1:]
-        prev_sail = row[0]
-        log(fmt(display_row, pay_color))
-
-
 def main() -> None:
     """
     Primary orchestration engine for the cruise pricing validation suite.
@@ -3669,9 +3982,13 @@ def main() -> None:
     unbooked prospective vacation watchlists.
     """
     try:
-        # Start each run with an empty check-in / payment summary collector
-        checkin_payment_rows.clear()
-        watch_price_rows.clear()
+        # Instantiate clean per-run tracker
+        payment_tracker = CheckinPaymentTracker()
+
+        # Watch list table rows
+        collected_watch_rows: List[Dict[str, Any]] = []
+
+        config.history.start_run()
 
         # Set Time with AM/PM or 24h based on locale
         locale.setlocale(locale.LC_TIME,'')
@@ -3679,6 +3996,9 @@ def main() -> None:
 
         if config.log_file:
             log(f"Logging run to file: {config.log_file}")
+
+        if config.output_watch_as_json:
+            log(f"Logging watch list item prices to JSON file: {config.output_json_watch_file}")
 
         # Since timestamp is a datetime object, convert it to a string or update format_date to handle both
         log(f"Report generated {config.format_date(timestamp.strftime('%Y%m%d'))} {timestamp.strftime('%X')}")
@@ -3699,6 +4019,7 @@ def main() -> None:
                     account.apobj.notify(body=f"This is only a test for account {account.username}. Apprise is set up correctly",
                                           title='Cruise Price Notification Test', body_format=NotifyFormat.TEXT)
 
+            config.history.finish_run("apprise_test")
             sys.exit(0)   # quit() is a site-builtin, absent in frozen builds
 
         if config.minimum_saving_alert is not None:
@@ -3708,13 +4029,87 @@ def main() -> None:
         ship_dictionary = ShipRegistry()
         get_ship_dictionary_web(ship_dictionary)
 
+        # Accounts that could not be checked this run, paired with which
+        # phase failed (login or post-login profile fetch) - tracked so the
+        # end-of-run summary (and exit status) can't come out looking green
+        # when one account in a multi-account config silently never got
+        # checked, and so the persisted history row can still tell a stale
+        # password from a transient profile-API failure after the fact.
+        failed_accounts: List[Tuple[str, str]] = []
+
         for account_info in config.accounts:
             log(f"\nUsing {account_info.friendly_name} for user {account_info.username}")
             log(f"\t{account_info.friendly_name} loyalty number will be used for checking cabin prices")
 
-            # Login in to this account and get the profile information
-            account_info.access = login(account_info)
-            state_from_profile, loyalty_number, c_and_a_points = get_profile(account_info)
+            # Login in to this account and get the profile information.
+            #
+            # login() intentionally still raises SystemExit on failure (a stale
+            # password, a WAF block, etc.) - that contract is load-bearing for
+            # an out-of-tree caller that uses login() directly as a standalone
+            # credential probe. Left unguarded, though, that SystemExit would
+            # propagate straight out of this loop and take the whole
+            # multi-account run down over ONE bad account, silently skipping
+            # every account queued after it. So the caller - not login() -
+            # absorbs the failure: catch it (and any other unexpected
+            # Exception from either call) per account, report it loudly, and
+            # move on to the next account. SystemExit derives from
+            # BaseException rather than Exception, so it has to be named
+            # explicitly here; a bare `except Exception` would not catch it.
+            #
+            # login() and get_profile() are guarded together (an account that
+            # can't log in can't have its profile fetched either, so both
+            # failures are skip-and-continue the same way), but a phase flag
+            # tracks which of the two actually raised. A get_profile() error
+            # (e.g. a transient 500) on an account whose login SUCCEEDED is a
+            # different failure than a bad password, and must not be reported
+            # to the user as a login problem - that would send them chasing
+            # the wrong fix.
+            account_phase = "login"
+            try:
+                account_info.access = login(account_info)
+                account_phase = "profile"
+                state_from_profile, loyalty_number, c_and_a_points = get_profile(account_info)
+            except (SystemExit, Exception) as account_err:
+                failed_accounts.append((account_info.username, account_phase))
+                if account_phase == "login":
+                    skip_reason = "could not be logged in"
+                    notify_title = 'Cruise Price Account Login Failed'
+                else:
+                    skip_reason = "logged in, but its profile could not be fetched"
+                    notify_title = 'Cruise Price Account Profile Fetch Failed'
+                log(RED + f"\n[SKIPPED] {account_info.friendly_name} ({account_info.username}) {skip_reason} "
+                          f"this run (see the error above) - skipping this account and continuing "
+                          f"with the rest of the run." + RESET)
+
+                # Route the failure through the same per-account/global
+                # notifier resolution used everywhere else in this script, so
+                # a bad password reaches the user the same way a price alert
+                # would - not a bespoke notification path. Gated the same way
+                # as the module-level fatal-error notifier below: honor the
+                # notifyOnError opt-out, and only fire when the resolved
+                # notifier actually has URLs registered.
+                account_notifier = notifier_for(account_info)
+                if config.notify_on_error and account_notifier is not None and len(account_notifier) > 0:
+                    # login()'s SystemExit carries nothing but a bare exit
+                    # status (e.g. SystemExit(1), whose str() is just "1") -
+                    # the real diagnosis (a stale password, a WAF block,
+                    # etc.) was already logged by login() itself and a bare
+                    # "1" would only be noise to a user who, by definition,
+                    # is being notified because they won't read the log. A
+                    # plain Exception (e.g. from get_profile()) DOES carry a
+                    # useful message, so that case is still included.
+                    if isinstance(account_err, SystemExit) and not isinstance(account_err.code, str):
+                        detail = "See the run log for the exact reason."
+                    else:
+                        detail = str(account_err)
+                    account_notifier.notify(
+                        body=f"Account {account_info.username} ({account_info.friendly_name}) {skip_reason} "
+                             f"this run and was skipped. {detail}",
+                        title=notify_title,
+                        body_format=NotifyFormat.TEXT,
+                    )
+                continue
+
             if account_info.state is None:
                 account_info.state = state_from_profile
 
@@ -3742,7 +4137,13 @@ def main() -> None:
 
             # Gather the information on all voyages under the current account
             try:
-                get_voyages(account_info, discounts, ship_dictionary)
+                get_voyages(
+                   account_info,
+                   discounts,
+                   ship_dictionary,
+                   payment_tracker=payment_tracker,
+                   collected_watch_rows=collected_watch_rows,
+                 )
             finally:
                 # Close the account session even when a booking raises, so
                 # sessions don't leak across the remaining accounts
@@ -3792,15 +4193,43 @@ def main() -> None:
             anon_session.close()
 
         # Summary table of upcoming check-in and final-payment dates for booked sailings
-        print_checkin_payment_table()
+        payment_tracker.print_table()
 
         # Write the watchlist price results to JSON for external consumption
         if config.output_watch_as_json:
-            write_watch_price_json(config.output_json_watch_file)
+            write_watch_price_json(collected_watch_rows, config.output_json_watch_file)
+
+        if failed_accounts:
+            # At least one account never got checked this run. A quiet exit
+            # 0 here would look identical to a fully-successful run to any
+            # scheduler/log-scraper watching this process, hiding exactly the
+            # kind of silent partial loss this guard exists to prevent - so
+            # both the history row and the process exit code say otherwise.
+            failed_usernames = [username for username, _phase in failed_accounts]
+            log(RED + f"\n{len(failed_accounts)} of {len(config.accounts)} account(s) could not be checked this "
+                      f"run and were SKIPPED: {', '.join(failed_usernames)}. Prices for those accounts were NOT "
+                      f"checked. See the [SKIPPED] line(s) above for whether each was a login or profile-fetch "
+                      f"failure." + RESET)
+            # Name each account's failure phase (login vs profile) in the
+            # persisted summary too, not just the console [SKIPPED] lines -
+            # a later reader of the history DB only has this string, and
+            # without the phase they can't tell a stale password from a
+            # transient profile-API failure.
+            failure_detail = ", ".join(f"{username} ({phase})" for username, phase in failed_accounts)
+            config.history.finish_run(
+                "partial_failure",
+                f"{len(failed_accounts)} of {len(config.accounts)} account(s) could not be checked: "
+                f"{failure_detail}",
+            )
+            # Distinct from the fatal exit 1 below - see EXIT_PARTIAL_FAILURE.
+            sys.exit(EXIT_PARTIAL_FAILURE)
+
+        config.history.finish_run("ok")
 
     except Exception as e:
-        # Let the global catch-all at the module entry point handle unexpected execution faults
-        raise e
+        # Mark the price-history run as failed before the module-level handler reports it
+        config.history.finish_run("error", f"{type(e).__name__}: {e}")
+        raise
 
 
 if __name__ == "__main__":

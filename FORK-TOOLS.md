@@ -188,4 +188,4 @@ python CheckRoyalCaribbeanGui.py
 runs them via the exe's internal `--run-script` dispatch). Because the scripts are bundled at
 build time, the exe keeps running its built-in copies until you rebuild it - run the `.py`
 directly if you want script changes picked up immediately. Unit tests for its helpers
-live in `test_gui_helpers.py`.
+live in `unittests/test_gui_helpers.py`.

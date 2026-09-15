@@ -1,21 +1,17 @@
-# ==============================================================================
-# TODO (Maintainer Note):
-# To enable automated pytest & coverage checks on pushes/PRs to main:
-#   1. Move/rename this file to: .github/workflows/pytest.yml
-#   2. Commit and push to your main branch.
-# ==============================================================================
-
 name: Run Unit Tests
 
 on:
   # 1. Automatically run on pushes to main
   push:
     branches: [ "main" ]
-
+    paths-ignore:
+      - '**/**.md' # Optional: Ignores READMEs in subdirectories
   # 2. Automatically run on incoming Pull Requests targeting main
   pull_request:
     branches: [ "main" ]
-
+    paths-ignore:
+      - '**/**.md' # Optional: Ignores READMEs in subdirectories
+      
   # 3. Allow manual execution on ANY branch via GitHub UI
   workflow_dispatch:
 
@@ -40,5 +36,7 @@ jobs:
           pip install pytest pytest-cov requests
 
       - name: Execute Pytest Suite
+        env:
+          PYTHONPATH: .
         run: |
-          python -m pytest test_price_browser.py test_price_checker.py test_alert_matrix.py test_per_account_notify.py -vs --cov=CheckRoyalCaribbeanPrice --cov=BrowseRoyalCaribbeanPrice --cov-report=term-missing
+          python -m pytest unittests/ -vs --cov=CheckRoyalCaribbeanPrice --cov=BrowseRoyalCaribbeanPrice --cov-report=term-missing

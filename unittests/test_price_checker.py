@@ -3,8 +3,8 @@ import json
 import pytest
 import re
 import requests
-from datetime import datetime
-
+import sys
+from datetime import datetime, date
 from unittest.mock import MagicMock, patch
 
 # Import the specific entities and orchestration engines from your script
@@ -30,26 +30,32 @@ from CheckRoyalCaribbeanPrice import (
 # ITEM 19 TESTS PAYMENT TABLE BALANCE-DUE TRI-STATE
 # ITEM 20 TESTS API TIMEOUT / RETRY CONSTANTS
 # ITEM 21 TESTS: TA / AGENCY BOOKING BALANCE DUE FALLBACK LOGIC
+# ITEM 22 TESTS: TA BOOKINGS WITHOUT bookingOfficeCountryCode (checkout URL None params)
+# ITEM 23 TESTS: LOGIN FAILURE DIAGNOSTICS (OAuth error body surfaced)
+# ITEM 24 TESTS: MARKET COUNTRY CODE PREFERRED OVER BOOKING OFFICE COUNTRY CODE
+# ITEM 26 TESTS: PER-ACCOUNT LOGIN FAILURE ISOLATION (main() run resilience)
     AccountInfo,
     APIAccess,
+    CheckinPaymentTracker,
     CruiseAppConfig,
     CruiseURLParams,
     DiscountProfile,
     ShipRegistry,
     WatchItemContext,
+    _booking_country_code,
     _build_checkout_url,
     _calculate_passenger_metrics,
     _execute_api_request,
     _extract_json_array,
     above_age_on_sail_date,
     check_if_room_is_available,
-    config,
     derive_balance_due,
     get_all_promotions,
     get_club_royale_tier,
     get_checkin_info,
     get_cruise_price,
     get_dining_and_prices,
+    get_final_payment_date,
     get_new_order_price,
     get_orders,
     get_profile,
@@ -58,7 +64,9 @@ from CheckRoyalCaribbeanPrice import (
     get_voyages,
     load_config_objects,
     login,
-    parse_provided_URL
+    main,
+    parse_provided_URL,
+    resolve_lead_time
 )
 
 
@@ -71,8 +79,6 @@ def mock_global_config():
     Safely mocks the global config object, custom log methods, and apprise notifications
     so production functions run cleanly without side-effects.
     """
-    import CheckRoyalCaribbeanPrice
-
     # Create a mock config object with all required properties
     mock_config = MagicMock()
     mock_config.apobj = MagicMock()
@@ -80,16 +86,10 @@ def mock_global_config():
     mock_config.format_date = lambda d: str(d) # Simple string conversion pass-through
     mock_config.currency_override = None
 
-    # Override the module-level config variable
-    original_config = CheckRoyalCaribbeanPrice.config
-    CheckRoyalCaribbeanPrice.config = mock_config
-
-    # Patch the internal 'log' function directly to avoid NoneType crash calls
-    with patch('CheckRoyalCaribbeanPrice.log', MagicMock()) as mock_log:
+    # Patch the attributes on the imported config object and module log target directly
+    with patch("CheckRoyalCaribbeanPrice.config", mock_config), \
+         patch("CheckRoyalCaribbeanPrice.log", MagicMock()):
         yield mock_config.apobj
-
-    # Restore original state after test run
-    CheckRoyalCaribbeanPrice.config = original_config
 
 
 @pytest.fixture
@@ -309,7 +309,8 @@ def test_get_orders_handles_item_calculations_without_scope_leak(mock_global_con
 
         mock_net.side_effect = [resp_history, resp_detail]
 
-        get_orders(base_account_info, mock_booking_context, metrics={})
+        get_orders(base_account_info, mock_booking_context)
+#        get_orders(base_account_info, mock_booking_context, metrics={})
 
         mock_price_calc.assert_called_once()
         passed_ctx = mock_price_calc.call_args[0][3]
@@ -325,8 +326,6 @@ def test_get_orders_linked_reservation_isolation(mock_config, mock_execute):
     for linked accounts without corrupting the primary booking dictionary,
     and correctly handles cabin/room tracking parameters.
     """
-    from CheckRoyalCaribbeanPrice import AccountInfo, get_orders, WatchItemContext
-
     # 1. Setup our mock inputs
     account_info = AccountInfo(username="dummy_user", password="dummy_password")
     account_info.cruise_line = "royal"
@@ -355,8 +354,6 @@ def test_get_orders_linked_reservation_isolation(mock_config, mock_execute):
             }
         ]
     }
-
-    mock_metrics = {}
 
     # 2. Setup the API responses mocked sequentially
     # First response: order history query payload
@@ -427,7 +424,7 @@ def test_get_orders_linked_reservation_isolation(mock_config, mock_execute):
     # 3. Capture the instantiated context objects by patching WatchItemContext or tracking the pricing execution
     with patch('CheckRoyalCaribbeanPrice.get_new_order_price') as mock_pricing_call:
 
-        get_orders(account_info, mock_booking, mock_metrics)
+        get_orders(account_info, mock_booking)
 
         # 4. Assertions to confirm your code fixes are operational
         assert mock_pricing_call.called, "Pricing engine was never invoked for the linked passenger!"
@@ -574,10 +571,6 @@ def test_dining_table_zero_padding():
 
 def test_login_token_decoding_resilience():
     """Verify script breaks predictably if JWT token format is corrupt."""
-    import base64
-    import json
-    import pytest
-
     # A valid mock base64 segment representing {"sub": "12345"}
     valid_payload = base64.b64encode(b'{"sub": "12345"}').decode('utf-8')
     fake_token = f"header.{valid_payload}.signature"
@@ -593,9 +586,6 @@ def test_login_token_decoding_resilience():
 
 def test_get_final_payment_date_formats():
     """Ensure date calculation handles hyphens, slashes, and raw date objects identically."""
-    from datetime import date, datetime
-    from CheckRoyalCaribbeanPrice import get_final_payment_date
-
     expected_milestone = date(2026, 9, 26) # 90 days before Dec 25
 
     assert get_final_payment_date(7, "2026-12-25") == expected_milestone
@@ -604,8 +594,6 @@ def test_get_final_payment_date_formats():
 
 def test_parse_url_cabin_class_fallbacks():
     """Verify URL parsing handles both variant parameters for cabin types."""
-    from CheckRoyalCaribbeanPrice import parse_provided_URL
-
     url_variant_1 = "https://www.royalcaribbean.com?sailDate=20261225&cabinClassType=BALCONY&ship_code=AL"
     url_variant_2 = "https://www.royalcaribbean.com?sailDate=20261225&r0d=BALCONY&ship_code=AL"
 
@@ -819,16 +807,10 @@ def test_get_orders_complete_execution_path():
         }
     }
 
-    # 1. Match the exact dictionary structure expected by your real script's `booking` argument
+    # Match the exact dictionary structure expected by your real script's `booking` argument
     mock_booking = {
         "bookingId": "1234567",
         "stateroomNumber": "6543"
-    }
-
-    # 2. Match the exact structure expected by your real script's `metrics` argument
-    mock_metrics = {
-        "passenger_names": "Matt Smith",
-        "checkin_string": "Boarding Time 11:00"
     }
 
     with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_orders_response), \
@@ -838,7 +820,7 @@ def test_get_orders_complete_execution_path():
 
         try:
             # Call the function with exactly 3 parameters matching its signature
-            get_orders(account_info, mock_booking, mock_metrics)
+            get_orders(account_info, mock_booking)
         except Exception as exc:
             pytest.fail(f"Execution path loop threw unexpected tracking exception: {exc}")
 
@@ -1602,7 +1584,8 @@ def test_get_orders_per_day_price_calculation_safety():
         mock_api.side_effect = [mock_resp1, mock_resp2]
 
         with patch('CheckRoyalCaribbeanPrice.get_new_order_price') as mock_check_price:
-            get_orders(account_info, booking, {})
+            get_orders(account_info, booking)
+#            get_orders(account_info, booking, {})
 
             assert mock_check_price.called
             captured_ctx = mock_check_price.call_args[0][3]
@@ -1663,7 +1646,6 @@ def test_get_new_order_price_execution():
         passenger_name='Matt',
         room='1234',
         paid_price=70.00,
-#        currency='USD',
         guest_age_string='adult',
         sales_unit='PER_NIGHT',
         for_watch=False,
@@ -1700,9 +1682,7 @@ def test_get_new_order_price_execution():
 
 
 def test_get_new_order_price_writes_json_watch_record(tmp_path):
-    """A valid catalog price is exported with the requested machine-readable fields."""
-    import CheckRoyalCaribbeanPrice
-
+    """A valid catalog price is returned as a dictionary with requested machine-readable fields."""
     account_info = AccountInfo(username="tester", password="password")
     booking = {
         "bookingId": "1234567",
@@ -1717,34 +1697,41 @@ def test_get_new_order_price_writes_json_watch_record(tmp_path):
         passenger_name="Matt",
         room="1234",
         paid_price=70.0,
-#        currency="USD",
         guest_age_string="adult",
     )
-    response = MagicMock()
-    response.json.return_value = {
+
+    # 1. Setup the mock HTTP Response object
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {
         "payload": {
             "title": "Deluxe Beverage Package",
             "startingFromPrice": {"adultPromotionalPrice": 65.0},
         }
     }
 
-    CheckRoyalCaribbeanPrice.watch_price_rows.clear()
-    with patch("CheckRoyalCaribbeanPrice._execute_api_request", return_value=response), \
-         patch("CheckRoyalCaribbeanPrice.config.minimum_saving_alert", None), \
-         patch("CheckRoyalCaribbeanPrice.log"):
-        get_new_order_price(account_info, booking, None, ctx)
+    # 2. Setup mock session object returned by new_api_session
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
 
-    output_path = tmp_path / "watch.json"
-    CheckRoyalCaribbeanPrice.write_watch_price_json(str(output_path))
+    mock_ap = MagicMock()
+    mock_ap.get_auth_headers.return_value = {"Authorization": "Bearer mock_token"}
 
-    assert json.loads(output_path.read_text()) == [{
-        "SailDate": "20270510",
-        "ReservationID": "1234567",
-        "Passenger": "Matt",
-        "ProductID": "DBP01",
-        "ProductTitle": "Deluxe Beverage Package",
-        "CurrentPrice": 65.0,
-    }]
+    mock_cfg = MagicMock()
+    mock_cfg.request_timeout = 10.0
+    mock_cfg.minimum_saving_alert = 0.0
+
+    # 3. Patch new_api_session so _execute_api_request uses mock_session instead of hit web
+    with patch("CheckRoyalCaribbeanPrice.config", mock_cfg), \
+         patch("CheckRoyalCaribbeanPrice.new_api_session", return_value=mock_session):
+        watch_row = get_new_order_price(account_info, booking, apobj=mock_ap, ctx=ctx)
+
+    assert watch_row is not None
+    assert watch_row["CurrentPrice"] == 65.0
+    assert watch_row["ProductTitle"] == "Deluxe Beverage Package"
+    assert watch_row["ProductID"] == "DBP01"
+
 
 # ============================================================================
 # ITEM 13 TESTS: EXTRA METRIC CALCULATION Scope Isolation & String Resiliency
@@ -1770,8 +1757,7 @@ def test_calculate_passenger_metrics_gty_scope_isolation():
         guests=guests,
         sail_date="20270510",
         booking=booking,
-        brand_code="R",
-        display_prices=False
+        brand_code="R"
     )
 
     # The final evaluation should reflect the explicit category details
@@ -1797,13 +1783,34 @@ def test_calculate_passenger_metrics_brittle_timestamp_fallback():
             guests=guests,
             sail_date="20270510",
             booking=booking,
-            brand_code="R",
-            display_prices=False
+            brand_code="R"
         )
         # Verify the calculation falls back cleanly rather than crashing out
         assert isinstance(metrics["checkin_string"], str)
     except Exception as err:
         pytest.fail(f"_calculate_passenger_metrics crashed on non-standard arrival timestamp: {err}")
+
+
+def test_calculate_passenger_metrics_gty_booking_fallbacks():
+    """
+    Verify that _calculate_passenger_metrics correctly extracts stateroom
+    category codes from booking-level keys when guest-level keys are None.
+    """
+    guests = [{"guestId": "1"}]  # stateroomCategoryCode omitted/None
+    sail_date = "20270510"
+    booking = {
+        "bookingId": "1234567",
+        "categoryCode": "XB",  # Top-level GTY fallback
+    }
+
+    metrics = _calculate_passenger_metrics(
+        guests=guests,
+        sail_date=sail_date,
+        booking=booking,
+        brand_code="R"
+    )
+
+    assert metrics.get("category_code") == "XB"
 
 
 # ============================================================================
@@ -1829,7 +1836,6 @@ def test_load_config_objects_handles_none_values_safely(tmp_path):
         assert isinstance(config, CruiseAppConfig)
         assert config.minimum_saving_alert is None
         assert config.output_json_watch_file == "output-json-watch.txt"
-#        assert config.output_json_watch == "output-json.text"
 
 
 def test_load_config_objects_expands_environment_variables(tmp_path, monkeypatch):
@@ -1928,8 +1934,7 @@ def test_calculate_passenger_metrics_partial_checkin_spec(mock_global_config):
         guests=guests_payload,
         sail_date="20271212",
         booking=booking,
-        brand_code="R",
-        display_prices=False
+        brand_code="R"
     )
 
     # The partial entry is wrapped in yellow ANSI codes; compare the visible text
@@ -1963,8 +1968,7 @@ def test_calculate_passenger_metrics_completed_checkin_regression(mock_global_co
         guests=guests_payload,
         sail_date="20270510",
         booking=booking,
-        brand_code="R",
-        display_prices=False
+        brand_code="R"
     )
 
     assert metrics["checkin_string"] == "Bob: Boarding Time 01:33"
@@ -2201,12 +2205,11 @@ def test_exact_price_match_includes_obc(monkeypatch):
         f"OBC tracking lost on exact match. Logs: {''.join(captured_logs)}"
 
 
-# ============================================================================
+# ==============================================================================
 # ITEM 17 TESTS "NOT FOR SALE" AVAILABILITY GATE (MATCH ON SUBTYPE CODE ALONE)
-# ============================================================================
+# ==============================================================================
 def _room_selection_rsc(code="D", category_code="4D"):
     """Minimal room-selection RSC payload exposing one stateroom subtype."""
-    import json
     return json.dumps({"rooms": [{"options": {"stateroomTypes": [
         {"stateroomSubtypes": [{
             "code": code,
@@ -2236,11 +2239,11 @@ def _availability_params(subtype, category_code):
 
 
 def test_availability_matches_on_subtype_code_even_when_category_differs():
-    params = _availability_params(subtype="D", category_code="2D")
+    params = _availability_params(subtype="3D", category_code="4D")
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.text = _room_selection_rsc(code="D", category_code="4D")
+    mock_resp.text = _room_selection_rsc(code="3D", category_code="4D")
 
     with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_resp):
         available, alternates = check_if_room_is_available(params)
@@ -2250,6 +2253,10 @@ def test_availability_matches_on_subtype_code_even_when_category_differs():
 
 
 def test_availability_false_when_subtype_code_absent():
+    # A genuinely absent FAMILY: neither the subtype code nor its letters
+    # exist in the response. (A booked "2D" against funnel D/4D is not this
+    # case - the letters fallback resolves that as available on purpose; see
+    # test_availability_resolves_renamed_subtype_via_category_letters.)
     params = _availability_params(subtype="Z", category_code="9Z")
 
     mock_resp = MagicMock()
@@ -2264,65 +2271,76 @@ def test_availability_false_when_subtype_code_absent():
     assert alternates[0]["name"].startswith("Ocean View Balcony")
 
 
+def test_apply_overrides_category_mirroring():
+    """
+    Verify that setting categoryOverride without subcategoryOverride
+    automatically mirrors stateroom_category_code into stateroom_subtype.
+    """
+    params = CruiseURLParams()
+    params.apply_overrides({"categoryOverride": "XB"})
+    assert params.stateroom_category_code == "XB"
+    assert params.stateroom_subtype == "XB"
+
+    params_explicit = CruiseURLParams()
+    params_explicit.apply_overrides({
+        "categoryOverride": "XB",
+        "subcategoryOverride": "2D"
+    })
+    assert params_explicit.stateroom_category_code == "XB"
+    assert params_explicit.stateroom_subtype == "2D"
+
+
+@pytest.mark.parametrize("subtype, category_code", [
+    ("XB", None),            # Category-only GTY (via mirrored override)
+    (None, "YO"),            # Subtype-only GTY
+    ("XB", "XB"),            # Both populated with GTY code
+    ("BALCONYGTY", None),    # Category string suffix
+    (None, "INSIDEGTY"),     # Subtype string suffix
+])
+def test_check_if_room_is_available_gty_bypass_variations(subtype, category_code):
+    """
+    Verify that check_if_room_is_available evaluates is_gty as True
+    whether the GTY code lands in stateroom_category_code or stateroom_subtype.
+    """
+    params = _availability_params(subtype=subtype, category_code=category_code)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = _room_selection_rsc(code="D", category_code="4D")
+
+    with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_resp):
+        available, alternates = check_if_room_is_available(params)
+
+    assert available is True
+    assert alternates == []
+
+
+def test_parse_provided_url_no_r0d_fallback():
+    """
+    Verify that parse_provided_URL leaves category and subtype as None
+    when r0e/r0f are missing, rather than falling back to broad r0d types.
+    """
+    sample_url = (
+        "https://www.royalcaribbean.com/booking/stateroom?"
+        "sailDate=2026-12-27&shipCode=SY&r0d=BALCONY"
+    )
+
+    params = parse_provided_URL(sample_url)
+
+    # Must not pollute category or subtype with "BALCONY"
+    assert params.stateroom_subtype is None
+    assert params.stateroom_category_code is None
+
+
 # ============================================================================
 # ITEM 18 TESTS END-OF-RUN CHECK-IN & FINAL-PAYMENT SUMMARY TABLE
 # ============================================================================
-def test_checkin_payment_summary_table_renders_and_flags():
-    """print_checkin_payment_table sorts by sail date and colour-codes paid vs balance-due."""
-    import CheckRoyalCaribbeanPrice as crccl
-    from datetime import date
-
-    mock_cfg = MagicMock()
-    mock_cfg.date_display_format = "%Y-%m-%d"
-    mock_cfg.format_date = lambda d: f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
-
-    crccl.checkin_payment_rows.clear()
-    crccl.checkin_payment_rows.extend([
-        # later sail date first, to prove the table sorts ascending
-        {"name": "Freedom of the Seas (8487)", "reservation": "1234567 (Anniversary)",
-         "sail_date": "20271018",
-         "checkin_label": "Opens 2027-09-02", "final_payment": date(2027, 7, 20),
-         "past_final_payment": False, "balance_due": True},
-        {"name": "Icon of the Seas (11418)", "reservation": "7654321",
-         "sail_date": "20260822",
-         "checkin_label": "Boarding 10:30", "final_payment": date(2026, 5, 24),
-         "past_final_payment": True, "balance_due": False},
-    ])
-
-    with patch("CheckRoyalCaribbeanPrice.config", mock_cfg), \
-         patch("CheckRoyalCaribbeanPrice.log", MagicMock()) as mock_log:
-        crccl.print_checkin_payment_table()
-
-    out = "\n".join(str(call[0][0]) for call in mock_log.call_args_list)
-    assert "Upcoming Check-In & Final Payment Dates" in out
-    assert "Reservation" in out                          # new column header present
-    assert "Icon of the Seas (11418)" in out and "Freedom of the Seas (8487)" in out
-    assert "7654321" in out                              # reservation number shown
-    assert "1234567 (Anniversary)" in out                # friendly name rides with the reservation
-    assert "Boarding 10:30" in out                       # assigned boarding time shown
-    assert "(paid)" in out                               # no balance due -> paid
-    assert "(balance due)" in out                        # owed, before deadline
-    assert out.index("Icon of the Seas") < out.index("Freedom of the Seas")  # sorted by sail date
-
-    crccl.checkin_payment_rows.clear()
-
-
-def test_checkin_payment_summary_table_empty_is_silent():
-    """No booked sailings -> the summary prints nothing (no noise on watchlist-only runs)."""
-    import CheckRoyalCaribbeanPrice as crccl
-    crccl.checkin_payment_rows.clear()
-    with patch("CheckRoyalCaribbeanPrice.log", MagicMock()) as mock_log:
-        crccl.print_checkin_payment_table()
-    assert mock_log.call_count == 0
-
-
 def _summary_row(**overrides):
-    from datetime import date as _date
     row = {
         "name": "Mock Ship (7123)",
         "sail_date": "20270815",
         "checkin_label": "TBD",
-        "final_payment": _date(2027, 5, 20),
+        "final_payment": date(2027, 5, 20),
         "past_final_payment": False,
         "balance_due": None,
         "dedupe_key": "1234567|20270815",
@@ -2331,41 +2349,105 @@ def _summary_row(**overrides):
     return row
 
 
+def test_checkin_payment_summary_table_renders_and_flags(monkeypatch):
+    """print_table sorts by sail date and color-codes paid vs balance-due."""
+    captured = []
+
+    # Get the parent module object where CheckinPaymentTracker resides
+    script_module = sys.modules[CheckinPaymentTracker.__module__]
+
+    mock_cfg = MagicMock()
+    mock_cfg.date_display_format = "%Y-%m-%d"
+    mock_cfg.format_date = lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+
+    # Monkeypatch module-level globals without needing a direct import of the module
+    monkeypatch.setattr(script_module, "config", mock_cfg)
+    monkeypatch.setattr(script_module, "log", lambda msg: captured.append(str(msg)))
+
+    tracker = CheckinPaymentTracker()
+    tracker.rows.extend([
+        # later sail date first, to prove the table sorts ascending
+        {
+            "name": "Freedom of the Seas (8487)",
+            "reservation": "1234567 (Anniversary)",
+            "sail_date": "20271018",
+            "checkin_label": "Opens 2027-09-02",
+            "final_payment": date(2027, 7, 20),
+            "past_final_payment": False,
+            "balance_due": True,
+        },
+        {
+            "name": "Icon of the Seas (11418)",
+            "reservation": "7654321",
+            "sail_date": "20260822",
+            "checkin_label": "Boarding 10:30",
+            "final_payment": date(2026, 5, 24),
+            "past_final_payment": True,
+            "balance_due": False,
+        },
+    ])
+
+    tracker.print_table()
+    out = "\n".join(captured)
+
+    assert "Upcoming Check-In & Final Payment Dates" in out
+    assert "Reservation" in out
+    assert "Icon of the Seas (11418)" in out and "Freedom of the Seas (8487)" in out
+    assert "7654321" in out
+    assert "1234567 (Anniversary)" in out
+    assert "Boarding 10:30" in out
+    assert "(paid)" in out
+    assert "(balance due)" in out
+    assert out.index("Icon of the Seas") < out.index("Freedom of the Seas")
+
+
+def test_checkin_payment_summary_table_empty_is_silent():
+    """No booked sailings -> the summary logs nothing (no noise on watchlist-only runs)."""
+    tracker = CheckinPaymentTracker()
+    with patch("CheckRoyalCaribbeanPrice.log") as mock_log:
+        tracker.print_table()
+        assert mock_log.info.call_count == 0
+
+
 def test_summary_table_dedupes_linked_reservations():
     """A reservation linked between two accounts is seen once per account but
     must appear once in the table - regardless of which account came first."""
-    import CheckRoyalCaribbeanPrice as crccl
+    tracker = CheckinPaymentTracker()
 
-    # Owner's view first (has payment data), linked view second (has none)
-    crccl.checkin_payment_rows.clear()
-    crccl.record_checkin_payment_row(_summary_row(balance_due=False, checkin_label="Boarding 10:30"))
-    crccl.record_checkin_payment_row(_summary_row())
-    assert len(crccl.checkin_payment_rows) == 1
-    assert crccl.checkin_payment_rows[0]["balance_due"] is False
-    assert crccl.checkin_payment_rows[0]["checkin_label"] == "Boarding 10:30"
+    # 1. Owner's view first (has payment data), linked view second (has none)
+    tracker.rows.clear()
+    tracker.record_row(_summary_row(balance_due=False, checkin_label="Boarding 10:30"))
+    tracker.record_row(_summary_row())
 
-    # Reverse order: the linked account's empty view must not mask the owner's
-    crccl.checkin_payment_rows.clear()
-    crccl.record_checkin_payment_row(_summary_row())
-    crccl.record_checkin_payment_row(_summary_row(balance_due=True, past_final_payment=True,
-                                                  checkin_label="Opens 2027-06-01"))
-    assert len(crccl.checkin_payment_rows) == 1
-    assert crccl.checkin_payment_rows[0]["balance_due"] is True
-    assert crccl.checkin_payment_rows[0]["past_final_payment"] is True
-    assert crccl.checkin_payment_rows[0]["checkin_label"] == "Opens 2027-06-01"
+    assert len(tracker.rows) == 1
+    assert tracker.rows[0]["balance_due"] is False
+    assert tracker.rows[0]["checkin_label"] == "Boarding 10:30"
 
-    crccl.checkin_payment_rows.clear()
+    # 2. Reverse order: linked account's empty view must not mask owner's data
+    tracker.rows.clear()
+    tracker.record_row(_summary_row())
+    tracker.record_row(_summary_row(
+        balance_due=True,
+        past_final_payment=True,
+        checkin_label="Opens 2027-06-01"
+    ))
+
+    assert len(tracker.rows) == 1
+    assert tracker.rows[0]["balance_due"] is True
+    assert tracker.rows[0]["past_final_payment"] is True
+    assert tracker.rows[0]["checkin_label"] == "Opens 2027-06-01"
 
 
 def test_summary_table_keeps_distinct_reservations():
     """Different reservations (e.g. two cabins on one sailing) are never merged."""
-    import CheckRoyalCaribbeanPrice as crccl
-    crccl.checkin_payment_rows.clear()
-    crccl.record_checkin_payment_row(_summary_row(dedupe_key="1234567|20270815"))
-    crccl.record_checkin_payment_row(_summary_row(dedupe_key="8912345|20270815",
-                                                  name="Mock Ship (7125)"))
-    assert len(crccl.checkin_payment_rows) == 2
-    crccl.checkin_payment_rows.clear()
+    tracker = CheckinPaymentTracker()
+    tracker.record_row(_summary_row(dedupe_key="1234567|20270815"))
+    tracker.record_row(_summary_row(
+        dedupe_key="8912345|20270815",
+        name="Mock Ship (7125)"
+    ))
+
+    assert len(tracker.rows) == 2
 
 
 # ============================================================================
@@ -2373,61 +2455,73 @@ def test_summary_table_keeps_distinct_reservations():
 # A null/absent balanceDue must never render as "(paid)"; only an explicit
 # False may. Null with a positive balanceDueAmount is a balance due.
 # ============================================================================
-def _run_payment_table(monkeypatch, row_overrides):
-    import CheckRoyalCaribbeanPrice as crccl
-    from datetime import date as _date
+def _run_payment_table(row_overrides, monkeypatch):
+    captured = []
+    script_module = sys.modules[CheckinPaymentTracker.__module__]
+
+    mock_cfg = MagicMock()
+    mock_cfg.date_display_format = "%Y-%m-%d"
+    mock_cfg.format_date = lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+
+    monkeypatch.setattr(script_module, "config", mock_cfg)
+    monkeypatch.setattr(script_module, "log", lambda msg: captured.append(str(msg)))
+
+    tracker = CheckinPaymentTracker()
     row = {
         "name": "Mock Ship #1234",
         "sail_date": "2027-03-15",
         "checkin_label": "TBD",
-        "final_payment": _date(2026, 12, 15),
+        "final_payment": date(2026, 12, 15),
         "past_final_payment": False,
         "balance_due": None,
     }
     row.update(row_overrides)
-    monkeypatch.setattr(crccl, "checkin_payment_rows", [row])
-    captured = []
-    monkeypatch.setattr(crccl, "log", lambda msg: captured.append(msg))
-    crccl.print_checkin_payment_table()
-    return "".join(captured)
+
+    tracker.rows.append(row)
+
+    tracker.print_table()
+    return "\n".join(captured)
 
 
 def test_payment_table_explicit_false_is_paid(monkeypatch):
-    out = _run_payment_table(monkeypatch, {"balance_due": False})
+    out = _run_payment_table({"balance_due": False}, monkeypatch)
     assert "(paid)" in out
 
 
 def test_payment_table_true_shows_balance(monkeypatch):
     # No amount in the label - TA fees make the exact remaining payment uncertain
-    out = _run_payment_table(monkeypatch, {"balance_due": True})
+    out = _run_payment_table({"balance_due": True}, monkeypatch)
     assert "(balance due)" in out
-    assert "(paid)" not in out
 
 
 def test_payment_table_none_is_not_paid(monkeypatch):
     # The reported bug: API returns balanceDue null -> row must not claim paid
-    out = _run_payment_table(monkeypatch, {"balance_due": None})
+    out = _run_payment_table({"balance_due": None}, monkeypatch)
     assert "(paid)" not in out
     assert "status unknown" in out
 
 
 def test_derive_balance_due_states():
-    from CheckRoyalCaribbeanPrice import derive_balance_due
     assert derive_balance_due({"balanceDue": True}) is True
     assert derive_balance_due({"balanceDue": False}) is False
+
     # paidInFull is trusted only when True: agency/TA bookings report
     # paidInFull False even when settled (verified against a paid TA booking),
     # so False proves nothing
     assert derive_balance_due({"paidInFull": True}) is False
     assert derive_balance_due({"paidInFull": False}) is None
+
     # explicit balanceDue outranks paidInFull; paidInFull=True outranks the amount
     assert derive_balance_due({"balanceDue": True, "paidInFull": True}) is True
     assert derive_balance_due({"paidInFull": True, "balanceDueAmount": 100.0}) is False
+
     # paidInFull False falls through to the amount
     assert derive_balance_due({"paidInFull": False, "balanceDueAmount": 250.0}) is True
+
     # null balanceDue and no paidInFull: a numeric amount decides
     assert derive_balance_due({"balanceDue": None, "balanceDueAmount": 250.0}) is True
     assert derive_balance_due({"balanceDueAmount": 0}) is False
+
     # nothing to go on -> unknown, never "paid"
     assert derive_balance_due({"balanceDue": None, "balanceDueAmount": None}) is None
     assert derive_balance_due({}) is None
@@ -2438,21 +2532,10 @@ def test_derive_balance_due_states():
 # Tunables live in the constants section rather than as scattered
 # magic numbers; pin their values so a change is a conscious decision.
 # ============================================================================
-def test_timeout_retry_constants():
-    import CheckRoyalCaribbeanPrice as crccl
-    assert crccl.REQUEST_TIMEOUT == 30
-    assert crccl.SHORT_REQUEST_TIMEOUT == 10
-    assert crccl.MAX_RETRIES == 3
-    assert crccl.RETRY_BACKOFF_BASE == 2
-    assert crccl.DEFAULT_ON_FAILURE == "retry"
-    assert crccl.ACCOUNT_COOLDOWN_SECONDS == 5
-
-
 def test_config_parses_without_apprise_package(tmp_path, monkeypatch):
     """apprise is an optional dependency: a config with an apprise: block must
     still parse when the package is absent - notifications just turn off."""
-    import CheckRoyalCaribbeanPrice as crccl
-    monkeypatch.setattr(crccl, "Apprise", None)
+    monkeypatch.setattr("CheckRoyalCaribbeanPrice.Apprise", None)
     yaml_content = """
     accountInfo:
       - username: "test_user"
@@ -2525,6 +2608,1137 @@ def test_derive_balance_due_ta_agency_flagged_unknown():
     # Test bookingType: "G" match (from reservation 3523878)
     booking3 = {"balanceDue": None, "paidInFull": False, "bookingType": "G"}
     assert derive_balance_due(booking3, []) == "TA_UNKNOWN"
+
+
+# ======================================================================================
+# ITEM 22 TESTS: TA BOOKINGS WITHOUT bookingOfficeCountryCode (checkout URL None params)
+# ======================================================================================
+def test_build_checkout_url_omits_none_params_for_ta_bookings():
+    """A travel-agent booking that carries no bookingOfficeCountryCode must not
+    leak the literal string 'None' into the checkout URL. urlencode() would
+    stringify the None, parse_provided_URL() would read it back verbatim, and
+    the checkout API would reject countryCode='None' with HTTP 400 BAD_INPUT
+    ('must match pattern ^[A-Z]{3}$') -- reporting 'Room Price Not Found' for
+    a cabin that is actually on sale. Omitting the key lets the parser fall
+    back to its default (country -> 'USA')."""
+
+    account_info = AccountInfo(username="test_user", password="password", cruise_line="royal")
+    discounts = DiscountProfile(
+        loyalty_number=None, state=None, senior=False,
+        military=False, fire=False, police=False, dp340=False
+    )
+    metrics = {
+        'num_adults': 2, 'num_children': 0, 'sub_type': 'I1',
+        'category_code': 'I1', 'have_a_senior': False
+    }
+    booking = {
+        'packageCode': 'ST07E490',
+        'sailDate': '20270124',
+        'bookingCurrency': 'USD',
+        'shipCode': 'ST',
+        'stateroomNumber': '11588',
+        'stateroomType': 'B',
+        # NOTE: intentionally no 'bookingOfficeCountryCode' key (TA booking)
+    }
+
+    url = _build_checkout_url(booking, metrics, account_info, discounts)
+
+    assert "country=None" not in url
+    assert "None" not in url  # no parameter may stringify a Python None
+
+    parsed = parse_provided_URL(url)
+    assert parsed.booking_office_country_code == "USA"
+    assert parsed.sail_date == "2027-01-24"  # checkout API requires the dashed form
+
+
+# ======================================================================================
+# ITEM 23 TESTS: LOGIN FAILURE DIAGNOSTICS (OAuth error body surfaced)
+# ======================================================================================
+def test_login_failure_logs_server_error_body_and_scrubs_password():
+    """A bare status code cannot tell a rejected password ('invalid_grant')
+    from a malformed request ('invalid_request') or an edge/WAF block, which
+    makes login failures undiagnosable from a run log. login() must surface
+    the server's own error text -- with the password scrubbed if it ever
+    appears in the response."""
+
+    account_info = AccountInfo(username="someone@example.com", password="pa55!word", cruise_line="royal")
+
+    bad_response = MagicMock()
+    bad_response.status_code = 400
+    bad_response.text = '{"error_description":"Login failure","error":"invalid_grant"}'
+
+    mock_session = MagicMock()
+    mock_session.post.return_value = bad_response
+
+    logged: list[str] = []
+    with patch("CheckRoyalCaribbeanPrice.new_api_session", return_value=mock_session), \
+         patch("CheckRoyalCaribbeanPrice.log", side_effect=lambda msg="", *a, **k: logged.append(str(msg))):
+        with pytest.raises(SystemExit):
+            login(account_info)
+
+    joined = "\n".join(logged)
+    assert "invalid_grant" in joined, "the server's OAuth error must reach the run log"
+    assert "someone@example.com" in joined, "the failing account should be identifiable"
+    assert "pa55!word" not in joined, "the password must never be logged"
+
+
+def test_login_failure_scrubs_password_echoed_in_body():
+    """Defensive: if the endpoint ever echoes the submitted password back in
+    an error body, it must not land in the log."""
+
+    account_info = AccountInfo(username="someone@example.com", password="pa55!word", cruise_line="royal")
+
+    bad_response = MagicMock()
+    bad_response.status_code = 400
+    bad_response.text = '{"error":"invalid_request","detail":"password pa55!word rejected"}'
+
+    mock_session = MagicMock()
+    mock_session.post.return_value = bad_response
+
+    logged: list[str] = []
+    with patch("CheckRoyalCaribbeanPrice.new_api_session", return_value=mock_session), \
+         patch("CheckRoyalCaribbeanPrice.log", side_effect=lambda msg="", *a, **k: logged.append(str(msg))):
+        with pytest.raises(SystemExit):
+            login(account_info)
+
+    joined = "\n".join(logged)
+    assert "pa55!word" not in joined
+    assert "***" in joined
+
+
+# ======================================================================================
+# ITEM 24 TESTS: MARKET COUNTRY CODE PREFERRED OVER BOOKING OFFICE COUNTRY CODE
+# ======================================================================================
+def _country_code_test_args():
+    """Shared account/discounts/metrics fixtures for the country code tests."""
+    account_info = AccountInfo(username="test_user", password="password", cruise_line="royal")
+    discounts = DiscountProfile(
+        loyalty_number=None, state=None, senior=False,
+        military=False, fire=False, police=False, dp340=False
+    )
+    metrics = {
+        'num_adults': 2, 'num_children': 0, 'sub_type': 'XB',
+        'category_code': 'XB', 'have_a_senior': False
+    }
+    return account_info, discounts, metrics
+
+
+def test_build_checkout_url_prefers_market_country_over_office_country():
+    """A TA booking carries the agent's own office country (e.g. a German
+    agency, 'DEU') alongside the market the guest actually bought in ('CHS').
+    The checkout API validates country against the booking currency, so
+    DEU+CHF is rejected even though CHS+CHF prices fine -- send the market
+    code."""
+    account_info, discounts, metrics = _country_code_test_args()
+    booking = {
+        'packageCode': 'SY07W704',
+        'sailDate': '20261227',
+        'bookingCurrency': 'CHF',
+        'shipCode': 'SY',
+        'stateroomNumber': '3734',
+        'stateroomType': 'B',
+        'bookingOfficeCountryCode': 'DEU',
+        'bookingMarketCountryCode': 'CHS',
+    }
+
+    url = _build_checkout_url(booking, metrics, account_info, discounts)
+
+    assert "country=CHS" in url
+    assert "country=DEU" not in url
+
+
+def test_build_checkout_url_falls_back_to_office_country_when_no_market_code():
+    """Bookings without a bookingMarketCountryCode (e.g. this head's older
+    payload shape) must keep working exactly as before: fall back to
+    bookingOfficeCountryCode."""
+    account_info, discounts, metrics = _country_code_test_args()
+    booking = {
+        'packageCode': 'SY07W704',
+        'sailDate': '20261227',
+        'bookingCurrency': 'GBP',
+        'shipCode': 'SY',
+        'stateroomNumber': '3734',
+        'stateroomType': 'B',
+        'bookingOfficeCountryCode': 'GBR',
+    }
+
+    url = _build_checkout_url(booking, metrics, account_info, discounts)
+
+    assert "country=GBR" in url
+
+
+def test_build_checkout_url_omits_country_when_neither_code_present():
+    """With neither country field present, 'country' must be absent from the
+    URL (never the literal string 'None') so parse_provided_URL() falls back
+    to its own 'USA' default."""
+    account_info, discounts, metrics = _country_code_test_args()
+    booking = {
+        'packageCode': 'SY07W704',
+        'sailDate': '20261227',
+        'bookingCurrency': 'USD',
+        'shipCode': 'SY',
+        'stateroomNumber': '3734',
+        'stateroomType': 'B',
+    }
+
+    url = _build_checkout_url(booking, metrics, account_info, discounts)
+
+    assert "country=" not in url
+    assert parse_provided_URL(url).booking_office_country_code == "USA"
+
+
+def test_build_checkout_url_domestic_booking_unchanged():
+    """A domestic US booking carries 'USA' in both fields -- the preference
+    order is transparent and the resulting URL is unchanged."""
+    account_info, discounts, metrics = _country_code_test_args()
+    booking = {
+        'packageCode': 'SY07W704',
+        'sailDate': '20261227',
+        'bookingCurrency': 'USD',
+        'shipCode': 'SY',
+        'stateroomNumber': '3734',
+        'stateroomType': 'B',
+        'bookingOfficeCountryCode': 'USA',
+        'bookingMarketCountryCode': 'USA',
+    }
+
+    url = _build_checkout_url(booking, metrics, account_info, discounts)
+
+    assert "country=USA" in url
+
+
+def test_get_dining_and_prices_sends_market_country_code():
+    """get_dining_and_prices() queries the booked/overview React Server
+    Component with a 'country' param; it must send the market code, not the
+    TA's office code, for the same reason as the checkout URL builder."""
+    account_info = AccountInfo(username="tester", password="password", cruise_line="royal")
+    booking = {
+        'amendToken': 'token123',
+        'bookingOfficeCountryCode': 'DEU',
+        'bookingMarketCountryCode': 'CHS',
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.text = '"diningSelection":[]\n"prices":[]'
+
+    with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_resp) as mock_request:
+        get_dining_and_prices(account_info, booking)
+
+    sent_params = mock_request.call_args.kwargs['params']
+    assert sent_params['country'] == 'CHS'
+
+
+def test_booking_country_code_is_normalised_and_blank_market_falls_through():
+    """The checkout API rejects anything but ^[A-Z]{3}$, so a padded or
+    lower-case market code must be normalised, and a whitespace-only market
+    code must not beat a real office code."""
+
+    assert _booking_country_code({"bookingMarketCountryCode": " chs ", "bookingOfficeCountryCode": "DEU"}) == "CHS"
+    assert _booking_country_code({"bookingMarketCountryCode": "   ", "bookingOfficeCountryCode": "deu"}) == "DEU"
+    assert _booking_country_code({"bookingMarketCountryCode": "", "bookingOfficeCountryCode": ""}) is None
+    assert _booking_country_code({}) is None
+
+
+# ======================================================================================
+# ITEM 25 TESTS: xxx
+# ======================================================================================
+class TestFinalPaymentDate:
+    """Unit tests for market-aware final payment calculations and config date overrides."""
+
+    # -------------------------------------------------------------------------
+    # 1. Market Lead Time Resolution
+    # -------------------------------------------------------------------------
+    def test_dach_market_flat_30_days(self):
+        """DEU, CHE, NOR, SWE, DNK, and FIN should always return 30 days regardless of cruise length."""
+        for code in ["DEU", "CHE", "NOR", "SWE", "DNK", "FIN", "DE", "CH", "NO", "SE", "DK", "FI", "deu", "che"]:
+            assert resolve_lead_time(3, code) == 30
+            assert resolve_lead_time(7, code) == 30
+            assert resolve_lead_time(16, code) == 30
+
+    def test_aut_market_tiered_rules(self):
+        """AUT and AT should return 15 days for <=14 nights, 120 days for longer sailings."""
+        for code in ["AUT", "AT"]:
+            assert resolve_lead_time(7, code) == 15
+            assert resolve_lead_time(14, code) == 15
+            assert resolve_lead_time(15, code) == 120
+
+    def test_uk_market_tiered_rules(self):
+        """GBR, IRL, UK, GB, and IE should return 56 days for <=14 nights, 70 days for longer sailings."""
+        for code in ["GBR", "UK", "IRL", "IE", "GB"]:
+            assert resolve_lead_time(7, code) == 56
+            assert resolve_lead_time(14, code) == 56
+            assert resolve_lead_time(15, code) == 70
+
+    def test_aus_market_tiered_rules(self):
+        """AUS, AU, NZL, and NZ should return 90 days for <=14 nights, 120 days for longer sailings."""
+        for code in ["AUS", "AU", "NZL", "NZ"]:
+            assert resolve_lead_time(3, code) == 90
+            assert resolve_lead_time(7, code) == 90
+            assert resolve_lead_time(15, code) == 120
+
+    def test_us_market_and_default_fallback(self):
+        """US code or missing/unknown code should follow US duration tiers (75/90/120)."""
+        for code in ["US", "USA", "CAN", "CA", None, "UNKNOWN_CODE"]:
+            assert resolve_lead_time(3, code) == 75
+            assert resolve_lead_time(4, code) == 75
+            assert resolve_lead_time(7, code) == 90
+            assert resolve_lead_time(15, code) == 120
+
+    # -------------------------------------------------------------------------
+    # 2. get_final_payment_date Date Math
+    # -------------------------------------------------------------------------
+    def test_get_final_payment_date_dach_market(self):
+        """A Dec 31, 2026 sailing in Germany (DEU) should yield Dec 1, 2026 (30 days prior)."""
+        sail_date = "2026-12-31"
+        res = get_final_payment_date(number_of_nights=7, sail_date=sail_date, market_code="DEU")
+        assert res == date(2026, 12, 1)
+
+    def test_get_final_payment_date_us_market(self):
+        """A Dec 31, 2026 7-night sailing in US should yield Oct 2, 2026 (90 days prior)."""
+        sail_date = "2026-12-31"
+        res = get_final_payment_date(number_of_nights=7, sail_date=sail_date, market_code="US")
+        assert res == date(2026, 10, 2)
+
+    # -------------------------------------------------------------------------
+    # 3. Explicit Override (finalPaymentDate)
+    # -------------------------------------------------------------------------
+    def test_date_override_str_iso_format(self):
+        """Explicit ISO date string override takes priority over all market rules."""
+        res = get_final_payment_date(
+            number_of_nights=7,
+            sail_date="2026-12-31",
+            market_code="US",
+            final_payment_date_override="2026-11-15",
+        )
+        assert res == date(2026, 11, 15)
+
+    def test_date_override_str_compact_format(self):
+        """Explicit compact date string YYYYMMDD takes priority."""
+        res = get_final_payment_date(
+            number_of_nights=7,
+            sail_date="2026-12-31",
+            market_code="US",
+            final_payment_date_override="20261115",
+        )
+        assert res == date(2026, 11, 15)
+
+    def test_date_override_date_object(self):
+        """Explicit date object override passes through cleanly."""
+        override_dt = date(2026, 11, 15)
+        res = get_final_payment_date(
+            number_of_nights=7,
+            sail_date="2026-12-31",
+            market_code="US",
+            final_payment_date_override=override_dt,
+        )
+        assert res == override_dt
+
+    def test_date_override_invalid_string_raises(self):
+        """Malformed override string raises ValueError defensively."""
+        with pytest.raises(ValueError, match="Invalid finalPaymentDate"):
+            get_final_payment_date(
+                number_of_nights=7,
+                sail_date="2026-12-31",
+                final_payment_date_override="invalid-date",
+            )
+
+        # -------------------------------------------------------------------------
+        # 4. Integration: get_cruise_price Dictionary Processing
+        # -------------------------------------------------------------------------
+        @patch("CheckRoyalCaribbeanPrice.get_room_price_via_API")
+        @patch("CheckRoyalCaribbeanPrice.notifier_for")
+        def test_get_cruise_price_processes_market_and_override(self, mock_notifier, mock_api_pricing):
+            """Verify get_cruise_price extracts market_code and finalPaymentDate override correctly."""
+            mock_api_pricing.return_value = {
+                "room_available": True,
+                "sailing_nights": 7,
+                "prices": {"stateroomPrice": 1000.0, "taxesAndFees": 100.0},
+            }
+
+            mock_account = MagicMock()
+            mock_account.access.session = MagicMock()
+
+            mock_ship_registry = MagicMock()
+            mock_ship_registry.get_ship.return_value = "Test Ship"
+
+            # Target sailing: Dec 31, 2026 (7 nights)
+            # US default (90 days) -> Oct 2, 2026
+            # DEU market (30 days) -> Dec 1, 2026
+            # Override ("2026-11-15") -> Nov 15, 2026
+            booking_payload = {
+                "bookingId": "TEST12345",
+                "sailDate": "20261231",
+                "stateroomSubtype": "D1",
+                "bookingOfficeCountryCode": "DEU",
+                "passengers": [{"stateroomCategoryCode": "BALCONY", "birthdate": "19800101"}],
+            }
+
+            # Case A: Market code DEU from booking yields Dec 1, 2026
+            with patch("CheckRoyalCaribbeanPrice.get_final_payment_date", wraps=get_final_payment_date) as spy_get_fp:
+                get_cruise_price(
+                    account_info=mock_account,
+                    booking=booking_payload,
+                    ship_dictionary=mock_ship_registry,
+                    paid_price_struct={"paidPrice": 1200.0, "duration": 7},
+                )
+                spy_get_fp.assert_called_once()
+                _, kwargs = spy_get_fp.call_args
+                assert kwargs.get("market_code") == "DEU"
+                assert spy_get_fp.spy_return == date(2026, 12, 1)
+
+            # Case B: Explicit finalPaymentDate in paid_price_struct takes absolute priority
+            paid_struct_with_override = {
+                "paidPrice": 1200.0,
+                "duration": 7,
+                "finalPaymentDate": "2026-11-15",
+            }
+
+            with patch("CheckRoyalCaribbeanPrice.get_final_payment_date", wraps=get_final_payment_date) as spy_get_fp:
+                get_cruise_price(
+                    account_info=mock_account,
+                    booking=booking_payload,
+                    ship_dictionary=mock_ship_registry,
+                    paid_price_struct=paid_struct_with_override,
+                )
+                spy_get_fp.assert_called_once()
+                _, kwargs = spy_get_fp.call_args
+                assert kwargs.get("final_payment_date_override") == "2026-11-15"
+            assert spy_get_fp.spy_return == date(2026, 11, 15)
+
+    @patch("CheckRoyalCaribbeanPrice.config")
+    @patch("CheckRoyalCaribbeanPrice._execute_api_request")
+    @patch("CheckRoyalCaribbeanPrice.get_dining_and_prices")
+    @patch("CheckRoyalCaribbeanPrice.get_final_payment_date")
+    def test_integration_get_voyages_passes_regional_market_code(
+        self, mock_get_final_payment, mock_dining, mock_fetch_voyages, mock_config
+    ):
+        """Verify get_voyages extracts regional market codes (e.g. UK/GBR) and propagates them into get_final_payment_date."""
+        mock_config.date_display_format = "%Y-%m-%d"
+        mock_config.reservation_names = {}
+        mock_config.paid_reservations = []
+        mock_config.display_cruise_prices = False
+        mock_config.show_promos = False
+        mock_config.watch_list = []
+
+        mock_dining.return_value = {"dining_selection": [], "prices": []}
+        mock_get_final_payment.return_value = date(2026, 10, 6)  # Mock 70-day UK window output
+
+        # Response simulating a booking originating from the UK office
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "payload": {
+                "profileBookings": [
+                    {
+                        "bookingId": "UK_INTEG_99",
+                        "shipCode": "AL",
+                        "sailDate": "2026-12-15",
+                        "numberOfNights": "7",
+                        "bookingOfficeCountryCode": "UK",
+                        "finalPaymentDate": None,  # No override; force calculation
+                    }
+                ]
+            }
+        }
+        mock_fetch_voyages.return_value = mock_response
+
+        mock_account = MagicMock()
+        mock_account.is_royal = True
+
+        # Run discovery pipeline
+        get_voyages(
+            account_info=mock_account,
+            discounts=MagicMock(),
+            ship_dictionary=MagicMock(),
+        )
+
+        # Confirm get_final_payment_date was invoked with regional market context
+        mock_get_final_payment.assert_called_once_with(
+            7,
+            "2026-12-15",
+            market_code="UK",
+            final_payment_date_override=None,
+        )
+
+
+class TestFinalPaymentIntegration:
+    # -------------------------------------------------------------------------
+    # 1. Direct Contract Tests for get_final_payment_date
+    # -------------------------------------------------------------------------
+    def test_get_final_payment_date_override_takes_precedence(self):
+        """Explicit final payment date string overrides default night-based calculations."""
+        override_str = "2026-11-15"
+        sail_date_str = "2027-04-01"
+
+        resolved = get_final_payment_date(
+            number_of_nights=7,
+            sail_date=sail_date_str,
+            final_payment_date_override=override_str,
+        )
+        assert resolved == date(2026, 11, 15)
+
+    def test_get_final_payment_date_market_code_handling(self):
+        """Passing market_code properly adjusts payment windows if configured."""
+        sail_date_str = "2027-06-01"
+        # Standard calculation test
+        resolved = get_final_payment_date(
+            number_of_nights=7,
+            sail_date=sail_date_str,
+            market_code="US",
+        )
+        assert isinstance(resolved, date)
+        assert resolved < date(2027, 6, 1)
+
+    # -------------------------------------------------------------------------
+    # 2. Integration Test via get_voyages
+    # -------------------------------------------------------------------------
+    @patch("CheckRoyalCaribbeanPrice.config")
+    @patch("CheckRoyalCaribbeanPrice.log")
+    @patch("CheckRoyalCaribbeanPrice.notifier_for")
+    @patch("CheckRoyalCaribbeanPrice._execute_api_request")
+    @patch("CheckRoyalCaribbeanPrice._calculate_passenger_metrics")
+    @patch("CheckRoyalCaribbeanPrice.get_dining_and_prices")
+    @patch("CheckRoyalCaribbeanPrice.get_final_payment_date")
+    @patch("CheckRoyalCaribbeanPrice.get_orders")
+    def test_get_voyages_passes_market_and_override_to_payment_calc(
+        self,
+        mock_get_orders,
+        mock_get_final_payment,
+        mock_dining,
+        mock_calc_metrics,
+        mock_api,
+        mock_notifier,
+        mock_log,
+        mock_config,
+    ):
+        """Verify get_voyages correctly extracts market_code and override from booking."""
+        # Setup config defaults
+        mock_config.date_display_format = "%Y-%m-%d"
+        mock_config.reservation_names = {}
+        mock_config.paid_reservations = []
+        mock_config.display_cruise_prices = False
+        mock_config.show_promos = False
+        mock_config.watch_list = []
+        mock_config.format_date.side_effect = lambda d: d
+
+        # Mock passenger metrics return value
+        mock_calc_metrics.return_value = {
+            "passenger_names": "John Doe",
+            "checkin_string": "Checked in",
+            "boarding_time": "11:00 AM",
+            "category_code": None,
+        }
+
+        # Setup mock booking payload with override and country code
+        mock_api.return_value.json.return_value = {
+            "payload": {
+                "profileBookings": [
+                    {
+                        "bookingId": "1001",
+                        "sailDate": "2027-01-15",
+                        "numberOfNights": "7",
+                        "shipCode": "SY",
+                        "bookingOfficeCountryCode": "UK",
+                        "finalPaymentDate": "2026-10-15",
+                    }
+                ]
+            }
+        }
+        mock_dining.return_value = {"dining_selection": [], "prices": []}
+        mock_get_final_payment.return_value = date(2026, 10, 15)
+
+        mock_account = MagicMock()
+        mock_account.is_royal = True
+        mock_account.access.id = "ACC_1"
+
+        # Execute get_voyages
+        get_voyages(
+            account_info=mock_account,
+            discounts=MagicMock(),
+            ship_dictionary=MagicMock(),
+        )
+
+        # Assert get_final_payment_date received exact expected parameters
+        mock_get_final_payment.assert_called_once_with(
+            7,
+            "2027-01-15",
+            market_code="UK",
+            final_payment_date_override="2026-10-15",
+        )
+
+    # -------------------------------------------------------------------------
+    # 3. Integration Test via get_cruise_price
+    # -------------------------------------------------------------------------
+    @patch("CheckRoyalCaribbeanPrice.config")
+    @patch("CheckRoyalCaribbeanPrice.get_room_price_via_API")
+    @patch("CheckRoyalCaribbeanPrice._build_checkout_url")
+    @patch("CheckRoyalCaribbeanPrice.parse_provided_URL")
+    @patch("CheckRoyalCaribbeanPrice.get_final_payment_date")
+    def test_get_cruise_price_handles_malformed_dates_gracefully(
+        self,
+        mock_get_final_payment,
+        mock_parse_url,
+        mock_build_url,
+        mock_get_room_price,
+        mock_config,
+    ):
+        """Verify get_cruise_price catches exceptions from bad sail_dates and passes market_code."""
+        mock_config.date_display_format = "%Y-%m-%d"
+        mock_build_url.return_value = "https://mock.rccl.com"
+
+        # Setup URL params with invalid sail date and US market location
+        mock_params = MagicMock()
+        mock_params.sail_date = "INVALID_DATE"
+        mock_params.ship_code = "AL"
+        mock_params.duration = 7
+        mock_params.market_code = "US"
+        mock_params.coupon_code = None
+        mock_parse_url.return_value = mock_params
+
+        # Force get_final_payment_date to raise ValueError on bad string input
+        mock_get_final_payment.side_effect = ValueError("Invalid date format")
+
+        mock_get_room_price.return_value = {
+            "room_available": False  # Triggers Path 1 log output
+        }
+
+        mock_account = MagicMock()
+        mock_account.username = "tester"
+
+        booking = {
+            "bookingId": "2002",
+            "sailDate": "INVALID_DATE",
+            "shipCode": "AL",
+            "url": "https://mock.rccl.com?sailDate=INVALID_DATE",
+        }
+
+        # Should execute without raising ValueError or TypeError
+        get_cruise_price(
+            account_info=mock_account,
+            booking=booking,
+            ship_dictionary=MagicMock(),
+            automatic_URL=True,
+        )
+
+        # Assert get_final_payment_date was called with the bad date and market code
+        mock_get_final_payment.assert_called_once()
+        args, kwargs = mock_get_final_payment.call_args
+
+        assert "INVALID_DATE" in args or kwargs.get("sail_date") == "INVALID_DATE"
+        assert kwargs.get("market_code") == "US" or "US" in args
+
+    # -------------------------------------------------------------------------
+    # 4. Integration Tests: Valid Sail Dates & Non-US Markets
+    # -------------------------------------------------------------------------
+    @patch("CheckRoyalCaribbeanPrice.config")
+    @patch("CheckRoyalCaribbeanPrice.get_room_price_via_API")
+    @patch("CheckRoyalCaribbeanPrice._build_checkout_url")
+    @patch("CheckRoyalCaribbeanPrice.parse_provided_URL")
+    @patch("CheckRoyalCaribbeanPrice.get_final_payment_date")
+    def test_get_cruise_price_passes_gbr_market_code_to_payment_calc(
+        self,
+        mock_get_final_payment,
+        mock_parse_url,
+        mock_build_url,
+        mock_get_room_price,
+        mock_config,
+    ):
+        """Verify get_cruise_price extracts market_code='GBR' and passes it to get_final_payment_date."""
+        mock_config.date_display_format = "%Y-%m-%d"
+        mock_config.minimum_saving_alert = 10.0
+        mock_build_url.return_value = "https://mock.rccl.com"
+
+        # Setup URL params for a valid UK/GBR booking
+        mock_params = MagicMock()
+        mock_params.sail_date = "2027-06-15"
+        mock_params.ship_code = "AL"
+        mock_params.duration = 7
+        mock_params.market_code = "GBR"
+        mock_params.coupon_code = None
+        mock_parse_url.return_value = mock_params
+
+        # Return a valid calculated date
+        mock_get_final_payment.return_value = date(2027, 4, 6)
+
+        mock_get_room_price.return_value = {
+            "room_available": True,
+            "base_fare": {"fare": 800.0, "gratuities": 0.0, "insurance": 0.0, "obc": "0.0"},
+        }
+
+        booking = {
+            "bookingId": "3003",
+            "sailDate": "2027-06-15",
+            "shipCode": "AL",
+            "marketCode": "GBR",
+            "url": "https://mock.rccl.com?sailDate=2027-06-15&marketCode=GBR",
+            "paidPriceStruct": {"paid_price": 1000.0},
+        }
+
+        get_cruise_price(
+            account_info=MagicMock(),
+            booking=booking,
+            ship_dictionary=MagicMock(),
+            automatic_URL=True,
+        )
+
+        # Assert get_final_payment_date received sail_date and market_code='GBR'
+        mock_get_final_payment.assert_called_once()
+        args, kwargs = mock_get_final_payment.call_args
+
+        assert "2027-06-15" in args or kwargs.get("sail_date") == "2027-06-15"
+        assert kwargs.get("market_code") == "GBR" or "GBR" in args
+
+    @patch("CheckRoyalCaribbeanPrice.config")
+    @patch("CheckRoyalCaribbeanPrice.log")
+    @patch("CheckRoyalCaribbeanPrice.notifier_for")
+    @patch("CheckRoyalCaribbeanPrice._execute_api_request")
+    @patch("CheckRoyalCaribbeanPrice._calculate_passenger_metrics")
+    @patch("CheckRoyalCaribbeanPrice.get_dining_and_prices")
+    @patch("CheckRoyalCaribbeanPrice.get_final_payment_date")
+    @patch("CheckRoyalCaribbeanPrice.get_orders")
+    def test_get_voyages_passes_gbr_market_code_to_payment_calc(
+        self,
+        mock_get_orders,
+        mock_get_final_payment,
+        mock_dining,
+        mock_calc_metrics,
+        mock_api,
+        mock_notifier,
+        mock_log,
+        mock_config,
+    ):
+        """Verify get_voyages passes market_code='GBR' to get_final_payment_date for tracked UK voyages."""
+        mock_config.date_display_format = "%Y-%m-%d"
+        mock_config.reservation_names = {}
+        mock_config.paid_reservations = []
+        mock_config.display_cruise_prices = False
+        mock_config.show_promos = False
+        mock_config.watch_list = []
+        mock_config.format_date.side_effect = lambda d: d
+
+        mock_calc_metrics.return_value = {
+            "passenger_names": "Jane Doe",
+            "checkin_string": "Not Checked In",
+            "boarding_time": "12:00 PM",
+            "category_code": None,
+        }
+
+        mock_api.return_value.json.return_value = {
+            "payload": {
+                "profileBookings": [
+                    {
+                        "bookingId": "UK999",
+                        "sailDate": "2027-06-15",
+                        "numberOfNights": "7",
+                        "shipCode": "SY",
+                        "bookingOfficeCountryCode": "GBR",
+                    }
+                ]
+            }
+        }
+        mock_dining.return_value = {"dining_selection": [], "prices": []}
+        mock_get_final_payment.return_value = date(2027, 4, 6)
+
+        mock_account = MagicMock()
+        mock_account.is_royal = True
+        mock_account.access.id = "ACC_UK"
+
+        get_voyages(
+            account_info=mock_account,
+            discounts=MagicMock(),
+            ship_dictionary=MagicMock(),
+        )
+
+        mock_get_final_payment.assert_called_once_with(
+            7,
+            "2027-06-15",
+            market_code="GBR",
+            final_payment_date_override=None,
+        )
+
+import pytest
+from datetime import date
+from CheckRoyalCaribbeanPrice import get_final_payment_date, resolve_lead_time
+
+
+class TestFinalPaymentDateOverrides:
+    """Test suite for market rules and explicit overrides in get_final_payment_date."""
+
+    def test_integer_days_override(self):
+        """Verify an explicit integer override (e.g. 30 days) subtracts directly from sail date."""
+        sail_date = date(2026, 12, 31)
+        # 30 days before Dec 31, 2026 is Dec 1, 2026
+        calculated = get_final_payment_date(
+            number_of_nights=7,
+            sail_date=sail_date,
+            final_payment_date_override=30,
+        )
+        assert calculated == date(2026, 12, 1)
+
+    def test_string_integer_days_override(self):
+        """Verify a string representation of lead-days ("45") is correctly parsed as an integer offset."""
+        sail_date = "2026-12-31"
+        # 45 days before Dec 31, 2026 is Nov 16, 2026
+        calculated = get_final_payment_date(
+            number_of_nights=7,
+            sail_date=sail_date,
+            final_payment_date_override="45",
+        )
+        assert calculated == date(2026, 11, 16)
+
+    def test_explicit_date_string_override(self):
+        """Verify explicit ISO date strings override market calculations."""
+        sail_date = "2026-12-31"
+        calculated = get_final_payment_date(
+            number_of_nights=7,
+            sail_date=sail_date,
+            final_payment_date_override="2026-11-30",
+        )
+        assert calculated == date(2026, 11, 30)
+
+    @pytest.mark.parametrize(
+        "market_code, nights, expected_days",
+        [
+            ("DEU", 7, 30),      # DACH flat 30-day window
+            ("CHE", 14, 30),     # Switzerland flat 30-day window
+            ("GBR", 7, 56),      # UK standard 8-week window
+            ("GBR", 16, 70),     # UK long sailing 70-day window
+            ("US", 3, 75),       # US short sailing
+            ("US", 7, 90),       # US standard sailing
+            ("US", 15, 120),     # US long sailing
+        ],
+    )
+    def test_market_code_resolution(self, market_code, nights, expected_days):
+        """Verify resolve_lead_time picks the correct regional policy window."""
+        assert resolve_lead_time(nights, market_code) == expected_days
+
+    def test_invalid_override_format_raises_value_error(self):
+        """Verify invalid override strings raise a descriptive ValueError."""
+        with pytest.raises(ValueError, match=r"Invalid finalPaymentDate string format"):
+            get_final_payment_date(
+                number_of_nights=7,
+                sail_date="2026-12-31",
+                final_payment_date_override="INVALID_DATE",
+            )
+# ============================================================================
+# ITEM 26 TESTS: PER-ACCOUNT LOGIN FAILURE ISOLATION (main() run resilience)
+# ============================================================================
+# A stale password on ONE account in a multi-account config.yaml used to take
+# the entire run down: login()'s sys.exit(1) propagated straight out of
+# main()'s account loop as an uncaught SystemExit. main() must now absorb a
+# failed login/profile fetch for one account, report it loudly, and still
+# process every remaining account - without changing login()'s own contract
+# (an out-of-tree caller uses login() directly as a standalone credential
+# probe and depends on it still raising SystemExit on failure).
+
+def _make_multi_account_config(accounts):
+    """A MagicMock config with just enough real values wired up that main()
+    can run its account loop and fall through past the watchlist / JSON
+    stages without touching the network or the filesystem."""
+    mock_cfg = MagicMock()
+    mock_cfg.accounts = accounts
+    mock_cfg.apobj = None
+    mock_cfg.apprise_test = False
+    mock_cfg.log_file = None
+    mock_cfg.output_watch_as_json = False
+    mock_cfg.minimum_saving_alert = None
+    mock_cfg.prospective_cruises = []
+    mock_cfg.date_display_format = "%m/%d/%Y"
+    mock_cfg.format_date = lambda d: str(d)
+    # Mirrors the real config default (notifyOnError: false) - tests that
+    # need the opt-in login-failure notification enable it explicitly.
+    mock_cfg.notify_on_error = False
+    return mock_cfg
+
+
+def test_main_continues_to_next_account_when_first_login_raises_systemexit():
+    """
+    The real-world failure this guards: account 1 has a stale password and
+    login() raises SystemExit for it, while account 2 is fine. The run must
+    still reach and process account 2, and must exit non-zero afterward so
+    the skipped account isn't silently swallowed by a green-looking run.
+    """
+    import CheckRoyalCaribbeanPrice as C
+
+    bad_account = AccountInfo(username="bad@example.com", password="stale-pw", cruise_line="royal")
+    good_account = AccountInfo(username="good@example.com", password="correct-pw", cruise_line="royal")
+    mock_cfg = _make_multi_account_config([bad_account, good_account])
+
+    good_access = APIAccess(token="tok", id="acct-id", session=MagicMock())
+    logged: list[str] = []
+
+    with patch.object(C, "config", mock_cfg), \
+         patch.object(C, "log", side_effect=lambda msg="", *a, **k: logged.append(str(msg))), \
+         patch.object(C, "get_ship_dictionary_web"), \
+         patch.object(C, "login", side_effect=[SystemExit(1), good_access]) as mock_login, \
+         patch.object(C, "get_profile", return_value=("FL", "LOY-1", 0)) as mock_get_profile, \
+         patch.object(C, "get_voyages") as mock_get_voyages, \
+         patch("CheckRoyalCaribbeanPrice.time.sleep"):
+
+        with pytest.raises(SystemExit) as exc_info:
+            C.main()
+
+    # login() was attempted for BOTH accounts - the first failure did not stop the loop
+    assert mock_login.call_count == 2
+
+    # Only the account that actually logged in went on to get_profile()/get_voyages()
+    mock_get_profile.assert_called_once_with(good_account)
+    mock_get_voyages.assert_called_once()
+    assert mock_get_voyages.call_args.args[0] is good_account
+
+    # The failure was reported loudly and named the failing account
+    joined = "\n".join(logged)
+    assert "bad@example.com" in joined
+    assert "SKIPPED" in joined
+
+    # History records the run as a partial failure (not a silent "ok")
+    mock_cfg.history.finish_run.assert_called_once()
+    finish_status, finish_summary = mock_cfg.history.finish_run.call_args.args
+    assert finish_status == "partial_failure"
+    assert "bad@example.com" in finish_summary
+
+    # The run must exit with the distinct partial-failure code - never 0
+    # (which would hide the skipped account) and never 1 (which is reserved
+    # for a fatal/total failure and would wrongly tell a supervising
+    # scheduler that the whole run, including the good accounts' already-
+    # written data, needs to be retried).
+    assert C.EXIT_PARTIAL_FAILURE not in (0, 1)
+    assert exc_info.value.code == C.EXIT_PARTIAL_FAILURE
+
+
+def test_main_notifies_failed_account_via_its_own_notifier_when_notify_on_error_enabled():
+    """A per-account apprise: notifier must hear about ITS OWN login failure,
+    following the same notifier_for() resolution used for price alerts - as
+    long as the user has opted in to error notifications (notifyOnError:
+    true), the same opt-out the module-level fatal-error handler honors."""
+    import CheckRoyalCaribbeanPrice as C
+
+    bad_account = AccountInfo(username="bad@example.com", password="stale-pw", cruise_line="royal")
+    bad_account.apobj = MagicMock(name="bad_account_apobj")
+    bad_account.apobj.__len__ = MagicMock(return_value=1)  # a registered URL
+    mock_cfg = _make_multi_account_config([bad_account])
+    mock_cfg.notify_on_error = True
+
+    with patch.object(C, "config", mock_cfg), \
+         patch.object(C, "log", MagicMock()), \
+         patch.object(C, "get_ship_dictionary_web"), \
+         patch.object(C, "login", side_effect=SystemExit(1)), \
+         patch.object(C, "get_profile"), \
+         patch.object(C, "get_voyages"):
+
+        with pytest.raises(SystemExit):
+            C.main()
+
+    bad_account.apobj.notify.assert_called_once()
+    body = bad_account.apobj.notify.call_args.kwargs["body"]
+    assert "bad@example.com" in body
+
+
+def test_main_does_not_notify_failed_account_when_notify_on_error_disabled():
+    """
+    The opt-out: a user who set notifyOnError: false but still has an
+    apprise: URL for price-drop alerts must NOT receive a login-failure
+    push - they explicitly asked not to be notified about errors, and this
+    notification must honor that the same way the module-level fatal-error
+    handler already does (`config.notify_on_error` gate).
+    """
+    import CheckRoyalCaribbeanPrice as C
+
+    bad_account = AccountInfo(username="bad@example.com", password="stale-pw", cruise_line="royal")
+    bad_account.apobj = MagicMock(name="bad_account_apobj")
+    bad_account.apobj.__len__ = MagicMock(return_value=1)  # a registered URL
+    mock_cfg = _make_multi_account_config([bad_account])
+    mock_cfg.notify_on_error = False
+
+    with patch.object(C, "config", mock_cfg), \
+         patch.object(C, "log", MagicMock()), \
+         patch.object(C, "get_ship_dictionary_web"), \
+         patch.object(C, "login", side_effect=SystemExit(1)), \
+         patch.object(C, "get_profile"), \
+         patch.object(C, "get_voyages"):
+
+        with pytest.raises(SystemExit):
+            C.main()
+
+    bad_account.apobj.notify.assert_not_called()
+
+
+def test_main_unrelated_fatal_error_still_propagates_and_is_not_partial_failure():
+    """
+    A login failure is deliberately absorbed into the partial-failure path
+    (EXIT_PARTIAL_FAILURE). An unrelated fatal error elsewhere in the run
+    (e.g. get_voyages blowing up after a successful login) must NOT be
+    caught by that same per-account guard - it has to keep propagating out
+    of main() as the exact, unconverted exception, exactly as it did before
+    this feature, and main() itself must never call sys.exit for it (never
+    silently downgraded to a "some accounts were skipped" outcome).
+
+    This test calls C.main() directly, so it does NOT exercise the
+    `if __name__ == "__main__":` block at the bottom of the module - it
+    cannot observe that block's except-Exception handler actually mapping
+    this exception to sys.exit(1). It only proves the half of that
+    contract that lives inside main(): the exception reaches the caller
+    unconverted and untouched by main()'s own sys.exit calls, which is a
+    precondition for that mapping to happen correctly.
+    """
+    import CheckRoyalCaribbeanPrice as C
+
+    account = AccountInfo(username="user@example.com", password="pw", cruise_line="royal")
+    mock_cfg = _make_multi_account_config([account])
+
+    access = APIAccess(token="tok", id="acct-id", session=MagicMock())
+    boom = RuntimeError("boom")
+
+    with patch.object(C, "config", mock_cfg), \
+         patch.object(C, "log", MagicMock()), \
+         patch.object(C, "get_ship_dictionary_web"), \
+         patch.object(C, "login", return_value=access), \
+         patch.object(C, "get_profile", return_value=("FL", "LOY-1", 0)), \
+         patch.object(C, "get_voyages", side_effect=boom), \
+         patch("sys.exit") as mock_exit:
+
+        with pytest.raises(RuntimeError) as exc_info:
+            C.main()
+
+    # This must be the exact bare RuntimeError, never converted along the
+    # way, and main() itself must never call sys.exit for it. That matters
+    # because the *only* place this exception's fate as an exit code gets
+    # decided is the module-level handler at the bottom of this file
+    # (`if __name__ == "__main__": ... except Exception as exc: ...
+    # sys.exit(1)`), which maps every exception reaching it - unconditionally,
+    # with no branch for EXIT_PARTIAL_FAILURE - to the fixed exit code 1.
+    # Pinning that main() calls sys.exit zero times here (mirroring how
+    # test_main_continues_to_next_account_when_first_login_raises_systemexit
+    # pins EXIT_PARTIAL_FAILURE off main()'s OWN sys.exit call) is what
+    # guarantees this exception is still headed for that fixed 1, and would
+    # catch a future change that had main() itself start intercepting fatal
+    # errors and mapping some of them to EXIT_PARTIAL_FAILURE.
+    assert exc_info.value is boom
+    assert not isinstance(exc_info.value, SystemExit)
+    mock_exit.assert_not_called()
+    assert C.EXIT_PARTIAL_FAILURE not in (0, 1)
+
+    # Finalized as a fatal "error", never as "partial_failure" - the two
+    # outcomes must stay distinguishable by exit code (1 vs
+    # EXIT_PARTIAL_FAILURE) all the way through to the history row.
+    mock_cfg.history.finish_run.assert_called_once_with("error", "RuntimeError: boom")
+
+
+def test_main_distinguishes_login_failure_from_profile_fetch_failure():
+    """
+    ITEM 1 fix: login() and get_profile() are guarded together (both skip
+    the account the same way), but a profile-fetch failure on an account
+    whose login SUCCEEDED must be reported as a profile problem, not
+    misreported as a login problem - conflating the two would send someone
+    debugging a transient profile-API 500 chasing a "bad password" that
+    never happened. A genuine login failure must still say "login".
+    """
+    import CheckRoyalCaribbeanPrice as C
+
+    login_bad_account = AccountInfo(username="badlogin@example.com", password="stale-pw", cruise_line="royal")
+    login_bad_account.apobj = MagicMock(name="login_bad_apobj")
+    login_bad_account.apobj.__len__ = MagicMock(return_value=1)  # a registered URL
+
+    profile_bad_account = AccountInfo(username="badprofile@example.com", password="pw", cruise_line="royal")
+    profile_bad_account.apobj = MagicMock(name="profile_bad_apobj")
+    profile_bad_account.apobj.__len__ = MagicMock(return_value=1)  # a registered URL
+
+    mock_cfg = _make_multi_account_config([login_bad_account, profile_bad_account])
+    mock_cfg.notify_on_error = True
+
+    good_access = APIAccess(token="tok", id="acct-id", session=MagicMock())
+    logged: list[str] = []
+
+    with patch.object(C, "config", mock_cfg), \
+         patch.object(C, "log", side_effect=lambda msg="", *a, **k: logged.append(str(msg))), \
+         patch.object(C, "get_ship_dictionary_web"), \
+         patch.object(C, "login", side_effect=[SystemExit(1), good_access]), \
+         patch.object(C, "get_profile", side_effect=RuntimeError("profile 500")) as mock_get_profile, \
+         patch.object(C, "get_voyages") as mock_get_voyages:
+
+        with pytest.raises(SystemExit) as exc_info:
+            C.main()
+
+    # get_profile() was reached only for the account that actually logged in.
+    mock_get_profile.assert_called_once_with(profile_bad_account)
+    # Neither account made it to get_voyages() - both were skipped.
+    mock_get_voyages.assert_not_called()
+
+    joined = "\n".join(logged)
+
+    # The login failure is reported as a login problem...
+    assert "badlogin@example.com) could not be logged in" in joined
+    # ...and the profile-fetch failure on the account that DID log in is
+    # reported as a profile problem, never misreported as a login failure.
+    assert "badprofile@example.com) logged in, but its profile could not be fetched" in joined
+    assert "badprofile@example.com) could not be logged in" not in joined
+
+    # Each account's own notifier got a message naming ITS OWN failure phase.
+    login_notify = login_bad_account.apobj.notify.call_args.kwargs
+    assert "could not be logged in" in login_notify["body"]
+    assert login_notify["title"] == 'Cruise Price Account Login Failed'
+    # login() raised a bare SystemExit(1) here - str(SystemExit(1)) is just
+    # "1", which carries no diagnosis. The notification must not surface
+    # that noise; it should point the reader at the run log instead, where
+    # login() already logged the real reason.
+    assert "run log" in login_notify["body"]
+    assert not login_notify["body"].rstrip().endswith("1")
+
+    profile_notify = profile_bad_account.apobj.notify.call_args.kwargs
+    assert "logged in, but its profile could not be fetched" in profile_notify["body"]
+    assert "could not be logged in" not in profile_notify["body"]
+    # get_profile() raised a plain Exception with a real message - unlike
+    # the bare SystemExit case above, that message IS informative and must
+    # still reach the notification.
+    assert "profile 500" in profile_notify["body"]
+    assert profile_notify["title"] == 'Cruise Price Account Profile Fetch Failed'
+
+    # Both accounts still land in the same partial-failure outcome - the
+    # fix distinguishes the MESSAGE, not whether the account gets skipped.
+    mock_cfg.history.finish_run.assert_called_once()
+    finish_status, finish_summary = mock_cfg.history.finish_run.call_args.args
+    assert finish_status == "partial_failure"
+    assert "badlogin@example.com" in finish_summary
+    assert "badprofile@example.com" in finish_summary
+
+    # The persisted summary must name each account's failure phase too, not
+    # just its username - a later reader of the history DB has only this
+    # string (the console [SKIPPED] lines aren't persisted), so without the
+    # phase they can't tell a stale password from a transient profile-API
+    # failure.
+    assert "badlogin@example.com (login)" in finish_summary
+    assert "badprofile@example.com (profile)" in finish_summary
+    assert exc_info.value.code == C.EXIT_PARTIAL_FAILURE
+
+
+def test_main_all_accounts_succeed_exits_and_records_ok_unchanged():
+    """Baseline: with no failures, current behavior is unchanged - every
+    account is processed, the history run finishes 'ok', and the process
+    does not raise/exit non-zero."""
+    import CheckRoyalCaribbeanPrice as C
+
+    account_one = AccountInfo(username="one@example.com", password="pw1", cruise_line="royal")
+    account_two = AccountInfo(username="two@example.com", password="pw2", cruise_line="royal")
+    mock_cfg = _make_multi_account_config([account_one, account_two])
+
+    access_one = APIAccess(token="tok1", id="id1", session=MagicMock())
+    access_two = APIAccess(token="tok2", id="id2", session=MagicMock())
+
+    with patch.object(C, "config", mock_cfg), \
+         patch.object(C, "log", MagicMock()), \
+         patch.object(C, "get_ship_dictionary_web"), \
+         patch.object(C, "login", side_effect=[access_one, access_two]) as mock_login, \
+         patch.object(C, "get_profile", return_value=("FL", "LOY-1", 0)) as mock_get_profile, \
+         patch.object(C, "get_voyages") as mock_get_voyages, \
+         patch("CheckRoyalCaribbeanPrice.time.sleep"):
+
+        C.main()  # must return normally - no SystemExit
+
+    assert mock_login.call_count == 2
+    assert mock_get_profile.call_count == 2
+    assert mock_get_voyages.call_count == 2
+
+    mock_cfg.history.finish_run.assert_called_once_with("ok")
 
 
 # =====================================================================
@@ -2608,3 +3822,18 @@ def test_availability_exact_match_still_wins_unchanged():
         available, alternates = check_if_room_is_available(params)
     assert available is True and alternates == []
     assert params.stateroom_subtype == "D"
+
+
+# =====================================================================
+# API TIMEOUT / RETRY CONSTANTS
+# Tunables live in the constants section rather than as scattered
+# magic numbers; pin their values so a change is a conscious decision.
+# =====================================================================
+def test_timeout_retry_constants():
+    import CheckRoyalCaribbeanPrice as crccl
+    assert crccl.REQUEST_TIMEOUT == 30
+    assert crccl.SHORT_REQUEST_TIMEOUT == 10
+    assert crccl.MAX_RETRIES == 3
+    assert crccl.RETRY_BACKOFF_BASE == 2
+    assert crccl.DEFAULT_ON_FAILURE == "retry"
+    assert crccl.ACCOUNT_COOLDOWN_SECONDS == 5
