@@ -251,7 +251,9 @@ SCRIPTS = [
         Field('Type', '--type', default='all', required=True, width=18,
               tip="interior / oceanview / balcony / suite, comma-separated, or 'all' for every type."),
         Field('Category (e.g. 4D)', '--category', default='all', width=8,
-              tip="Category code to match, e.g. 4D. 'all' = every category."),
+              tip="Category code to match, e.g. 4D. 'all' = every category. Royal only "
+                  "advertises each family's cheapest tier, but sister tiers (2U alongside "
+                  "4U) may exist at a higher price - any code can be entered here."),
         Field('Subtype letter (D = 1D,2D,4D…; prefer Category)', '--sub', width=5,
               tip='A subtype is the letter its categories share: D matches 1D, 2D, 4D… '
                   'Usually leave this blank and set Category instead.'),

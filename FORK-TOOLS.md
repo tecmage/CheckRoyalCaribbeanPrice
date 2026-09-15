@@ -46,7 +46,7 @@ Filters and tags:
 | --- | --- |
 | `--ship` | code (`OV`) or any part of the name (`ovation`, `celebrity edge`); brand auto-detected |
 | `--type` | comma-separated classes: `interior`/`oceanview`/`balcony`/`suite` (or API codes); `all` = every type |
-| `--category` | specific category code (`4D`); `all` skips the filter |
+| `--category` | specific category code (`4D`); `all` skips the filter. Royal's category list only advertises each family's cheapest tier, but sister tiers (`2U` alongside `4U`) often exist at a higher price - any code works here even if the menu didn't list it |
 | `--side` | `port` / `starboard` / `any`. Sides are derived from measured deck-plan geometry: Royal ships split sides by room number (per-ship split points built in; Voyager/Freedom classes are numbered mirror-image and handled), Celebrity by odd/even (odd = port). `--flip-sides` inverts if a ship reads reversed |
 | `--decks` | e.g. `8,9,10`; `all` skips the filter |
 | `--saildate` | one date = list that sailing's open cabins instead of hunting chains |

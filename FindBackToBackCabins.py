@@ -862,7 +862,12 @@ def main() -> None:
         category = None
     if args.subtype is None and args.category is None and sys.stdin.isatty():
         if pickable:
-            print(f"\n{CYAN}Categories on this ship:{RESET}")
+            # The type-and-subtype endpoint returns one row per subtype family,
+            # showing only its lead-in (cheapest) category - sister tiers are
+            # still bookable and enumerable via the rooms API, just not listed here
+            print(f"\n{CYAN}Categories on this ship{RESET} (each family's cheapest tier - "
+                  f"sister tiers like 2U alongside 4U may exist at a higher price; "
+                  f"type any category code):")
             for st, code, cat in pickable:
                 print(f"  {BLUE}{cat or code}{RESET}  {sub_name.get((st, code), '')}")
         hint = ""
