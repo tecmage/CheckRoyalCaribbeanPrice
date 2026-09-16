@@ -306,3 +306,26 @@ def test_is_hump_only_applies_to_balcony_classes():
     assert m.is_hump("OV", hump_cabin, "DELUXE") is True
     assert m.is_hump("OV", hump_cabin, "INTERIOR") is False
     assert m.is_hump("OV", hump_cabin, None) is False
+
+
+##################################
+# side_of on letter-suffixed cabin numbers
+##################################
+def test_side_of_letter_suffixed_cabins():
+    """The side rules apply to the DIGITS of a cabin number: '1234A' must not
+    crash the parity path nor digit-shift the split path (audit finding A2)."""
+    # Celebrity parity: last DIGIT is 4 (even) -> starboard, no ValueError
+    assert m.side_of("1234A", flip=False, by_number=False) == "starboard"
+    assert m.side_of("1233A", flip=False, by_number=False) == "port"
+    # Royal by-number: last three DIGITS are 234, not '34A'->34
+    assert m.side_of("1234A", flip=False, by_number=True, split=200) == "starboard"
+    # discriminating case: digits 134 >= split 100 -> starboard, while the old
+    # raw-slice bug read '34A' as 34 -> port
+    assert m.side_of("1134A", flip=False, by_number=True, split=100) == "starboard"
+    # plain numbers unchanged
+    assert m.side_of("1134", flip=False, by_number=True, split=200) == "port"
+    # no digits at all -> unknown, and filter_side keeps rather than hides it
+    assert m.side_of("GTY", flip=False, by_number=True) == "?"
+    kept = m.filter_side([{"cabin": "GTY"}, {"cabin": "8123"}], "port", False,
+                         by_number=True, split=500)
+    assert [c["cabin"] for c in kept] == ["GTY", "8123"]

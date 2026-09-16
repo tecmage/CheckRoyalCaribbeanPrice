@@ -383,11 +383,20 @@ SIDE_PORT_HIGH = {"AD", "EX", "FR", "ID", "LB", "MA", "NV", "VY"}
 def side_of(cabin: str, flip: bool, by_number: bool = False,
             split: int = SIDE_SPLIT_DEFAULT) -> str:
     """Port/starboard from the room number: low/high split on Royal ships,
-    odd/even parity on Celebrity ships."""
+    odd/even parity on Celebrity ships.
+
+    Cabin numbers can carry a letter suffix ("1234A"): the side rules apply
+    to the DIGITS, so strip non-digits first - slicing the raw string crashed
+    the parity path on the suffix and digit-shifted the split path ("34A"
+    read as 34 instead of 234). Unclassifiable numbers return "?" rather
+    than a guess so filters keep such cabins instead of misfiling them."""
+    digits = re.sub(r"\D", "", str(cabin))
+    if not digits:
+        return "?"
     if by_number:
-        port = _cabin_int(str(cabin)[-3:]) < split
+        port = int(digits[-3:]) < split
     else:
-        port = int(str(cabin)[-1]) % 2 == 1
+        port = int(digits[-1]) % 2 == 1
     if flip:
         port = not port
     return "port" if port else "starboard"
@@ -397,7 +406,8 @@ def filter_side(cabins: List[Dict[str, Any]], side: Optional[str], flip: bool,
                 by_number: bool = False, split: int = SIDE_SPLIT_DEFAULT) -> List[Dict[str, Any]]:
     if not side:
         return cabins
-    return [c for c in cabins if side_of(c["cabin"], flip, by_number, split) == side]
+    # "?" (unclassifiable number) is kept rather than silently hidden
+    return [c for c in cabins if side_of(c["cabin"], flip, by_number, split) in (side, "?")]
 
 
 # Quantum-class ship codes (Quantum, Anthem, Ovation, Odyssey, Spectrum).
