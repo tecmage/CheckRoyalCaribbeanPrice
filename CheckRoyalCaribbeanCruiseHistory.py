@@ -647,11 +647,14 @@ def show_pending_points(pending: List[Dict[str, Any]]) -> None:
 
 def show_tier_progress(account, profile_points: int, sailings: List[Dict[str, Any]],
                        upcoming: List[Tuple[str, Dict[str, Any], int, str]],
-                       earns_blocks: bool = True, block_holder: str = "") -> None:
+                       earns_blocks: bool = True, block_holder: str = "",
+                       pending: int = 0) -> None:
     if not account.is_royal:
         return
-    points = profile_points or sum(sail_ints(s)[1] for s in sailings)
+    points = (profile_points or sum(sail_ints(s)[1] for s in sailings)) + pending
     source = "profile" if profile_points else "sum of history"
+    if pending:
+        source += f" + {pending} pending"
     crccl.log(f"\n{BLUE}Crown & Anchor progress:{RESET} {points} points ({source})")
 
     current = None
@@ -797,6 +800,12 @@ def main() -> None:
                              "double-points promo: (base + suite + solo) x2 "
                              "(booked Jul 21-31 2026, sailing Sep 2026 - Apr 2027, "
                              "non-casino, non-TA/TP, max 2/member)")
+    parser.add_argument("--pending-points", type=int, default=0, metavar="N",
+                        help="Points earned but not yet posted to Crown & Anchor (e.g. a "
+                             "cruise that just ended). Added to the current balance for "
+                             "tier progress and projections, shown as an explicit "
+                             "'+N pending' adjustment. Applies to every account in the "
+                             "config, so best used with a single-account config file")
     parser.add_argument("--new-double-points", default="", metavar="ID,ID",
                         help="Comma-separated booking IDs on the NEWER double-points promo, "
                              "which doubles only base + suite and pays the solo point single: "
@@ -811,7 +820,8 @@ def main() -> None:
 
     accounts, skipped, history_db = load_accounts(args.config)
     try:
-        _run_report(accounts, skipped, promo_ids, new_promo_ids, history_db)
+        _run_report(accounts, skipped, promo_ids, new_promo_ids, history_db,
+                    pending_points=args.pending_points)
     finally:
         for account, _loyalty, _points in accounts:
             account.access.session.close()
@@ -819,7 +829,8 @@ def main() -> None:
 
 def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
                 new_promo_ids: frozenset = frozenset(),
-                history_db: Optional[str] = None) -> None:
+                history_db: Optional[str] = None,
+                pending_points: int = 0) -> None:
     registry = crccl.ShipRegistry()
     try:
         crccl.get_ship_dictionary_web(registry)
@@ -881,13 +892,13 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
         # Manual --double-points wins; otherwise auto-detect from the amend pages
         acct_promo = promo_ids or probe_promo(account, own_bookings, holder)
         upcoming = upcoming_earnings(own_bookings, holder, acct_promo, new_promo_ids)
-        eff_points = points or sum(sail_ints(s)[1] for s in sailings)
+        eff_points = (points or sum(sail_ints(s)[1] for s in sailings)) + pending_points
         earns_blocks = idx == block_idx
         show_pending_points(pending_ledger_sailings(history_db, account.username, sailings))
         show_upcoming_earnings(upcoming, SHIP_NAMES, holder,
                                start_points=eff_points, earns_blocks=earns_blocks,
                                promo_ids=acct_promo)
-        show_tier_progress(account, points, sailings, upcoming,
+        show_tier_progress(account, points, sailings, upcoming, pending=pending_points,
                            earns_blocks=earns_blocks, block_holder=block_holder)
         if sailings or upcoming:
             show_yearly(sailings, upcoming)

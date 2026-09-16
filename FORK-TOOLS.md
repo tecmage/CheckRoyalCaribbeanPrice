@@ -162,7 +162,10 @@ If `historyDb` is set in config.yaml (the main price checker's opt-in SQLite lay
 the report also flags **points that haven't posted yet**: cruises the price checker
 snapshotted that have already ended but are missing from the loyalty ledger, with the
 estimated points. Without `historyDb` this check is silently skipped - the API alone
-cannot reveal an unposted cruise.
+cannot reveal an unposted cruise. Either way, `--pending-points N` (also a GUI field) manually adds
+known-but-unposted points to the working balance for tier progress and projections,
+disclosed as "+N pending"; it applies to every account in the config, so use it with
+a single-account config file.
 A 5-second cooldown is applied between account logins (same as the main script), and
 accounts that fail login or have no sailings are called out in the household/shared-room
 sections rather than silently shrinking them.

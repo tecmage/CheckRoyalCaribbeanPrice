@@ -101,3 +101,21 @@ def test_pending_ledger_sailings_detects_unposted_points(tmp_path):
     # No db configured -> quiet no-op
     assert pending_ledger_sailings(None, "solo@example.com", []) == []
     assert pending_ledger_sailings(str(tmp_path / "nope.db"), "solo@example.com", []) == []
+
+
+def test_tier_progress_shows_pending_adjustment(monkeypatch):
+    """--pending-points raises the working balance and is disclosed in the
+    source label rather than silently blended in."""
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    import CheckRoyalCaribbeanPrice as crccl
+
+    logged = []
+    monkeypatch.setattr(crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+
+    class _Acct:
+        is_royal = True
+
+    hist.show_tier_progress(_Acct(), 245, [], [], earns_blocks=False, pending=8)
+    out = "\n".join(logged)
+    assert "253 points" in out                 # 245 + 8
+    assert "profile + 8 pending" in out        # disclosed, not blended

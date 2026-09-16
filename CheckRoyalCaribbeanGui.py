@@ -243,6 +243,10 @@ SCRIPTS = [
               tip='Booking IDs on the NEWER double-points promo, comma-separated: only '
                   'base + suite doubles and the solo point stays single '
                   '((base + suite) x2 + solo) - solo earns 3/night, suite solo 5/night.'),
+        Field('Pending points', '--pending-points', kind='int', width=6,
+              tip='Points earned but not yet posted (e.g. a cruise that just ended). '
+                  'Added to the current balance for tier progress and projections, shown '
+                  'as "+N pending". Applies to every account in this config tab.'),
     ]),
     ScriptDef('Back-to-Back Cabins', 'FindBackToBackCabins.py', uses_config=False, fields=[
         # --ship and --type are required: without them the script falls back to
