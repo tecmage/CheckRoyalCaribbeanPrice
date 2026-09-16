@@ -59,7 +59,9 @@ Filters and tags:
 
 All values are case-insensitive. Prices are the tax-inclusive party total at the public
 rate (current promos included, no loyalty/qualifier discounts). Guarantee categories
-(line picks your room) are always excluded – you can't hold a specific cabin with one.
+(line picks your room) are excluded from same-cabin hunts – you can't hold a specific
+cabin with one – but `--price-chains` includes their rates (tagged `[GTY]`), since
+cabin moves are allowed in that mode.
 
 ---
 
@@ -101,8 +103,8 @@ $200/stateroom charge and can suspend future offers).
 Apprise alerts: `--alert-below N` (or `upgradeAlertBelow: N` in `config.yaml`, handy
 for cron) sends one notification per run listing every upgrade – a higher class, or a
 pricier category within your class – whose category-difference cost is at or below N.
-Uses the same `apprise:` URLs as the main script. Without a threshold set the script
-is display-only.
+Uses the top-level `apprise:` URLs from your config (per-account apprise entries
+are ignored by this tool). Without a threshold set the script is display-only.
 
 Notes: uses the first `accountInfo` entry in your config. Sailings with no inventory
 for sale (sold out / too close to departure) are reported as such rather than priced.
@@ -132,6 +134,8 @@ python CheckRoyalCaribbeanCasinoOffers.py -c config.yaml --warn-days 14
   is configured, sent as a notification
 
 Uses the first `accountInfo` entry in your config; stateless (no history file).
+Royal Caribbean only – the offers API is Club Royale's; Celebrity's Blue Chip Club
+has no equivalent endpoint here, so a `cruiseLine: celebrity` account won't work.
 
 ---
 
@@ -188,8 +192,8 @@ python CheckRoyalCaribbeanGui.py
   ship-search settings are shared. Tabs show ▶ / ✓ / ✖ while running / after a run.
 - **Script picker + options form** generated per script (tooltips on every field).
   Back-to-Back and the Cruise Planner Browser get live dropdowns: the fleet list
-  (brand-filtered, API placeholder ships removed) and, after picking a ship, its
-  actual sailing dates.
+  (brand-filtered, new ships' ALL-CAPS API names normalized to display casing) and,
+  for the Cruise Planner Browser, a ship's actual sailing dates after picking it.
 - **Run / Refresh, Run All Tabs** (each config sequentially), **Stop**, repeat-every-N-hours
   timer, and per-run **HTML reports** (Export button, or auto-export to `reports/`).
 - Output pane: ANSI colors rendered, smart autoscroll, Ctrl+F search, font zoom

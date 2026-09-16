@@ -242,17 +242,6 @@ def discover_types(ship: str, brand: str, voyages: List[Dict[str, Any]],
     return [], None
 
 
-def category_rooms_left(pkg: str, sail: str, ship: str, brand: str, subtype: str,
-                        adults: int, children: int) -> Optional[int]:
-    """roomsLeft for one subtype on a sailing (None = not returned / unknown, 0 = sold out)."""
-    types = get_stateroom_types(pkg, sail, ship, brand, adults, children)
-    for t in types:
-        for s in t.get("stateroomSubtypes", []):
-            if s.get("code") == subtype:
-                return s.get("roomsLeft")
-    return None
-
-
 def get_subtype_decks(pkg: str, sail: str, ship: str, brand: str, stype: str, subtype: str,
                       adults: int, children: int) -> List[str]:
     """Deck codes (e.g. '07') that have availability for a subtype on a sailing."""
@@ -720,7 +709,9 @@ def main() -> None:
     ap.add_argument("--decks", help="Comma-separated deck numbers, e.g. 7,8,9 "
                                     "('all' = no filter, skip the prompt)")
     ap.add_argument("--flip-sides", action="store_true",
-                    help="Flip the odd/even -> port/starboard mapping for this ship")
+                    help="Invert which side the room-number rule (Royal: low/high split, "
+                         "Celebrity: odd/even) maps to port vs starboard, for a ship "
+                         "whose deck plan reads reversed")
     ap.add_argument("--adults", type=int, default=2)
     ap.add_argument("--children", type=int, default=0)
     ap.add_argument("--min-legs", type=int, default=2, help="Minimum consecutive sailings (default 2)")

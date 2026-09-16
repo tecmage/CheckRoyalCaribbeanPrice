@@ -29,7 +29,6 @@ category within your class - whose category-difference cost is at or below N.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
 
@@ -43,8 +42,6 @@ from CheckRoyalCaribbeanPrice import RED, GREEN, YELLOW, BLUE, RESET, USER_AGENT
 ##################################
 # Global Constants & Variables
 ##################################
-CYAN = "\033[96m"
-
 # Ledger discount/option descriptions that mark a Club Royale casino-rate booking
 CASINO_MARKER = re.compile(r"casino|clubr|club royale", re.I)
 
@@ -390,7 +387,7 @@ def delta(v: Optional[float], width: int = 12) -> str:
 
 
 def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
-                   state: Optional[str], limit: int,
+                   limit: int,
                    alert_below: Optional[float] = None,
                    dp340_ok: bool = False) -> List[str]:
     bid = booking.get("bookingId")
@@ -537,9 +534,11 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
                                               TYPE_RANK.get(r["type"]), r["total"],
                                               r.get("name") or "")
             if basis is not None and basis <= alert_below and is_upgrade:
+                sign = "+" if basis > 0 else "-" if basis < 0 else ""
+                via = "" if d_rate is not None else " (vs fare+taxes paid)"
                 hits.append(f"{booking.get('shipCode')} {sail_disp} #{bid}: "
                             f"{booked_cat} -> {r['category']} {r['name']} "
-                            f"for {'+' if basis > 0 else ''}${basis:,.2f} "
+                            f"for {sign}${abs(basis):,.2f}{via} "
                             f"(now ${r['total']:,.2f})")
     if limit and len(rows) > limit:
         log(f"    ... and {len(rows) - limit} more (use --limit 0 to show all)")
@@ -587,7 +586,7 @@ def main() -> None:
                              "upgradeAlertBelow in config.yaml)")
     args = parser.parse_args()
 
-    account, state, loyalty, points, data = build_account(args.config)
+    account, _state, loyalty, points, data = build_account(args.config)
     dp340_ok = dp340_eligible(account, points)
     if dp340_ok:
         log(f"Diamond Plus 340+: solo bookings will be priced with the DP340 code")
@@ -617,13 +616,14 @@ def main() -> None:
             log(f"\n{YELLOW}Skipping booking {booking.get('bookingId')} "
                 f"(no sail date or amend token).{RESET}")
             continue
-        all_hits += report_booking(account, booking, loyalty, state, args.limit,
+        all_hits += report_booking(account, booking, loyalty, args.limit,
                                    alert_below=alert_below, dp340_ok=dp340_ok)
 
     if alert_below is not None:
         if all_hits:
             body = (f"{len(all_hits)} upgrade(s) at or below ${alert_below:,.2f} "
-                    f"(category-difference basis):\n" + "\n".join(f"- {h}" for h in all_hits))
+                    f"(category-difference basis unless noted):\n"
+                    + "\n".join(f"- {h}" for h in all_hits))
             log(f"\n{GREEN}{body}{RESET}")
             if apobj is not None:
                 apobj.notify(body=body, title="Cruise Upgrade Opportunity", body_format=crccl.NotifyFormat.TEXT)

@@ -334,7 +334,7 @@ def test_booked_subtype_resolves_renamed_funnel_code(monkeypatch):
     booking = {"bookingId": "1234567", "sailDate": "20270111", "shipCode": "OV",
                "stateroomNumber": "9999", "stateroomSubtype": "U",   # booking-era code
                "passengersInStateroom": [{"stateroomCategoryCode": "2U", "firstName": "Solo"}]}
-    up.report_booking(None, booking, "123456", "FL", limit=0)
+    up.report_booking(None, booking, "123456", limit=0)
 
     assert captured["subtype"] == "V"      # priced under the renamed funnel code
     assert any("769.00" in s for s in logged), "booked category failed to price"
@@ -368,7 +368,7 @@ def test_renamed_fallback_skips_connecting_rooms(monkeypatch):
     booking = {"bookingId": "1234567", "sailDate": "20270111", "shipCode": "OV",
                "stateroomNumber": "9999", "stateroomSubtype": "U",
                "passengersInStateroom": [{"stateroomCategoryCode": "2U", "firstName": "Solo"}]}
-    up.report_booking(None, booking, "123456", "FL", limit=0)
+    up.report_booking(None, booking, "123456", limit=0)
 
     # old code matched the first letters-compatible row (the connecting IC)
     assert captured["subtype"] == "V"
@@ -397,7 +397,7 @@ def test_dl_paid_uses_fare_plus_taxes_not_gross(monkeypatch):
                "stateroomNumber": "7123", "stateroomSubtype": "D",
                "passengersInStateroom": [{"stateroomCategoryCode": "2D", "firstName": "A"},
                                           {"stateroomCategoryCode": "2D", "firstName": "B"}]}
-    up.report_booking(None, booking, "123456", "FL", limit=0)
+    up.report_booking(None, booking, "123456", limit=0)
 
     out = "\n".join(logged)
     assert "Reprice basis (fare + taxes): $1,700.00" in out

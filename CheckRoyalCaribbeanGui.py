@@ -226,9 +226,10 @@ SCRIPTS = [
         Field('Reservations (comma-sep)', '--reservation', width=22,
               tip='Only check these reservation IDs, comma-separated. Blank = every booking.'),
         Field('Limit', '--limit', kind='int', width=6,
-              tip='Stop after this many bookings (0 or blank = all).'),
+              tip='Max categories listed per booking (0 or blank = all; alerts still scan every category).'),
         Field('Alert below $', '--alert-below', kind='float', width=8,
-              tip='Send an Apprise alert when an upgrade for the whole cabin costs less than this.'),
+              tip="Send an Apprise alert when a higher-class category's dl-rate (whole-cabin "
+                  'upgrade delta) is at or below this amount.'),
     ]),
     ScriptDef('Casino Offers', 'CheckRoyalCaribbeanCasinoOffers.py', uses_config=True, fields=[
         Field('Warn days', '--warn-days', kind='int', default='14', width=6,
@@ -263,11 +264,12 @@ SCRIPTS = [
               tip="Category code to match, e.g. 4D. 'all' = every category. Royal only "
                   "advertises each family's cheapest tier, but sister tiers (2U alongside "
                   "4U) may exist at a higher price - any code can be entered here."),
-        Field('Subtype letter (D = 1D,2D,4D…; prefer Category)', '--sub', width=5,
-              tip='A subtype is the letter its categories share: D matches 1D, 2D, 4D… '
+        Field('Subtype code (D = 1D,2D,4D…; prefer Category)', '--sub', width=5,
+              tip='A subtype is the code its categories share: D matches 1D, 2D, 4D… '
+                  '(some are two letters since the 2026 renames: EX, DW, CL). '
                   'Usually leave this blank and set Category instead.'),
         Field('Side', '--side', kind='choice', choices=('', 'any', 'port', 'starboard', 'both'), width=10,
-              tip="Port/starboard preference. 'any' = no preference, 'both' = show each side separately."),
+              tip="Port/starboard preference. 'any' and 'both' both mean no filter (aliases)."),
         Field('Decks (e.g. 7,8,9)', '--decks', width=10,
               tip='Comma-separated deck numbers to include; blank = any deck.'),
         Field('After (YYYY-MM-DD)', '--after', width=11,
@@ -275,7 +277,7 @@ SCRIPTS = [
         Field('Before (YYYY-MM-DD)', '--before', width=11,
               tip='Only sailings on or before this date.'),
         Field('Sail date (YYYY-MM-DD)', '--saildate', width=11,
-              tip='Check one specific sailing (and the legs after it) instead of scanning the schedule.'),
+              tip='List one specific sailing\'s open cabins instead of hunting back-to-backs.'),
         Field('Adults', '--adults', kind='int', width=4,
               tip='Guests used for the availability query (default 2).'),
         Field('Children', '--children', kind='int', width=4,
@@ -289,8 +291,10 @@ SCRIPTS = [
                   'cheapest category per class on every leg with per-night breakdowns and chain '
                   'totals; includes guarantee (GTY) rates. Type/Category/Side/Deck filters are '
                   'ignored in this mode.'),
-        Field('Flip sides OK', '--flip-sides', kind='check',
-              tip='Accept chains that switch between port and starboard mid-run.'),
+        Field('Flip port/starboard', '--flip-sides', kind='check',
+              tip='Invert which side the room-number rule maps to port vs starboard, '
+                  'for a ship whose deck plan reads reversed. Does NOT allow '
+                  'mixed-side chains.'),
         Field('Hide avoid-list', '--hide-avoid', kind='check',
               tip='Hide cabins that are on the known avoid list.'),
         Field('Hump only', '--hump-only', kind='check',
