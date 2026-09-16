@@ -83,6 +83,24 @@ def build_account(config_path: str):
     return account, state, loyalty, points, data
 
 
+def _occupancy(booking: Dict[str, Any]) -> Tuple[int, int]:
+    """(adults, children) for pricing quotes, from guest birthdates vs the sail
+    date (same 12-year threshold as the main checker). The funnel prices child
+    berths differently, so quoting every guest as an adult skewed both deltas
+    on family bookings. A guest with no birthdate counts as an adult - the
+    safer default, and the previous behavior for all-adult bookings."""
+    guests = booking.get("passengersInStateroom") or []
+    sail = booking.get("sailDate")
+    adults = children = 0
+    for g in guests:
+        birth = g.get("birthdate")
+        if birth and sail and not crccl.above_age_on_sail_date(birth, sail, 12):
+            children += 1
+        else:
+            adults += 1
+    return max(1, adults), children
+
+
 def dp340_eligible(account, points) -> bool:
     """Diamond Plus 340+ single-supplement tier - same rule as the main checker
     (the 175-point figure was a corrected Royal PDF typo; 340 stands)."""
@@ -231,14 +249,14 @@ def get_sailing_inventory(account, booking: Dict[str, Any], loyalty: Optional[st
     returns nothing and the coupon is dropped, mirroring the main checker)."""
     sd = str(booking.get("sailDate") or "")
     sail = f"{sd[0:4]}-{sd[4:6]}-{sd[6:8]}" if len(sd) == 8 else sd
-    guests = booking.get("passengersInStateroom") or []
+    adults, children = _occupancy(booking)
     params = {
         "packageCode": booking.get("packageCode"), "sailDate": sail,
         "country": booking.get("bookingOfficeCountryCode") or "USA",
         "selectedCurrencyCode": booking.get("bookingCurrency") or "USD",
         "shipCode": (booking.get("packageCode") or "")[0:2],
         "cabinClassType": "INTERIOR", "roomIndex": "0",
-        "r0a": str(max(1, len(guests))), "r0c": "0",
+        "r0a": str(adults), "r0c": str(children),
         "r0b": "n", "r0r": "n", "r0s": "n", "r0q": "n", "r0t": "n",
         "r0d": "INTERIOR", "r0D": "y", "rgVisited": "true", "r0C": "y",
     }
@@ -290,8 +308,9 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
     sd = str(booking.get("sailDate") or "")
     sail = f"{sd[0:4]}-{sd[4:6]}-{sd[6:8]}" if len(sd) == 8 else sd
     guests = booking.get("passengersInStateroom") or []
+    adults, children = _occupancy(booking)
     room: Dict[str, Any] = {
-        "adultCount": max(1, len(guests)), "childCount": 0,
+        "adultCount": adults, "childCount": children,
         "stateroomTypeCode": stype, "stateroomSubtypeCode": subtype,
         "accessible": False, "selectionFallbackStrategy": "RECOMMENDATION",
         "editMode": True, "reset": False, "taxesAndFeesBundled": True,

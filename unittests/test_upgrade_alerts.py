@@ -368,3 +368,47 @@ def test_dl_paid_uses_fare_plus_taxes_not_gross(monkeypatch):
     assert "$350.00" in out                       # excluded add-ons disclosed
     # candidate 2100 - 1700 = +400 (NOT 2100 - 2050 = +50)
     assert "+$400.00" in out and "+$50.00" not in out
+
+
+def test_occupancy_prices_children_as_children(monkeypatch):
+    """Both pricing calls previously hardcoded r0c=0/childCount=0 and counted
+    every guest as an adult; child berths price differently, skewing deltas."""
+    import json as _json
+    import CheckRoyalCaribbeanUpgrades as up
+    from unittest.mock import MagicMock
+
+    family = {"sailDate": "20270320", "packageCode": "WN07X123",
+              "passengersInStateroom": [
+                  {"firstName": "A", "birthdate": "19850101"},   # adult
+                  {"firstName": "B", "birthdate": "19870601"},   # adult
+                  {"firstName": "C", "birthdate": "20200101"},   # child (7 at sailing)
+                  {"firstName": "D"},                            # no birthdate -> adult
+              ]}
+    assert up._occupancy(family) == (3, 1)
+    assert up._occupancy({"passengersInStateroom": []}) == (1, 0)   # never zero adults
+
+    captured = {}
+    monkeypatch.setattr(up, "_rsc_get",
+                        lambda account, url, params: captured.update(rsc=dict(params)) or None)
+    monkeypatch.setattr(up, "log", lambda *a, **k: None)
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+    up.get_sailing_inventory(_Acct(), family, "123456")
+    assert captured["rsc"]["r0a"] == "3" and captured["rsc"]["r0c"] == "1"
+
+    class _Sess:
+        def post(self, url, json=None, headers=None):
+            captured.update(rooms=json)
+            return None
+
+    class _Access:
+        session = _Sess()
+
+    class _Acct2:
+        url_brand = "royalcaribbean"
+        is_royal = True
+        access = _Access()
+    up.get_category_prices(_Acct2(), family, "D", "BALCONY", "123456")
+    room = captured["rooms"]["rooms"][0]
+    assert room["adultCount"] == 3 and room["childCount"] == 1
