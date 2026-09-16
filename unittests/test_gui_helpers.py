@@ -240,7 +240,7 @@ def test_migrate_form_values():
     out = gui.migrate_form_values(mixed, labels)
     assert out['/cfg/config.yaml.jim'] == {'Cabin Upgrades': {'--limit': '9'}}
     assert out['*shared*']['Cabin Upgrades'] == {'--limit': '5'}
-    assert 'Cabin Upgrades' not in out or out.get('Cabin Upgrades') is None or True
+    assert 'Cabin Upgrades' not in out   # flat entry migrated, not left behind
     assert set(out) == {'*shared*', '/cfg/config.yaml.jim'}
     assert gui.migrate_form_values('junk', labels) == {}
 

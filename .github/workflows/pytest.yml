@@ -3,12 +3,12 @@ name: Run Unit Tests
 on:
   # 1. Automatically run on pushes to main
   push:
-    branches: [ "main" ]
+    branches: [ "main", "fork-tools" ]
     paths-ignore:
       - '**/**.md' # Optional: Ignores READMEs in subdirectories
   # 2. Automatically run on incoming Pull Requests targeting main
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "fork-tools" ]
     paths-ignore:
       - '**/**.md' # Optional: Ignores READMEs in subdirectories
       

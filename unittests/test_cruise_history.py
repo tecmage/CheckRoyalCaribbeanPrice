@@ -204,3 +204,67 @@ def test_old_promo_cap_warning_excludes_new_promo_bookings(monkeypatch):
         rows, {}, "JIM EXAMPLE",
         promo_ids=frozenset({"1000001", "1000002", "1000003"}))
     assert any("caps at" in s for s in logged)
+
+
+def test_old_promo_window_gate():
+    """The original double-points promo only covers Sep 2026 - Apr 2027 sailings:
+    a flagged booking outside the window earns single points with a visible
+    'ignored' note; the window edges themselves double."""
+    from CheckRoyalCaribbeanCruiseHistory import upcoming_earnings
+
+    outside = _promo_booking("1234567", guests=1, sail="20270601")
+    inside = _promo_booking("2345678", guests=1, sail="20261001")
+    at_end = _promo_booking("3456789", guests=1, sail="20270430")
+    ids = frozenset({"1234567", "2345678", "3456789"})
+    rows = {r[1]["bookingId"]: r for r in
+            upcoming_earnings([outside, inside, at_end], None, promo_ids=ids)}
+
+    assert rows["1234567"][2] == 14                        # 7n x2, NOT doubled
+    assert "--double-points ignored" in rows["1234567"][3]
+    assert rows["2345678"][2] == 28                        # in-window doubles
+    assert rows["3456789"][2] == 28                        # end edge doubles
+
+
+def test_show_yearly_totals_and_projections(monkeypatch):
+    """Past years aggregate cruises/nights/points with a running total; booked
+    cruises appear as 'est' rows and a 'w/ booked' summary line."""
+    import CheckRoyalCaribbeanCruiseHistory as hist
+
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    sailings = [
+        {"sailingDate": "20240301", "itineraryNightsQuantity": 7, "points": 7},
+        {"sailingDate": "20241101", "itineraryNightsQuantity": 3, "points": 3},
+        {"sailingDate": "20250601", "itineraryNightsQuantity": 7, "points": 14},
+    ]
+    upcoming = [("20260901", {"numberOfNights": 7}, 14, "7n x2 (solo)")]
+    hist.show_yearly(sailings, upcoming)
+
+    out = [hist.crccl.StripAnsiFilter.ANSI_REGEX.sub("", s) for s in logged]
+    def row(prefix):
+        return next((l.split() for l in out if l.strip().startswith(prefix)), None)
+
+    assert row("2024") == ["2024", "2", "10", "10", "10"]
+    assert row("2025") == ["2025", "1", "7", "14", "24"]
+    assert row("2026 est") == ["2026", "est", "+1", "+7", "+14", "38", "(booked)"]
+    assert row("total") == ["total", "3", "17", "24"]
+    assert row("w/ booked") == ["w/", "booked", "4", "24", "38"]
+
+
+def test_show_pending_points_lists_unposted_sailings(monkeypatch):
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    from datetime import date, timedelta
+
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    hist.show_pending_points([{"sail_date": "20260810", "ship": "Wonder of the Seas",
+                               "ended": date.today() - timedelta(days=5),
+                               "est_points": 14}])
+    out = "\n".join(logged)
+    assert "Points not posted yet (1 sailed cruise(s)" in out
+    assert "Wonder of the Seas" in out and "ended 5d ago" in out
+    assert "~14 pts expected" in out
+
+    logged.clear()
+    hist.show_pending_points([])
+    assert logged == []   # nothing pending prints nothing

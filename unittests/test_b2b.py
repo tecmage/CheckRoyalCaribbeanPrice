@@ -329,3 +329,78 @@ def test_side_of_letter_suffixed_cabins():
     kept = m.filter_side([{"cabin": "GTY"}, {"cabin": "8123"}], "port", False,
                          by_number=True, split=500)
     assert [c["cabin"] for c in kept] == ["GTY", "8123"]
+
+
+##################################
+# get_open_cabins price-resolution ladder
+##################################
+class _FakeResp:
+    def __init__(self, payload):
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _rooms_payload():
+    """One deck's /api/v1/rooms answer exercising every rung of the ladder."""
+    return {"rooms": [{
+        "options": {"stateroomTypes": [{"stateroomSubtypes": [
+            {"code": "D", "categoryCode": "1D",
+             "pricing": {"invoice": {"total": 2000.0}}},
+            {"code": "B", "categoryCode": "2B",
+             "pricing": {"invoice": {"total": 2500.0}}},
+        ]}]},
+        "roomNumbers": {"categories": [
+            # rung 1: category record carries its own price -> exact
+            {"categoryCode": "4D", "pricing": {"invoice": {"total": 1800.0}},
+             "cabins": [{"cabinNumber": "10234", "positionCode": "M"}]},
+            # rung 1 via an alternate probed field name -> still exact
+            {"categoryCode": "5D", "startingPrice": 1900.0,
+             "cabins": [{"cabinNumber": "10240", "positionCode": "M"}]},
+            # rung 2: no own price, but it IS a lead-in category -> exact
+            {"categoryCode": "1D",
+             "cabins": [{"cabinNumber": "10236", "positionCode": "M"}]},
+            # rung 3: neither -> subtype's cheapest as an approximation, not exact
+            {"categoryCode": "3D",
+             "cabins": [{"cabinNumber": "10238", "positionCode": "M"}]},
+        ]},
+    }]}
+
+
+def test_open_cabins_price_ladder(monkeypatch):
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return _FakeResp(_rooms_payload())
+
+    monkeypatch.setattr(m, "get_subtype_decks", lambda *a, **k: ["07"])
+    monkeypatch.setattr(m, "_post", fake_post)
+
+    cabins = m.get_open_cabins("PKG7NT", "20270101", "OV", "R", "BALCONY", "D", 2, 0)
+    got = {c["cabin"]: (c["price"], c["price_exact"]) for c in cabins}
+    assert got == {
+        "10234": (1800.0, True),    # own category price
+        "10240": (1900.0, True),    # own price under an alternate field
+        "10236": (2000.0, True),    # lead-in category's advertised price
+        "10238": (2000.0, False),   # approximated from the subtype lead-in
+    }
+    # Sept 2026: this endpoint is POST-with-JSON-body; the body must carry the
+    # room filter (the old GET-with-params form gets a blanket Akamai 403)
+    url, kwargs = calls[0]
+    assert url.endswith("/room-selection/api/v1/rooms")
+    body = kwargs.get("json")
+    assert body and body["rooms"][0]["stateroomSubtypeCode"] == "D"
+    assert body["rooms"][0]["room"]["deckCode"] == "07"
+
+
+def test_open_cabins_skips_failed_deck(monkeypatch):
+    """A non-200 on one deck skips that deck instead of crashing the scan."""
+    responses = iter([None, _FakeResp(_rooms_payload())])
+    monkeypatch.setattr(m, "get_subtype_decks", lambda *a, **k: ["06", "07"])
+    monkeypatch.setattr(m, "_post", lambda url, **k: next(responses))
+    cabins = m.get_open_cabins("PKG7NT", "20270101", "OV", "R", "BALCONY", "D", 2, 0)
+    assert {c["deck"] for c in cabins} == {"07"}
+    assert len(cabins) == 4

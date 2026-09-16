@@ -486,3 +486,48 @@ def test_category_prices_retries_without_dp340_on_failure(monkeypatch):
     prices = up.get_category_prices(_Acct(), booking, "V", "INTERIOR", "123456", dp340=True)
     assert calls == ["DP340", None]     # coded attempt, then uncoded retry
     assert prices == {"2U": 769.0}
+
+
+def test_sailing_inventory_parses_rsc_payload(monkeypatch):
+    """The type-and-subtype RSC body parses into flat rows: guarantee flag,
+    connecting detection from the name, missing pricing -> total None (a row is
+    still emitted so 'listed but unpriced' is distinguishable from 'absent')."""
+    import json
+    import CheckRoyalCaribbeanUpgrades as up
+
+    payload = {"rooms": [{"options": {"stateroomTypes": [
+        {"code": "INTERIOR", "stateroomSubtypes": [
+            {"code": "ZI", "categoryCode": "ZI", "name": "Interior GTY",
+             "guarantee": True,
+             "pricing": {"invoice": {"total": 655.0},
+                         "refundability": "DEPOSIT_NOT_REFUNDABLE"}},
+            {"code": "V", "categoryCode": "4U", "name": "Interior",
+             "pricing": {"invoice": {"total": 756.5}}},
+        ]},
+        {"code": "BALCONY", "stateroomSubtypes": [
+            {"code": "DC", "categoryCode": "4DC", "name": "Connecting Balcony",
+             "pricing": {}},
+        ]},
+    ]}}]}
+
+    class _Resp:
+        status_code = 200
+        text = json.dumps(payload)
+
+    monkeypatch.setattr(up, "_rsc_get", lambda account, url, params: _Resp())
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+
+    booking = {"sailDate": "20270815", "packageCode": "WN07X123",
+               "passengersInStateroom": [{"firstName": "Solo"}]}
+    rows = up.get_sailing_inventory(_Acct(), booking, "123456")
+    assert rows == [
+        {"type": "INTERIOR", "subtype": "ZI", "category": "ZI", "name": "Interior GTY",
+         "guarantee": True, "connecting": False, "total": 655.0,
+         "refundability": "DEPOSIT_NOT_REFUNDABLE"},
+        {"type": "INTERIOR", "subtype": "V", "category": "4U", "name": "Interior",
+         "guarantee": False, "connecting": False, "total": 756.5, "refundability": None},
+        {"type": "BALCONY", "subtype": "DC", "category": "4DC", "name": "Connecting Balcony",
+         "guarantee": False, "connecting": True, "total": None, "refundability": None},
+    ]
