@@ -886,7 +886,8 @@ def main() -> None:
     # Split each type's subtypes into pickable vs guarantee. Guarantee categories (X-prefixed,
     # guarantee=true) let the line assign your room, so you can't hold a specific cabin across
     # legs - exclude them from a back-to-back cabin search.
-    type_subs = [(t["code"], s) for t in types if t["code"] in stypes for s in t["stateroomSubtypes"]]
+    type_subs = [(t["code"], s) for t in types if t["code"] in stypes
+                 for s in t.get("stateroomSubtypes") or []]
     pickable = [(st, s.get("code"), s.get("categoryCode")) for st, s in type_subs if not s.get("guarantee")]
     guarantees = sorted({s.get("categoryCode") or s.get("code") for _, s in type_subs if s.get("guarantee")})
     sub_name = {(st, s.get("code")): (s.get("name") or "") for st, s in type_subs}
@@ -935,7 +936,7 @@ def main() -> None:
     # --connecting-permitted keeps them (still tagged [connecting]). An explicit category or
     # subtype request is always honored.
     connecting_pairs = {(t["code"], s.get("code")) for t in types if t["code"] in stypes
-                        for s in t["stateroomSubtypes"]
+                        for s in t.get("stateroomSubtypes") or []
                         if "connect" in (s.get("name") or "").lower()}
     if not args.connecting_permitted and not (args.subtype or category):
         subtype_pairs = [p for p in subtype_pairs if p not in connecting_pairs] or subtype_pairs
