@@ -309,9 +309,11 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
                "content-type": "application/json",
                "brand": "R" if account.is_royal else "C", "country": "USA"}
     try:
-        r = account.access.session.get(
+        # Sept 2026: Royal switched this endpoint to POST-with-JSON-body; the old
+        # GET-with-filter-param form now gets a blanket Akamai 403
+        r = account.access.session.post(
             f"https://www.{account.url_brand}.com/room-selection/api/v1/rooms",
-            params={"filter": json.dumps(flt)}, headers=headers)
+            json=flt, headers=headers)
     except Exception:
         return {}
     if not r or r.status_code != 200:

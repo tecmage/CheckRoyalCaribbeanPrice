@@ -85,6 +85,14 @@ def _get(url: str, **kwargs) -> Optional[requests.Response]:
         return None
 
 
+def _post(url: str, **kwargs) -> Optional[requests.Response]:
+    try:
+        return session.post(url, timeout=45, **IMPERSONATE, **kwargs)
+    except Exception as e:
+        print(f"{RED}Request failed: {e}{RESET}")
+        return None
+
+
 def _extract_json_array(text: str, key: str) -> Optional[list]:
     """Bracket-count a "key": [ ... ] array out of an RSC/text stream."""
     m = re.search(rf'"{re.escape(key)}"\s*:\s*\[', text)
@@ -284,8 +292,10 @@ def get_open_cabins(pkg: str, sail: str, ship: str, brand: str, stype: str, subt
                           "editMode": True, "reset": False, "taxesAndFeesBundled": True,
                           "room": {"deckCode": dc}}],
                "platform": "web"}
-        r = _get(f"https://www.{host}.com/room-selection/api/v1/rooms",
-                 params={"filter": json.dumps(flt)}, headers=hdr)
+        # Sept 2026: Royal switched this endpoint to POST-with-JSON-body; the old
+        # GET-with-filter-param form now gets a blanket Akamai 403
+        r = _post(f"https://www.{host}.com/room-selection/api/v1/rooms",
+                  json=flt, headers=hdr)
         if not r or r.status_code != 200:
             continue
         try:
