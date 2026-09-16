@@ -340,6 +340,40 @@ def test_booked_subtype_resolves_renamed_funnel_code(monkeypatch):
     assert any("769.00" in s for s in logged), "booked category failed to price"
 
 
+def test_renamed_fallback_skips_connecting_rooms(monkeypatch):
+    """The letters fallback must not resolve a booked code to a connecting-room
+    subtype: connecting categories price differently and are excluded from the
+    upgrade table, so resolving to one priced the wrong product."""
+    import CheckRoyalCaribbeanUpgrades as up
+    inventory = [
+        {"type": "INTERIOR", "subtype": "IC", "category": "4U", "name": "Interior Connecting",
+         "guarantee": False, "connecting": True, "total": 700.0, "refundability": None},
+        {"type": "INTERIOR", "subtype": "V", "category": "4U", "name": "Interior",
+         "guarantee": False, "connecting": False, "total": 756.0, "refundability": None},
+    ]
+    captured = {}
+
+    def fake_cat_prices(account, booking, subtype, stype, loyalty, dp340=False):
+        captured["subtype"] = subtype
+        return {"2U": 769.0}
+
+    monkeypatch.setattr(up, "get_sailing_inventory", lambda *a, **k: inventory)
+    monkeypatch.setattr(up, "get_category_prices", fake_cat_prices)
+    monkeypatch.setattr(up, "read_ledger", lambda a, b: {
+        "gross": 700.0, "original_fare": 700.0, "discounted_fare": 600.0, "discount": -100.0,
+        "taxes": 100.0, "payments_applied": 700.0, "balance_due": None, "deposit_type": None,
+        "casino_items": [], "promo_items": [], "is_casino": False})
+    monkeypatch.setattr(up, "log", lambda m, *a, **k: None)
+
+    booking = {"bookingId": "1234567", "sailDate": "20270111", "shipCode": "OV",
+               "stateroomNumber": "9999", "stateroomSubtype": "U",
+               "passengersInStateroom": [{"stateroomCategoryCode": "2U", "firstName": "Solo"}]}
+    up.report_booking(None, booking, "123456", "FL", limit=0)
+
+    # old code matched the first letters-compatible row (the connecting IC)
+    assert captured["subtype"] == "V"
+
+
 def test_dl_paid_uses_fare_plus_taxes_not_gross(monkeypatch):
     """A reprice keeps prepaid add-ons: dl-paid must compare candidates against
     fare + taxes, not GROSS_TOTALS (which bundles prepaid gratuities/packages

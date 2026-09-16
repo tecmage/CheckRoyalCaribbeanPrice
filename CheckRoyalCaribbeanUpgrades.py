@@ -461,9 +461,9 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
             # D -> DW): a booking-era code that no longer exists resolves via the
             # subtype whose lead-in category shares its letters, same fallback the
             # main checker's availability gate uses
-            wanted = re.sub(r"[^A-Za-z]", "", booked_sub or booked_cat or "").upper()
+            wanted = re.sub(r"[^A-Za-z]", "", booked_sub).upper()
             renamed = next((r for r in inventory
-                            if not r["guarantee"] and wanted
+                            if not r["guarantee"] and not r["connecting"] and wanted
                             and re.sub(r"[^A-Za-z]", "", r["category"] or "").upper() == wanted), None)
             if renamed:
                 log(f"  Subtype code {booked_sub} no longer offered under that name; "
