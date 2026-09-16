@@ -277,3 +277,32 @@ def test_chain_class_totals_requires_every_leg():
 def test_class_display_order_known_first_then_alpha():
     assert m._class_display_order({"DELUXE", "INTERIOR", "ZZTOP"}) == \
         ["INTERIOR", "DELUXE", "ZZTOP"]
+
+
+##################################
+# Quality / hump tags are balcony-class only
+##################################
+def test_cabin_quality_only_applies_to_balcony_classes():
+    """The quality overlay is transcribed from a BALCONY side-elevation guide
+    (overhangs, pool noise, lifeboats) - interiors and ocean-view windows must
+    never carry its tags."""
+    # A deck/position combo that IS covered by the Quantum overlay
+    deck, pos = next(((d, p) for d, positions in m.QUANTUM_QUALITY.items()
+                      for p, q in positions.items() if q), (None, None))
+    assert deck is not None, "overlay unexpectedly empty"
+    assert m.cabin_quality("OV", f"{deck:02d}", pos, "BALCONY") is not None
+    assert m.cabin_quality("OV", f"{deck:02d}", pos, "DELUXE") is not None
+    assert m.cabin_quality("OV", f"{deck:02d}", pos, "INTERIOR") is None
+    assert m.cabin_quality("OV", f"{deck:02d}", pos, "OUTSIDE") is None
+    assert m.cabin_quality("OV", f"{deck:02d}", pos, None) is None
+
+
+def test_is_hump_only_applies_to_balcony_classes():
+    """Hump = bigger balcony; an interior room number falling in a hump range
+    must not be tagged."""
+    lo, hi = m.QUANTUM_HUMP_RANGES[0]
+    hump_cabin = f"8{lo + 2:03d}"
+    assert m.is_hump("OV", hump_cabin, "BALCONY") is True
+    assert m.is_hump("OV", hump_cabin, "DELUXE") is True
+    assert m.is_hump("OV", hump_cabin, "INTERIOR") is False
+    assert m.is_hump("OV", hump_cabin, None) is False

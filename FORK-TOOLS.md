@@ -51,7 +51,7 @@ Filters and tags:
 | `--decks` | e.g. `8,9,10`; `all` skips the filter |
 | `--saildate` | one date = list that sailing's open cabins instead of hunting chains |
 | `--after` / `--before` | date window for the chain hunt (any common date format) |
-| `--hide-avoid`, `--hump-only` | Quantum-class extras: a deck-guide quality tag (`[recommended]`/`[caution]`/`[avoid]`) and the hump cabins (bigger balconies at the elevator banks, `[hump]`) |
+| `--hide-avoid`, `--hump-only` | Quantum-class extras: a deck-guide quality tag (`[recommended]`/`[caution]`/`[avoid]`) and the hump cabins (bigger balconies at the elevator banks, `[hump]`). Balcony/suite classes only - the guide is balcony geometry, so interiors and ocean-view cabins are never tagged (and `--hump-only` is ignored for them) |
 | `--connecting-permitted` | connecting staterooms are excluded by default; this re-includes them (tagged `[connecting]`) |
 | `--adults` / `--children`, `--min-legs`, `--limit` | occupancy, minimum chain length, output cap |
 | `--brand`, `--sub` | force `R`/`C` when not giving `--ship` (auto-detected otherwise); raw subtype code for power users (usually use `--category`) |

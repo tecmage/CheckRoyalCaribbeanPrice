@@ -411,8 +411,20 @@ QUALITY_TAG = {"good": f"{GREEN}[recommended]{RESET}",
                "avoid": f"{RED}[avoid]{RESET}"}
 
 
-def cabin_quality(ship: str, deck: str, position: Optional[str]) -> Optional[str]:
-    """Deck-guide quality (good/ok/avoid) for a Quantum-class cabin, or None if not covered."""
+# The quality overlay was transcribed from a BALCONY side-elevation guide
+# (overhangs, pool-deck noise above, lifeboat obstructions) and humps mean a
+# bigger BALCONY - both only apply to classes that have one. Interiors and
+# ocean-view (window) cabins get no view/balcony tags.
+VIEW_CLASSES = {"BALCONY", "DELUXE"}
+
+
+def cabin_quality(ship: str, deck: str, position: Optional[str],
+                  stype: Optional[str] = None) -> Optional[str]:
+    """Deck-guide quality (good/ok/avoid) for a Quantum-class BALCONY-class cabin,
+    or None if not covered (non-balcony classes are never tagged - the guide is
+    balcony geometry)."""
+    if stype not in VIEW_CLASSES:
+        return None
     if ship.upper() not in QUANTUM_CLASS:
         return None
     try:
@@ -429,7 +441,11 @@ QUANTUM_HUMP_RANGES = [(143, 185), (224, 262),     # port: forward hump, mid hum
                        (543, 585), (625, 661)]     # starboard: forward hump, mid hump
 
 
-def is_hump(ship: str, cabin: str) -> bool:
+def is_hump(ship: str, cabin: str, stype: Optional[str] = None) -> bool:
+    """Hump = bigger balcony at the elevator banks; meaningless for cabins
+    without one, so non-balcony classes are never tagged."""
+    if stype not in VIEW_CLASSES:
+        return False
     if ship.upper() not in QUANTUM_CLASS:
         return False
     try:
@@ -938,12 +954,14 @@ def main() -> None:
                   f"odd={odd_side}, even={even_side} (measured from the fleet's deck plans). "
                   f"--flip-sides inverts.")
 
-    def keep_cabin(c: Dict[str, Any]) -> bool:
+    def keep_cabin(c: Dict[str, Any], stype: Optional[str] = None) -> bool:
         if category is not None and (c.get("category") or "").upper() != category:
             return False
-        if args.hide_avoid and cabin_quality(ship, c["deck"], c["position"]) == "avoid":
+        if args.hide_avoid and cabin_quality(ship, c["deck"], c["position"], stype) == "avoid":
             return False
-        if args.hump_only and not is_hump(ship, c["cabin"]):
+        # --hump-only only makes sense for balcony classes; for others it would
+        # filter everything out, so it is ignored there
+        if args.hump_only and stype in VIEW_CLASSES and not is_hump(ship, c["cabin"], stype):
             return False
         return True
 
@@ -956,7 +974,7 @@ def main() -> None:
                         get_open_cabins(ship + v["voyageCode"], v["sailDate"], ship, args.brand,
                                         stype, sub, args.adults, args.children,
                                         only_decks=deck_pref),
-                        side, flip_eff, by_number, split_val) if keep_cabin(c)]
+                        side, flip_eff, by_number, split_val) if keep_cabin(c, stype)]
             if not cabs:
                 continue
             found_any = True
@@ -975,9 +993,9 @@ def main() -> None:
                     if shown >= limit:
                         break
                     side_tag = f", {side_of(c['cabin'], flip_eff, by_number, split_val)}" if show_side else ""
-                    q = cabin_quality(ship, c["deck"], c["position"])
+                    q = cabin_quality(ship, c["deck"], c["position"], stype)
                     tags = (f" {QUALITY_TAG[q]}" if q else "")
-                    tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"]) else ""
+                    tags += f" {CYAN}[hump]{RESET}" if is_hump(ship, c["cabin"], stype) else ""
                     tags += f" {MAGENTA}[connecting]{RESET}" if (stype, sub) in connecting_pairs else ""
                     p = price_str(c.get("price"), c.get("price_exact", False))
                     p_tag = f"  {p}" if p else ""
@@ -1011,10 +1029,10 @@ def main() -> None:
                                                         args.brand, stype, sub, args.adults,
                                                         args.children, only_decks=deck_pref),
                                         side, flip_eff, by_number, split_val)
-                 if keep_cabin(c)]
+                 if keep_cabin(c, stype)]
                 for v in chain]
             cab_cat = {c["cabin"]: c.get("category") for leg in leg_cabins for c in leg}
-            cab_q = {c["cabin"]: cabin_quality(ship, c["deck"], c["position"])
+            cab_q = {c["cabin"]: cabin_quality(ship, c["deck"], c["position"], stype)
                      for leg in leg_cabins for c in leg}
             leg_price = [{c["cabin"]: (c.get("price"), c.get("price_exact", False)) for c in leg}
                          for leg in leg_cabins]
@@ -1045,7 +1063,7 @@ def main() -> None:
                 side_tag = f", {side_of(cabin, flip_eff, by_number, split_val)}" if show_side else ""
                 q = cab_q.get(cabin)
                 q_tag = f" {QUALITY_TAG[q]}" if q else ""
-                hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin) else ""
+                hump_tag = f" {CYAN}[hump]{RESET}" if is_hump(ship, cabin, stype) else ""
                 conn_tag = f" {MAGENTA}[connecting]{RESET}" if (stype, sub) in connecting_pairs else ""
                 total = span_total(cabin, i, j)
                 total_tag = f"  {total} total" if total else ""
