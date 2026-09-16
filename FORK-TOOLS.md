@@ -143,6 +143,7 @@ and upcoming bookings, then:
 ```
 python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml
 python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --double-points 123456,789012
+python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --new-double-points 345678
 ```
 
 - Each person's past sailings: date, ship, nights, cabin, itinerary, points earned
@@ -150,8 +151,11 @@ python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --double-points 123456
   ship + sail date + cabin (the ledger only records the account holder)
 - Upcoming bookings with the roommates the API lists per stateroom
 - C&A points projection for booked cruises (suite/solo multipliers, crystal-block and
-  Diamond-Plus milestone math), with `--double-points` to mark bookings made during a
-  double-points promo (the API has no booking date, so you supply the IDs)
+  Diamond-Plus milestone math), with `--double-points` to mark bookings made during the
+  original double-points promo ((base + suite + solo) x2) and `--new-double-points` for
+  the newer promo shape that doubles only base + suite and pays the solo point single
+  ((base + suite) x2 + solo: solo earns 3/night, suite solo 5/night). The API has no
+  booking date, so you supply the IDs either way
 
 Output is console-only (plus `logFile` if configured); nothing is written to disk.
 A 5-second cooldown is applied between account logins (same as the main script), and

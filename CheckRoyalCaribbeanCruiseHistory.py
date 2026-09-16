@@ -463,9 +463,16 @@ def get_holder_name(account) -> Optional[str]:
 
 
 def upcoming_earnings(bookings: List[Dict[str, Any]], holder_name: Optional[str],
-                      promo_ids: frozenset = frozenset()
+                      promo_ids: frozenset = frozenset(),
+                      new_promo_ids: frozenset = frozenset()
                       ) -> List[Tuple[str, Dict[str, Any], int, str]]:
-    """Project C&A points from booked future cruises: (sailDate, booking, pts, why)."""
+    """Project C&A points from booked future cruises: (sailDate, booking, pts, why).
+
+    Two promo shapes exist: the original double-points promo doubled the whole
+    per-night rate ((base + suite + solo) x2); the newer one doubles only the
+    base+suite part and pays the solo supplement single ((base + suite) x2 + solo),
+    so solo earns 3/night (not 4) and suite-solo 5/night (not 6). Non-solo
+    bookings earn the same either way."""
     today = date.today().strftime("%Y%m%d")
     rows = []
     for b in bookings:
@@ -488,7 +495,15 @@ def upcoming_earnings(bookings: List[Dict[str, Any]], holder_name: Optional[str]
         why = ", ".join(w for w, on in (("suite", suite), ("solo", solo)) if on) or "standard"
         pts = nights * rate
         desc = f"{nights}n x{rate} ({why})"
-        if str(b.get("bookingId") or "") in promo_ids:
+        bid = str(b.get("bookingId") or "")
+        if bid in new_promo_ids:
+            # New promo shape: only base + suite doubles; the solo point stays single.
+            # No sail-window gate - Royal has not published one for this promo, and
+            # the ids are user-supplied explicitly.
+            new_rate = (1 + (1 if suite else 0)) * 2 + (1 if solo else 0)
+            pts = nights * new_rate
+            desc = f"{nights}n x{new_rate} ({why} + new double-points promo: base x2 + solo x1)"
+        elif bid in promo_ids:
             if PROMO_SAIL_START <= sail <= PROMO_SAIL_END:
                 pts *= 2
                 desc = f"{nights}n x{rate}x2 ({why} + double-points promo)"
@@ -684,21 +699,32 @@ def main() -> None:
     parser.add_argument("-c", "--config", default="config.yaml",
                         help="Path to configuration YAML file (default: config.yaml)")
     parser.add_argument("--double-points", default="", metavar="ID,ID",
-                        help="Comma-separated booking IDs that qualify for the C&A "
-                             "double-points promo (booked Jul 21-31 2026, sailing "
-                             "Sep 2026 - Apr 2027, non-casino, non-TA/TP, max 2/member)")
+                        help="Comma-separated booking IDs that qualify for the original C&A "
+                             "double-points promo: (base + suite + solo) x2 "
+                             "(booked Jul 21-31 2026, sailing Sep 2026 - Apr 2027, "
+                             "non-casino, non-TA/TP, max 2/member)")
+    parser.add_argument("--new-double-points", default="", metavar="ID,ID",
+                        help="Comma-separated booking IDs on the NEWER double-points promo, "
+                             "which doubles only base + suite and pays the solo point single: "
+                             "(base + suite) x2 + solo. Solo earns 3/night, suite solo 5/night")
     args = parser.parse_args()
     promo_ids = frozenset(i.strip() for i in args.double_points.split(",") if i.strip())
+    new_promo_ids = frozenset(i.strip() for i in args.new_double_points.split(",") if i.strip())
+    both = promo_ids & new_promo_ids
+    if both:
+        print(f"Booking(s) {', '.join(sorted(both))} given to BOTH promo flags; "
+              f"using the new-promo math for them.", file=sys.stderr)
 
     accounts, skipped = load_accounts(args.config)
     try:
-        _run_report(accounts, skipped, promo_ids)
+        _run_report(accounts, skipped, promo_ids, new_promo_ids)
     finally:
         for account, _loyalty, _points in accounts:
             account.access.session.close()
 
 
-def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset) -> None:
+def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
+                new_promo_ids: frozenset = frozenset()) -> None:
     registry = crccl.ShipRegistry()
     try:
         crccl.get_ship_dictionary_web(registry)
@@ -759,7 +785,7 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset) -
         holder = get_holder_name(account)
         # Manual --double-points wins; otherwise auto-detect from the amend pages
         acct_promo = promo_ids or probe_promo(account, own_bookings, holder)
-        upcoming = upcoming_earnings(own_bookings, holder, acct_promo)
+        upcoming = upcoming_earnings(own_bookings, holder, acct_promo, new_promo_ids)
         eff_points = points or sum(sail_ints(s)[1] for s in sailings)
         earns_blocks = idx == block_idx
         show_upcoming_earnings(upcoming, SHIP_NAMES, holder,

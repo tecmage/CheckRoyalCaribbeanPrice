@@ -235,9 +235,14 @@ SCRIPTS = [
               tip='Highlight offers whose reserve-by deadline is within this many days.'),
     ]),
     ScriptDef('Cruise History', 'CheckRoyalCaribbeanCruiseHistory.py', uses_config=True, fields=[
-        Field('Double-points IDs', '--double-points', width=22,
-              tip='Booking IDs made during a double-points promo window, comma-separated. '
+        Field('Double-points IDs (old promo)', '--double-points', width=22,
+              tip='Booking IDs on the ORIGINAL double-points promo, comma-separated: '
+                  'the whole per-night rate doubles ((base + suite + solo) x2). '
                   'The API has no booking date, so these must be supplied by you.'),
+        Field('New-double-points IDs', '--new-double-points', width=22,
+              tip='Booking IDs on the NEWER double-points promo, comma-separated: only '
+                  'base + suite doubles and the solo point stays single '
+                  '((base + suite) x2 + solo) - solo earns 3/night, suite solo 5/night.'),
     ]),
     ScriptDef('Back-to-Back Cabins', 'FindBackToBackCabins.py', uses_config=False, fields=[
         # --ship and --type are required: without them the script falls back to
