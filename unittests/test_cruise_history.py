@@ -161,3 +161,17 @@ def test_load_accounts_skips_malformed_entry(tmp_path, monkeypatch):
     assert [a[0].username for a in accounts] == ["good@example.com"]
     assert skipped == ["broken@e…"]
     assert any("KeyError" in s for s in logged)
+
+
+def test_unique_account_labels_disambiguates_collisions():
+    """jim@aol.com and jim@att.net both mask to jim@a… - colliding labels merged
+    the household joins, dropping one member's history (finding B10)."""
+    import CheckRoyalCaribbeanCruiseHistory as hist
+
+    class _A:
+        def __init__(self, u): self.username = u
+
+    labels = hist.unique_account_labels(
+        [_A("jim@aol.com"), _A("jim@att.net"), _A("bo@example.com")])
+    assert labels == ["jim@a…", "jim@a… (2)", "bo@e…"]
+    assert len(set(labels)) == 3

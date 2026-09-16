@@ -133,6 +133,19 @@ def account_label(account, idx: int) -> str:
     return mask_username(account.username) or f"account {idx + 1}"
 
 
+def unique_account_labels(accounts: List[Any]) -> List[str]:
+    """Masked labels, disambiguated: jim@aol.com and jim@att.net both mask to
+    "jim@a…", and colliding labels silently merged the household/shared-room
+    joins (one member's history vanished). Collisions get " (2)", " (3)"..."""
+    labels: List[str] = []
+    seen: Dict[str, int] = {}
+    for idx, account in enumerate(accounts):
+        base = account_label(account, idx)
+        seen[base] = seen.get(base, 0) + 1
+        labels.append(base if seen[base] == 1 else f"{base} ({seen[base]})")
+    return labels
+
+
 def missing_note(skipped: List[str], no_history: List[str]) -> Optional[str]:
     """One-line disclosure of who is absent from the cross-account views, so a
     shrunken household/shared-room join is never mistaken for the full picture."""
@@ -865,12 +878,13 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
     hist_pts = [sum(sail_ints(s)[1] for s in f[3]) for f in fetched]
     block_idx = max(range(len(fetched)),
                     key=lambda i: (hist_pts[i], fetched[i][1] or 0))
-    block_holder = account_label(fetched[block_idx][0], block_idx)
+    labels = unique_account_labels([f[0] for f in fetched])
+    block_holder = labels[block_idx]
 
     histories: List[Tuple[str, List[Dict[str, Any]]]] = []
     per_account: List[Tuple[Any, int, List[Dict[str, Any]]]] = []
     for idx, (account, points, lifetime, sailings) in enumerate(fetched):
-        label = account_label(account, idx)
+        label = labels[idx]
         crccl.log(f"\n{BLUE}=== Cruise history: {label} ==={RESET}")
         if lifetime:
             crccl.log(f"Lifetime: {lifetime.get('totalTrips', '?')} cruises, "
@@ -886,7 +900,7 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
 
     # Disclose anyone missing from the joins; with fewer than two usable
     # histories, say why the household sections are absent instead of silence.
-    no_history = [account_label(acc, i)
+    no_history = [labels[i]
                   for i, (acc, _pts, sails) in enumerate(per_account) if not sails]
     absent = missing_note(skipped, no_history)
     if len(histories) > 1:
@@ -902,7 +916,7 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
 
     # Final summary: yearly table, projected earnings from booked cruises, tier progress
     for idx, (account, points, sailings) in enumerate(per_account):
-        crccl.log(f"\n{BLUE}=== Summary: {account_label(account, idx)} ==={RESET}")
+        crccl.log(f"\n{BLUE}=== Summary: {labels[idx]} ==={RESET}")
         own_bookings = bookings if idx == 0 else fetch_bookings(account, idx)
         holder = get_holder_name(account)
         # Manual --double-points wins; otherwise auto-detect from the amend pages
