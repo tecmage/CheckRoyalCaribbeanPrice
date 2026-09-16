@@ -60,16 +60,22 @@ def load_accounts(config_path: str) -> Tuple[List[Any], List[str], Optional[str]
             # Same courtesy pause the main price checker uses between accounts
             crccl.log(f"Sleeping {crccl.ACCOUNT_COOLDOWN_SECONDS} seconds to allow API to cool down between accounts")
             time.sleep(crccl.ACCOUNT_COOLDOWN_SECONDS)
-        account = crccl.AccountInfo(username=a["username"], password=a["password"],
-                                    cruise_line=a.get("cruiseLine", "royalcaribbean"))
-        # login/get_profile call sys.exit on failure; one bad account must not
-        # kill the whole multi-account run
+        # One bad account must not kill the whole multi-account run: login and
+        # get_profile sys.exit on failure, a malformed config entry KeyErrors,
+        # and a 200-with-garbage profile body ValueErrors - skip them all
+        label = mask_username((a.get("username") if isinstance(a, dict) else "") or "") \
+            or f"account {i + 1}"
         try:
+            account = crccl.AccountInfo(username=a["username"], password=a["password"],
+                                        cruise_line=a.get("cruiseLine", "royalcaribbean"))
             account.access = crccl.login(account)
             _state, loyalty, points = crccl.get_profile(account)
         except SystemExit:
-            label = mask_username(a.get("username") or "") or f"account {i + 1}"
             crccl.log(f"{YELLOW}skipping {label}: login failed{RESET}")
+            skipped.append(label)
+            continue
+        except Exception as e:
+            crccl.log(f"{YELLOW}skipping {label}: {type(e).__name__}: {e}{RESET}")
             skipped.append(label)
             continue
         accounts.append((account, loyalty, points))

@@ -135,3 +135,29 @@ def test_tier_progress_shows_pending_adjustment(monkeypatch):
     out = "\n".join(logged)
     assert "253 points" in out                 # 245 + 8
     assert "profile + 8 pending" in out        # disclosed, not blended
+
+
+def test_load_accounts_skips_malformed_entry(tmp_path, monkeypatch):
+    """A config entry missing its password (or any unexpected per-account
+    exception) must skip that account, not kill the multi-account run."""
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    import CheckRoyalCaribbeanPrice as crccl
+    from unittest.mock import MagicMock
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "accountInfo:\n"
+        "  - username: broken@example.com\n"        # no password -> KeyError
+        "  - username: good@example.com\n"
+        "    password: pw\n")
+    monkeypatch.setattr(crccl, "setup_hybrid_logging", lambda *a, **k: None)
+    logged = []
+    monkeypatch.setattr(crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    monkeypatch.setattr(crccl, "login", lambda acct: MagicMock())
+    monkeypatch.setattr(crccl, "get_profile", lambda acct: ("FL", "123456", 42))
+    monkeypatch.setattr(hist.time, "sleep", lambda s: None)
+
+    accounts, skipped, history_db = hist.load_accounts(str(cfg))
+    assert [a[0].username for a in accounts] == ["good@example.com"]
+    assert skipped == ["broken@e…"]
+    assert any("KeyError" in s for s in logged)
