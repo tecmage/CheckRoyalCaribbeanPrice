@@ -158,6 +158,11 @@ python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --new-double-points 34
   booking date, so you supply the IDs either way
 
 Output is console-only (plus `logFile` if configured); nothing is written to disk.
+If `historyDb` is set in config.yaml (the main price checker's opt-in SQLite layer),
+the report also flags **points that haven't posted yet**: cruises the price checker
+snapshotted that have already ended but are missing from the loyalty ledger, with the
+estimated points. Without `historyDb` this check is silently skipped - the API alone
+cannot reveal an unposted cruise.
 A 5-second cooldown is applied between account logins (same as the main script), and
 accounts that fail login or have no sailings are called out in the household/shared-room
 sections rather than silently shrinking them.

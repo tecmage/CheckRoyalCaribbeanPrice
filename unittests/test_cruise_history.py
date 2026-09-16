@@ -70,3 +70,34 @@ def test_new_promo_wins_when_booking_given_to_both_flags():
                              new_promo_ids=frozenset({"1234567"}))
     assert rows[0][2] == 21          # new math (3/night), not old (4/night)
     assert "new double-points" in rows[0][3]
+
+
+def test_pending_ledger_sailings_detects_unposted_points(tmp_path):
+    """A booking snapshotted by the price checker whose cruise has ENDED but
+    which is absent from the loyalty ledger = points not posted yet."""
+    from datetime import date, timedelta
+    from CheckRoyalCaribbeanPrice import PriceHistory
+    from CheckRoyalCaribbeanCruiseHistory import pending_ledger_sailings
+
+    db = str(tmp_path / "h.db")
+    h = PriceHistory(db)
+    h.start_run()
+    ended_sail = (date.today() - timedelta(days=9)).strftime("%Y%m%d")
+    future_sail = (date.today() + timedelta(days=30)).strftime("%Y%m%d")
+    common = dict(account_label="solo@example.com", ship_code="OV",
+                  ship_name="Ovation of the Seas", guest_count=1, stateroom_type="INTERIOR")
+    h.record_booking(reservation_id="1234567", sail_date=ended_sail, nights=4, **common)
+    h.record_booking(reservation_id="7654321", sail_date=future_sail, nights=7, **common)
+
+    # Ledger does NOT contain the ended cruise -> pending, with solo math (4n x2)
+    pending = pending_ledger_sailings(db, "solo@example.com", ledger := [])
+    assert [p["reservation_id"] for p in pending] == ["1234567"]
+    assert pending[0]["est_points"] == 8
+    # Different account -> nothing
+    assert pending_ledger_sailings(db, "other@example.com", []) == []
+    # Once the ledger has it (ship+sailDate), no longer pending
+    posted = [{"shipCode": "OV", "sailingDate": ended_sail}]
+    assert pending_ledger_sailings(db, "solo@example.com", posted) == []
+    # No db configured -> quiet no-op
+    assert pending_ledger_sailings(None, "solo@example.com", []) == []
+    assert pending_ledger_sailings(str(tmp_path / "nope.db"), "solo@example.com", []) == []

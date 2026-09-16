@@ -20,7 +20,9 @@ Add family members' logins to accountInfo in config.yaml to match them up.
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import sqlite3
 import sys
 import time
 
@@ -37,12 +39,14 @@ from CheckRoyalCaribbeanPrice import GREEN, YELLOW, BLUE, RESET
 SHIP_NAMES: Dict[str, str] = {}
 
 
-def load_accounts(config_path: str) -> Tuple[List[Any], List[str]]:
-    """Log every account in. Returns (accounts, skipped) where skipped holds the
-    masked usernames that failed login, for the cross-account views to disclose."""
+def load_accounts(config_path: str) -> Tuple[List[Any], List[str], Optional[str]]:
+    """Log every account in. Returns (accounts, skipped, history_db) where skipped
+    holds the masked usernames that failed login, and history_db is the price
+    checker's optional SQLite path (used to spot sailed-but-unposted points)."""
     with open(config_path) as f:
         data = crccl.expand_env_vars(yaml.safe_load(f)) or {}
     crccl.setup_hybrid_logging(data.get("logFile"))
+    history_db = data.get("historyDb")
 
     entries = data.get("accountInfo") or []
     if not entries:
@@ -72,7 +76,7 @@ def load_accounts(config_path: str) -> Tuple[List[Any], List[str]]:
     if not accounts:
         print("No accounts could log in.", file=sys.stderr)
         sys.exit(1)
-    return accounts, skipped
+    return accounts, skipped, history_db
 
 
 def api_get(account, url: str, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
@@ -411,21 +415,44 @@ def show_yearly(sailings: List[Dict[str, Any]],
         est[sail[:4]][1] += nights
         est[sail[:4]][2] += pts
 
-    crccl.log("  year       cruises  nights  points")
-    for year in sorted(years):
-        cruises, nights, pts = years[year]
-        crccl.log(f"  {year}       {cruises:>7}  {nights:>6}  {pts:>6}")
-    for year in sorted(est):
-        cruises, nights, pts = est[year]
-        crccl.log(f"  {year} est  {'+' + str(cruises):>7}  {'+' + str(nights):>6}  "
-                  f"{'+' + str(pts):>6}  (booked)")
+    # One uniform table (same style as the projections table): history rows and
+    # booked ("est") rows interleaved by year, with a running points total so
+    # each year shows where the balance stood/lands.
+    table = []
+    cum = 0
+    for year in sorted(set(years) | set(est)):
+        if year in years:
+            cruises, nights, pts = years[year]
+            cum += pts
+            table.append((year, str(cruises), str(nights), str(pts), str(cum)))
+        if year in est:
+            cruises, nights, pts = est[year]
+            cum += pts
+            table.append((f"{year} est", f"+{cruises}", f"+{nights}", f"+{pts}", str(cum)))
 
     total = [sum(v[i] for v in years.values()) for i in range(3)]
-    crccl.log(f"  total      {total[0]:>7}  {total[1]:>6}  {total[2]:>6}")
     est_total = [sum(v[i] for v in est.values()) for i in range(3)]
+    summary = [("total", str(total[0]), str(total[1]), str(total[2]), "")]
     if est_total[0]:
-        crccl.log(f"  w/ booked  {total[0] + est_total[0]:>7}  {total[1] + est_total[1]:>6}  "
-                  f"{total[2] + est_total[2]:>6}")
+        summary.append(("w/ booked", str(total[0] + est_total[0]),
+                        str(total[1] + est_total[1]), str(total[2] + est_total[2]), ""))
+
+    headers = ("Year", "Cruises", "Nights", "Points", "Total")
+    widths = [max(len(r[i]) for r in ([headers] + table + summary)) for i in range(5)]
+
+    def emit(r, suffix=""):
+        cells = [r[0].ljust(widths[0])] + [r[i].rjust(widths[i]) for i in range(1, 5)]
+        crccl.log(("  " + "  ".join(cells)).rstrip() + suffix if suffix else
+                  "  " + "  ".join(cells).rstrip())
+
+    crccl.log("  " + "  ".join(h.ljust(widths[i]) if i == 0 else h.rjust(widths[i])
+                               for i, h in enumerate(headers)))
+    crccl.log("  " + "  ".join("-" * w for w in widths))
+    for r in table:
+        emit(r, "  (booked)" if r[0].endswith("est") else "")
+    crccl.log("  " + "  ".join("-" * w for w in widths))
+    for r in summary:
+        emit(r)
     bonus = total[2] - total[1]
     if bonus > 0:
         crccl.log(f"  ({bonus} points above 1x/night, from suite/solo/promo sailings)")
@@ -565,6 +592,57 @@ def show_upcoming_earnings(rows: List[Tuple[str, Dict[str, Any], int, str]],
                   f"the promo caps at {PROMO_MAX_CRUISES} cruises per member{RESET}")
     crccl.log("  (solo-studio rules and unregistered promos can't be known in advance)")
     return total
+
+
+def pending_ledger_sailings(db_path: Optional[str], username: str,
+                            ledger: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Cruises the price checker's historyDb snapshotted for this account that
+    have already ENDED but are absent from the loyalty ledger - i.e. points that
+    have not posted yet. Returns [] when no historyDb is configured/present.
+
+    The API alone cannot reveal an unposted cruise (profile points and ledger
+    both lack it); the bookings snapshot is the only record it happened."""
+    if not db_path or not os.path.exists(db_path):
+        return []
+    posted = {(s.get("shipCode"), s.get("sailingDate")) for s in ledger}
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT reservation_id, ship_code, ship_name, sail_date, nights, "
+                "guest_count, stateroom_type FROM bookings WHERE account_label = ? "
+                "ORDER BY observed_at", (username,)).fetchall()
+    except sqlite3.Error:
+        return []
+    latest: Dict[str, tuple] = {r[0]: r for r in rows}   # last snapshot per reservation
+    out = []
+    today = date.today()
+    for rid, ship_code, ship_name, sail, nights, guest_count, stype in latest.values():
+        try:
+            nights = int(nights or 0)
+            ended = datetime.strptime(sail or "", "%Y%m%d").date() + timedelta(days=nights)
+        except ValueError:
+            continue
+        if not nights or ended >= today or (ship_code, sail) in posted:
+            continue
+        suite = (stype or "").upper() in ("D", "DELUXE", "SUITE")
+        solo = guest_count == 1
+        est = nights * (1 + (1 if suite else 0) + (1 if solo else 0))
+        out.append({"reservation_id": rid, "ship": ship_name or ship_code or "?",
+                    "sail_date": sail, "ended": ended, "est_points": est})
+    return sorted(out, key=lambda p: p["sail_date"])
+
+
+def show_pending_points(pending: List[Dict[str, Any]]) -> None:
+    if not pending:
+        return
+    crccl.log(f"\n{YELLOW}Points not posted yet ({len(pending)} sailed cruise(s) "
+              f"missing from the loyalty ledger):{RESET}")
+    for p in pending:
+        days = (date.today() - p["ended"]).days
+        crccl.log(f"  {pretty_date(p['sail_date'])}  {p['ship']:<26} ended {days}d ago  "
+                  f"~{p['est_points']} pts expected (not yet in totals)")
+    crccl.log("  (points usually post within a few days of debarkation; contact C&A if "
+              "a cruise is still missing after 2 weeks)")
 
 
 def show_tier_progress(account, profile_points: int, sailings: List[Dict[str, Any]],
@@ -731,16 +809,17 @@ def main() -> None:
         print(f"Booking(s) {', '.join(sorted(both))} given to BOTH promo flags; "
               f"using the new-promo math for them.", file=sys.stderr)
 
-    accounts, skipped = load_accounts(args.config)
+    accounts, skipped, history_db = load_accounts(args.config)
     try:
-        _run_report(accounts, skipped, promo_ids, new_promo_ids)
+        _run_report(accounts, skipped, promo_ids, new_promo_ids, history_db)
     finally:
         for account, _loyalty, _points in accounts:
             account.access.session.close()
 
 
 def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
-                new_promo_ids: frozenset = frozenset()) -> None:
+                new_promo_ids: frozenset = frozenset(),
+                history_db: Optional[str] = None) -> None:
     registry = crccl.ShipRegistry()
     try:
         crccl.get_ship_dictionary_web(registry)
@@ -804,6 +883,7 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
         upcoming = upcoming_earnings(own_bookings, holder, acct_promo, new_promo_ids)
         eff_points = points or sum(sail_ints(s)[1] for s in sailings)
         earns_blocks = idx == block_idx
+        show_pending_points(pending_ledger_sailings(history_db, account.username, sailings))
         show_upcoming_earnings(upcoming, SHIP_NAMES, holder,
                                start_points=eff_points, earns_blocks=earns_blocks,
                                promo_ids=acct_promo)
