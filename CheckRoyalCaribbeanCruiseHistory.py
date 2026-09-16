@@ -608,21 +608,31 @@ def pending_ledger_sailings(db_path: Optional[str], username: str,
     try:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
-                "SELECT reservation_id, ship_code, ship_name, sail_date, nights, "
-                "guest_count, stateroom_type FROM bookings WHERE account_label = ? "
+                "SELECT observed_at, reservation_id, ship_code, ship_name, sail_date, "
+                "nights, guest_count, stateroom_type FROM bookings WHERE account_label = ? "
                 "ORDER BY observed_at", (username,)).fetchall()
     except sqlite3.Error:
         return []
-    latest: Dict[str, tuple] = {r[0]: r for r in rows}   # last snapshot per reservation
+    latest: Dict[str, tuple] = {r[1]: r for r in rows}   # last snapshot per reservation
+    # Every snapshot time for this account, to tell "sailed" from "cancelled":
+    # snapshots stop at the sail date either way, but a CANCELLED booking also
+    # vanishes from runs that happen BEFORE its sail date
+    observations = sorted({r[0] for r in rows})
     out = []
     today = date.today()
-    for rid, ship_code, ship_name, sail, nights, guest_count, stype in latest.values():
+    for last_seen, rid, ship_code, ship_name, sail, nights, guest_count, stype in latest.values():
         try:
             nights = int(nights or 0)
-            ended = datetime.strptime(sail or "", "%Y%m%d").date() + timedelta(days=nights)
+            sailed = datetime.strptime(sail or "", "%Y%m%d").date()
+            ended = sailed + timedelta(days=nights)
         except ValueError:
             continue
         if not nights or ended >= today or (ship_code, sail) in posted:
+            continue
+        # Cancelled, not sailed: the price checker ran again before the sail
+        # date and this booking no longer appeared - do not nag about it forever
+        if any(o > last_seen and datetime.strptime(o[:10], "%Y-%m-%d").date() < sailed
+               for o in observations):
             continue
         suite = (stype or "").upper() in ("D", "DELUXE", "SUITE")
         solo = guest_count == 1

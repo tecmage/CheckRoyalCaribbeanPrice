@@ -93,6 +93,22 @@ def test_pending_ledger_sailings_detects_unposted_points(tmp_path):
     pending = pending_ledger_sailings(db, "solo@example.com", ledger := [])
     assert [p["reservation_id"] for p in pending] == ["1234567"]
     assert pending[0]["est_points"] == 8
+
+    # Cancelled, not sailed: a LATER run before the sail date no longer saw the
+    # booking - it must not be flagged forever (audit finding A5)
+    from datetime import datetime, timezone
+    cancelled_sail = (date.today() - timedelta(days=10)).strftime("%Y%m%d")
+    h.record_booking(reservation_id="5550001", sail_date=cancelled_sail, nights=4,
+                     observed_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+                     **common)
+    # a run 15 days ago (still before the sail date) snapshotted OTHER bookings only
+    h.record_booking(reservation_id="5550002", sail_date=future_sail, nights=7,
+                     observed_at=(datetime.now(timezone.utc) - timedelta(days=15)).isoformat(),
+                     **common)
+    pending = pending_ledger_sailings(db, "solo@example.com", [])
+    ids = [p["reservation_id"] for p in pending]
+    assert "5550001" not in ids, "cancelled booking must not be flagged"
+    assert "1234567" in ids      # the genuinely-sailed one still is
     # Different account -> nothing
     assert pending_ledger_sailings(db, "other@example.com", []) == []
     # Once the ledger has it (ship+sailDate), no longer pending
