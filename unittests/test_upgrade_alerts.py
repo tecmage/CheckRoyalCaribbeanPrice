@@ -268,8 +268,9 @@ def test_category_prices_sends_coupon_code_only_when_asked(monkeypatch):
     captured = []
 
     class _Sess:
-        def get(self, url, params=None, headers=None):
-            captured.append(_json.loads(params["filter"]))
+        # The rooms endpoint is POST-with-JSON-body since Sept 2026
+        def post(self, url, json=None, headers=None):
+            captured.append(json)
             return None  # short-circuits after the request
 
     class _Access:
