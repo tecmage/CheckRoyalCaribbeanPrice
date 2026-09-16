@@ -519,15 +519,22 @@ def show_upcoming_earnings(rows: List[Tuple[str, Dict[str, Any], int, str]],
                            start_points: int = 0, earns_blocks: bool = True,
                            promo_ids: frozenset = frozenset()) -> int:
     who = f" for {holder_name}" if holder_name else ""
-    crccl.log(f"\n{BLUE}Projected points from booked cruises{who}:{RESET}")
+    start_txt = f" (starting from {start_points} pts)" if start_points else ""
+    crccl.log(f"\n{BLUE}Projected points from booked cruises{who}{start_txt}:{RESET}")
     if not holder_name:
         crccl.log(f"  {YELLOW}(couldn't read the account holder's name - linked bookings "
                   f"for other people's rooms may be counted below){RESET}")
     if not rows:
         crccl.log("  (no upcoming bookings found)")
         return 0
+
+    # Build ANSI-free cells first so the column-width math is never skewed by
+    # color codes (same pattern as the main script's check-in/payment table);
+    # milestone notes are colored at print time only.
+    strip_ansi = crccl.StripAnsiFilter.ANSI_REGEX.sub
     total = 0
     cum = start_points
+    table = []
     for sail, b, pts, why in rows:
         ship = ships.get(b.get("shipCode"), b.get("shipCode") or "?")
         before, cum = cum, cum + pts
@@ -536,11 +543,20 @@ def show_upcoming_earnings(rows: List[Tuple[str, Dict[str, Any], int, str]],
             notes += [f"crystal block #{block_number(t)} at {t}" for t in blocks_crossed(before, cum)]
         notes += [f"reaches {name}" for name, needed in CA_TIERS if before < needed <= cum]
         notes += [perk for m, perk in DP_MILESTONES.items() if before < m <= cum]
-        note_txt = f"  {GREEN}[{'; '.join(notes)}]{RESET}" if notes else ""
-        crccl.log(f"  {pretty_date(sail)}  {ship:<26} room {b.get('stateroomNumber') or 'GTY'}  "
-                  f"{why} = {pts} pts{note_txt}")
+        table.append((pretty_date(sail), ship, str(b.get("stateroomNumber") or "GTY"),
+                      strip_ansi("", why), f"+{pts}", str(cum), "; ".join(notes)))
         total += pts
-    crccl.log(f"  total: +{total} pts")
+
+    headers = ("Sail Date", "Ship", "Room", "Earn", "Pts", "Total", "")
+    widths = [max(len(str(r[i])) for r in ([headers] + table)) for i in range(6)]
+    crccl.log("  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers[:6])))
+    crccl.log("  " + "  ".join("-" * w for w in widths))
+    for r in table:
+        line = "  " + "  ".join(str(r[i]).ljust(widths[i]) for i in range(6))
+        if r[6]:
+            line += f"  {GREEN}[{r[6]}]{RESET}"
+        crccl.log(line.rstrip())
+    crccl.log(f"  total: +{total} pts -> {cum}")
 
     doubled = [r for r in rows if str(r[1].get("bookingId") or "") in promo_ids
                and PROMO_SAIL_START <= r[0] <= PROMO_SAIL_END]
