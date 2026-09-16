@@ -252,14 +252,30 @@ class TestFetchCasinoOffersPagination:
         assert complete is True
         assert len(account.access.session.calls) == 3
 
-    def test_junk_total_pages_falls_back_to_one_page(self):
+    def test_junk_total_pages_reports_partial(self):
+        """Unparseable totalPages means we cannot know whether more pages exist:
+        keep what we fetched but report the results as PARTIAL, never complete
+        (the old one-page fallback truncated silently with complete=True)."""
         account = make_account([
             FakeResponse(payload={"offers": [raw_offer("26AA1")], "totalPages": "lots"}),
         ])
         offers, complete = fetch_casino_offers(account)
         assert [o.offer_code for o in offers] == ["26AA1"]
-        assert complete is True
+        assert complete is False
         assert len(account.access.session.calls) == 1
+
+    def test_junk_total_pages_midrun_reports_partial(self):
+        """Page 1 promises 3 pages; page 2's totalPages goes junk - pages 1-2
+        are kept, page 3 is not fetched, and complete must be False."""
+        account = make_account([
+            FakeResponse(payload={"offers": [raw_offer("26AA1")], "totalPages": 3}),
+            FakeResponse(payload={"offers": [raw_offer("26AA2")], "totalPages": "junk"}),
+            FakeResponse(payload={"offers": [raw_offer("26AA3")], "totalPages": 3}),
+        ])
+        offers, complete = fetch_casino_offers(account)
+        assert [o.offer_code for o in offers] == ["26AA1", "26AA2"]
+        assert complete is False
+        assert len(account.access.session.calls) == 2
 
     def test_missing_total_pages_defaults_to_one_page(self):
         account = make_account([

@@ -231,12 +231,17 @@ def fetch_casino_offers(account_info: crccl.AccountInfo) -> Tuple[List[CasinoOff
             return offers, False
 
         offers.extend(CasinoOffer.from_api(o) for o in (payload.get("offers") or []))
-        # The API has returned totalPages as a string; coerce it, and fall back
-        # to a single page if the value is junk rather than crashing the loop.
+        # The API has returned totalPages as a string; coerce it. Junk means we
+        # cannot know whether more pages exist, so stop and report the results
+        # as PARTIAL - a silent fallback to "one page" previously truncated the
+        # remaining pages while still claiming complete=True.
+        raw_total = payload.get("totalPages")
         try:
-            total_pages = int(payload.get("totalPages") or 1)
+            total_pages = int(raw_total or 1)
         except (TypeError, ValueError):
-            total_pages = 1
+            log_warn(f"Casino offers API returned an unparseable totalPages "
+                     f"({raw_total!r}) on page {page}; treating results as partial")
+            return offers, False
         page += 1
 
     return offers, True
