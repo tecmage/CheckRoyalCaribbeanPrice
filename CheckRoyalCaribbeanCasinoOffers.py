@@ -20,6 +20,11 @@ from CheckRoyalCaribbeanPrice import RED, GREEN, YELLOW, BLUE, RESET, USER_AGENT
 # plus the x-account-id and x-loyalty-id identity headers and a USA country header.
 OFFERS_API = "https://www.royalcaribbean.com/api/casino/v2/offers/list"
 
+# Sanity ceiling on pagination: at 100 offers/page a real account never comes
+# close, so a server-claimed totalPages beyond this is junk - stop there and
+# report the results as partial rather than hammering the API in a long loop.
+MAX_OFFER_PAGES = 30
+
 # Functional logging hooks, bound from the main module once logging is initialized
 log = None
 log_warn = None
@@ -208,7 +213,7 @@ def fetch_casino_offers(account_info: crccl.AccountInfo) -> Tuple[List[CasinoOff
     cookies = {"accessToken": token, "country": "USA"}
 
     offers: List[CasinoOffer] = []
-    page, total_pages = 1, 1
+    page, total_pages, truncated = 1, 1, False
     while page <= total_pages:
         params = {
             "sortBy": "offer.reserveByDate",
@@ -247,9 +252,14 @@ def fetch_casino_offers(account_info: crccl.AccountInfo) -> Tuple[List[CasinoOff
             log_warn(f"Casino offers API returned an unparseable totalPages "
                      f"({raw_total!r}) on page {page}; treating results as partial")
             return offers, False
+        if total_pages > MAX_OFFER_PAGES:
+            log_warn(f"Casino offers API claims {total_pages} pages; stopping at "
+                     f"{MAX_OFFER_PAGES} and treating results as partial")
+            total_pages = MAX_OFFER_PAGES
+            truncated = True
         page += 1
 
-    return offers, True
+    return offers, not truncated
 
 
 ##################################

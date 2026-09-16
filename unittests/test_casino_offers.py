@@ -277,6 +277,20 @@ class TestFetchCasinoOffersPagination:
         assert complete is False
         assert len(account.access.session.calls) == 2
 
+    def test_absurd_total_pages_capped_and_partial(self):
+        """A parseable-but-absurd totalPages (junk like 999999) must not turn
+        into a near-endless polling loop: fetching stops at MAX_OFFER_PAGES and
+        the results are reported as partial."""
+        from CheckRoyalCaribbeanCasinoOffers import MAX_OFFER_PAGES
+        pages = [FakeResponse(payload={"offers": [raw_offer(f"26A{i:02d}")],
+                                       "totalPages": 999999})
+                 for i in range(MAX_OFFER_PAGES + 5)]
+        account = make_account(pages)
+        offers, complete = fetch_casino_offers(account)
+        assert len(offers) == MAX_OFFER_PAGES
+        assert complete is False
+        assert len(account.access.session.calls) == MAX_OFFER_PAGES
+
     def test_missing_total_pages_defaults_to_one_page(self):
         account = make_account([
             FakeResponse(payload={"offers": [raw_offer("26AA1")], "totalPages": None}),

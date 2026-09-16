@@ -595,6 +595,11 @@ class ConfigTab:
             for text, color in tokens:
                 tag = self._tag_by_hex.get(color)
                 self.text.insert('end', text, tag if tag else ())
+        # trim the widget to the same cap as raw_lines - repeat runs without
+        # a clear otherwise grow the Text widget (and Tk memory) unbounded
+        widget_lines = int(self.text.index('end-1c').split('.')[0])
+        if widget_lines > self.MAX_RAW_LINES:
+            self.text.delete('1.0', f'{widget_lines - self.MAX_RAW_LINES + 1}.0')
         self.text.configure(state='disabled')
         if at_bottom:
             self.text.see('end')
@@ -642,7 +647,7 @@ class App:
         self._last_action = 'run'  # 'run' | 'run_all' — what the repeat timer redoes
         self._repeat_after_id = None
         self._ship_field = None
-        self._fleet_failed_at = 0.0
+        self._fleet_failed_at = float('-inf')   # monotonic() starts near 0 after boot; 0.0 wrongly suppressed the first fetch
         self._missing_configs = []  # configured paths that didn't exist at load
         self._sails_cache = {}     # ship code -> [mm/dd/yy] for the Browse -d combo
         self._sails_loading = set()
@@ -1416,6 +1421,15 @@ class App:
                         f'Could not load ship list ({err or "empty response"}) '
                         '— type a name or code')
                 self._apply_fleet_filter()
+                # the bind-time prefill for a remembered Browse ship was a no-op
+                # while the fleet was empty (short name -> code needs the fleet);
+                # now that it exists, load that ship's sailings into the -d combo
+                f = self._ship_field
+                if (fleet and f is not None and f.dynamic == 'ships_short'
+                        and '-d' in self.field_widgets
+                        and f.flag in self.field_vars
+                        and self.field_vars[f.flag].get().strip()):
+                    self._on_browse_ship_pick()
             elif kind == 'sails':
                 s_code, dates = payload
                 self._sails_loading.discard(s_code)
@@ -1560,8 +1574,10 @@ class App:
             name += '_' + re.sub(r'[^\w.-]+', '', run['config'])
         return name + (started or datetime.now()).strftime('_%Y%m%d_%H%M%S') + '.html'
 
-    def _write_report(self, tab, path):
-        """Render the tab's captured output to `path`; True on success."""
+    def _write_report(self, tab, path, quiet=False):
+        """Render the tab's captured output to `path`; True on success.
+        quiet: report failure via the status bar instead of a modal (auto-export
+        runs unattended mid-_finish_run, where a dialog would block the repeat)."""
         run = tab.last_run or {}
         script = run.get('script', 'Output')
         meta = script
@@ -1577,7 +1593,10 @@ class App:
                 fh.write(build_html_report(f'Check Royal Caribbean — {script}', meta, tab.raw_lines))
             return True
         except OSError as exc:
-            messagebox.showerror('Check Royal Caribbean', f'Could not write report:\n{exc}')
+            if quiet:
+                self.status_var.set(f'Auto-export failed: {exc}')
+            else:
+                messagebox.showerror('Check Royal Caribbean', f'Could not write report:\n{exc}')
             return False
 
     def _auto_export(self, tab):
@@ -1586,7 +1605,7 @@ class App:
         except OSError:
             return None   # silent by design: mid-_finish_run, no dialogs
         path = os.path.join(REPORTS_DIR, self._default_report_name(tab))
-        return path if self._write_report(tab, path) else None
+        return path if self._write_report(tab, path, quiet=True) else None
 
     def export_clicked(self):
         tab = self.current_tab()
