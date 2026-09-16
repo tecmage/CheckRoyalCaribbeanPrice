@@ -285,9 +285,11 @@ def test_category_prices_sends_coupon_code_only_when_asked(monkeypatch):
                "passengersInStateroom": [{"firstName": "Solo"}]}
     up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456", dp340=True)
     assert captured[0]["rooms"][0].get("couponCode") == "DP340"
+    # the mock's None response triggers the automatic retry-without-code
+    assert "couponCode" not in captured[1]["rooms"][0]
 
     up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456", dp340=False)
-    assert "couponCode" not in captured[1]["rooms"][0]
+    assert "couponCode" not in captured[2]["rooms"][0]
 
 
 def test_should_apply_dp340_gate():
@@ -412,3 +414,41 @@ def test_occupancy_prices_children_as_children(monkeypatch):
     up.get_category_prices(_Acct2(), family, "D", "BALCONY", "123456")
     room = captured["rooms"]["rooms"][0]
     assert room["adultCount"] == 3 and room["childCount"] == 1
+
+
+def test_category_prices_retries_without_dp340_on_failure(monkeypatch):
+    """A rejected DP340-priced category request falls back to an uncoded quote
+    instead of silently losing the dl-rate column (audit finding B7)."""
+    import CheckRoyalCaribbeanUpgrades as up
+    from unittest.mock import MagicMock
+
+    calls = []
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"rooms": [{"roomNumbers": {"categories": [
+                {"categoryCode": "2U", "pricing": {"invoice": {"total": 769.0}}}]}}]}
+
+    class _Sess:
+        def post(self, url, json=None, headers=None):
+            calls.append(json["rooms"][0].get("couponCode"))
+            if json["rooms"][0].get("couponCode") == "DP340":
+                bad = MagicMock(); bad.status_code = 400
+                return bad          # coupon rejected
+            return _Resp()
+
+    class _Access:
+        session = _Sess()
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+        is_royal = True
+        access = _Access()
+
+    monkeypatch.setattr(up, "log", lambda *a, **k: None)
+    booking = {"sailDate": "20270320", "packageCode": "WN07X123",
+               "passengersInStateroom": [{"firstName": "Solo"}]}
+    prices = up.get_category_prices(_Acct(), booking, "V", "INTERIOR", "123456", dp340=True)
+    assert calls == ["DP340", None]     # coded attempt, then uncoded retry
+    assert prices == {"2U": 769.0}

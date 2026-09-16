@@ -327,6 +327,16 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
     headers = {"user-agent": USER_AGENT_WEB, "accept": "*/*",
                "content-type": "application/json",
                "brand": "R" if account.is_royal else "C", "country": "USA"}
+    def _dp340_fallback() -> Dict[str, float]:
+        # A coupon-priced request can fail as a 4xx or an empty body when the
+        # coupon is rejected - retry once without the code (same fallback
+        # get_sailing_inventory has) instead of silently losing dl-rate
+        if not dp340:
+            return {}
+        if log:   # bound in build_account(); unit tests may call without it
+            log(f"{YELLOW}DP340-priced category request failed; retrying without the code{RESET}")
+        return get_category_prices(account, booking, subtype, stype, loyalty, dp340=False)
+
     try:
         # Sept 2026: Royal switched this endpoint to POST-with-JSON-body; the old
         # GET-with-filter-param form now gets a blanket Akamai 403
@@ -334,13 +344,13 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
             f"https://www.{account.url_brand}.com/room-selection/api/v1/rooms",
             json=flt, headers=headers)
     except Exception:
-        return {}
+        return _dp340_fallback()
     if not r or r.status_code != 200:
-        return {}
+        return _dp340_fallback()
     try:
         data = r.json()
     except Exception:
-        return {}
+        return _dp340_fallback()
     out: Dict[str, float] = {}
     for rm in data.get("rooms", []) or []:
         for cat in (rm.get("roomNumbers", {}) or {}).get("categories", []) or []:
@@ -348,6 +358,8 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
             total = ((cat.get("pricing") or {}).get("invoice") or {}).get("total")
             if code and isinstance(total, (int, float)):
                 out[code] = float(total)
+    if not out:
+        return _dp340_fallback()
     return out
 
 
