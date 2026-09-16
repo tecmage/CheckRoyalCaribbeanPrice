@@ -175,3 +175,32 @@ def test_unique_account_labels_disambiguates_collisions():
         [_A("jim@aol.com"), _A("jim@att.net"), _A("bo@example.com")])
     assert labels == ["jim@a…", "jim@a… (2)", "bo@e…"]
     assert len(set(labels)) == 3
+
+
+def test_old_promo_cap_warning_excludes_new_promo_bookings(monkeypatch):
+    """An id given to BOTH promo flags resolves as new-promo, so it must not
+    count toward the OLD promo's 2-cruise cap warning (finding B13)."""
+    import CheckRoyalCaribbeanCruiseHistory as hist
+
+    def make_row(bid, sail):
+        b = {"bookingId": bid, "shipCode": "WN", "stateroomNumber": "1234"}
+        return (sail, b, 7, "7n x1 (standard)")
+
+    rows = [make_row("1000001", "20261001"), make_row("1000002", "20261101"),
+            make_row("1000003", "20261201")]
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+
+    # 3 ids on the old flag would warn (cap is 2) - but one resolved as new-promo
+    hist.show_upcoming_earnings(
+        rows, {}, "JIM EXAMPLE",
+        promo_ids=frozenset({"1000001", "1000002", "1000003"}),
+        new_promo_ids=frozenset({"1000003"}))
+    assert not any("caps at" in s for s in logged)
+
+    # without the exclusion the warning fires as before
+    logged.clear()
+    hist.show_upcoming_earnings(
+        rows, {}, "JIM EXAMPLE",
+        promo_ids=frozenset({"1000001", "1000002", "1000003"}))
+    assert any("caps at" in s for s in logged)

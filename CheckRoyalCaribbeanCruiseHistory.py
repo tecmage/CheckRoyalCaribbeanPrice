@@ -563,7 +563,8 @@ def upcoming_earnings(bookings: List[Dict[str, Any]], holder_name: Optional[str]
 def show_upcoming_earnings(rows: List[Tuple[str, Dict[str, Any], int, str]],
                            ships: Dict[str, str], holder_name: Optional[str],
                            start_points: int = 0, earns_blocks: bool = True,
-                           promo_ids: frozenset = frozenset()) -> int:
+                           promo_ids: frozenset = frozenset(),
+                           new_promo_ids: frozenset = frozenset()) -> int:
     who = f" for {holder_name}" if holder_name else ""
     start_txt = f" (starting from {start_points} pts)" if start_points else ""
     crccl.log(f"\n{BLUE}Projected points from booked cruises{who}{start_txt}:{RESET}")
@@ -604,7 +605,10 @@ def show_upcoming_earnings(rows: List[Tuple[str, Dict[str, Any], int, str]],
         crccl.log(line.rstrip())
     crccl.log(f"  total: +{total} pts -> {cum}")
 
-    doubled = [r for r in rows if str(r[1].get("bookingId") or "") in promo_ids
+    # ids given to BOTH flags resolve as new-promo in projected_rows, so they
+    # must not count toward the OLD promo's per-member cruise cap
+    doubled = [r for r in rows
+               if str(r[1].get("bookingId") or "") in (promo_ids - new_promo_ids)
                and PROMO_SAIL_START <= r[0] <= PROMO_SAIL_END]
     if len(doubled) > PROMO_MAX_CRUISES:
         crccl.log(f"  {YELLOW}Warning: {len(doubled)} bookings flagged --double-points, but "
@@ -927,7 +931,7 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
         show_pending_points(pending_ledger_sailings(history_db, account.username, sailings))
         show_upcoming_earnings(upcoming, SHIP_NAMES, holder,
                                start_points=eff_points, earns_blocks=earns_blocks,
-                               promo_ids=acct_promo)
+                               promo_ids=acct_promo, new_promo_ids=new_promo_ids)
         show_tier_progress(account, points, sailings, upcoming, pending=pending_points,
                            earns_blocks=earns_blocks, block_holder=block_holder)
         if sailings or upcoming:
