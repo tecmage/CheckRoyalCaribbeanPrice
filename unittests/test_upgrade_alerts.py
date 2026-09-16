@@ -323,7 +323,7 @@ def test_booked_subtype_resolves_renamed_funnel_code(monkeypatch):
     monkeypatch.setattr(up, "get_sailing_inventory", lambda *a, **k: inventory)
     monkeypatch.setattr(up, "get_category_prices", fake_cat_prices)
     monkeypatch.setattr(up, "read_ledger", lambda a, b: {
-        "gross": 700.0, "original_fare": 800.0, "discounted_fare": 700.0, "discount": -100.0,
+        "gross": 700.0, "original_fare": 700.0, "discounted_fare": 600.0, "discount": -100.0,
         "taxes": 100.0, "payments_applied": 700.0, "balance_due": None, "deposit_type": None,
         "casino_items": [], "promo_items": [], "is_casino": False})
     logged = []
@@ -336,3 +336,35 @@ def test_booked_subtype_resolves_renamed_funnel_code(monkeypatch):
 
     assert captured["subtype"] == "V"      # priced under the renamed funnel code
     assert any("769.00" in s for s in logged), "booked category failed to price"
+
+
+def test_dl_paid_uses_fare_plus_taxes_not_gross(monkeypatch):
+    """A reprice keeps prepaid add-ons: dl-paid must compare candidates against
+    fare + taxes, not GROSS_TOTALS (which bundles prepaid gratuities/packages
+    and understated every delta by the prepaid amount)."""
+    import CheckRoyalCaribbeanUpgrades as up
+    inventory = [
+        {"type": "BALCONY", "subtype": "D", "category": "4D", "name": "Balcony",
+         "guarantee": False, "connecting": False, "total": 2100.0, "refundability": None},
+    ]
+    monkeypatch.setattr(up, "get_sailing_inventory", lambda *a, **k: inventory)
+    monkeypatch.setattr(up, "get_category_prices", lambda *a, **k: {"2D": 2000.0})
+    # fare 1500 + taxes 200 = 1700; gross 2050 includes 350 of prepaid add-ons
+    monkeypatch.setattr(up, "read_ledger", lambda a, b: {
+        "gross": 2050.0, "original_fare": 1600.0, "discounted_fare": 1500.0, "discount": -100.0,
+        "taxes": 200.0, "payments_applied": 2050.0, "balance_due": None, "deposit_type": None,
+        "casino_items": [], "promo_items": [], "is_casino": False})
+    logged = []
+    monkeypatch.setattr(up, "log", lambda m, *a, **k: logged.append(str(m)))
+
+    booking = {"bookingId": "1234567", "sailDate": "20270320", "shipCode": "WN",
+               "stateroomNumber": "7123", "stateroomSubtype": "D",
+               "passengersInStateroom": [{"stateroomCategoryCode": "2D", "firstName": "A"},
+                                          {"stateroomCategoryCode": "2D", "firstName": "B"}]}
+    up.report_booking(None, booking, "123456", "FL", limit=0)
+
+    out = "\n".join(logged)
+    assert "Reprice basis (fare + taxes): $1,700.00" in out
+    assert "$350.00" in out                       # excluded add-ons disclosed
+    # candidate 2100 - 1700 = +400 (NOT 2100 - 2050 = +50)
+    assert "+$400.00" in out and "+$50.00" not in out

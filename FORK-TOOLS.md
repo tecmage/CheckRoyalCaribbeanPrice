@@ -70,8 +70,9 @@ stateroom** on the same sailing. Reads the booking's real pricing ledger from th
 amend page, then prices every category currently for sale – with your loyalty number
 and the booking's guest count – and shows two deltas per candidate:
 
-- **dl-paid** – candidate's current all-in total minus what you pay today
-  (what a straight repricing would owe)
+- **dl-paid** – candidate's current all-in total minus your fare + taxes today
+  (what a straight repricing would owe; prepaid gratuities/insurance/packages are
+  excluded from the comparison since a reprice keeps them)
 - **dl-rate** – candidate minus your booked category's *current* price
   (the category-difference math an upgrade/casino desk uses)
 

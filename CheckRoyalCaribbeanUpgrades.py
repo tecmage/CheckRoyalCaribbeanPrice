@@ -375,9 +375,20 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         f"room {booking.get('stateroomNumber')}  cat {booked_cat}  {len(guests)} guest(s)")
 
     ledger = read_ledger(account, booking)
-    paid = ledger["gross"]
-    log(f"  You pay (gross): {money(paid)}   original fare {money(ledger['original_fare'])} "
+    # A reprice keeps your prepaid add-ons, so candidates (quoted as fare + taxes)
+    # must be compared against the booking's fare + taxes - NOT GROSS_TOTALS, which
+    # bundles prepaid gratuities/insurance/packages and understates every dl-paid
+    # by the prepaid amount (and could fire false upgrade alerts on the fallback).
+    fare_and_taxes = None
+    if isinstance(ledger["discounted_fare"], (int, float)) and isinstance(ledger["taxes"], (int, float)):
+        fare_and_taxes = round(ledger["discounted_fare"] + ledger["taxes"], 2)
+    paid = fare_and_taxes if fare_and_taxes is not None else ledger["gross"]
+    log(f"  You pay (gross): {money(ledger['gross'])}   original fare {money(ledger['original_fare'])} "
         f"- discounts {money(abs(ledger['discount'] or 0))} + taxes/fees {money(ledger['taxes'])}")
+    if (fare_and_taxes is not None and isinstance(ledger["gross"], (int, float))
+            and abs(ledger["gross"] - fare_and_taxes) >= 0.01):
+        log(f"  Reprice basis (fare + taxes): {money(fare_and_taxes)}   "
+            f"({money(ledger['gross'] - fare_and_taxes)} of prepaid add-ons excluded from dl-paid)")
     if ledger["is_casino"]:
         # The promo item's refundability field describes the promo, not the deposit -
         # Club Royale's own terms govern casino-rate deposits and changes
@@ -588,7 +599,8 @@ def main() -> None:
         else:
             log(f"\n No upgrades at or below ${alert_below:,.2f}.")
 
-    log(f"\n{GREEN}Done.{RESET} dl-paid = category total minus what you pay today; "
+    log(f"\n{GREEN}Done.{RESET} dl-paid = category total minus your fare + taxes today "
+        f"(prepaid add-ons excluded - a reprice keeps them); "
         f"dl-rate = minus your booked category at today's rate.")
 
 
