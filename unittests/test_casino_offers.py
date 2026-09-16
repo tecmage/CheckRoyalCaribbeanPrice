@@ -302,3 +302,21 @@ class TestFetchCasinoOffersPagination:
         offers, complete = fetch_casino_offers(account)
         assert offers == []
         assert complete is True
+
+
+class TestNaiveReserveByDates:
+    def test_timezone_less_dates_still_alert(self):
+        """A reserveByDate without a timezone must produce a day count instead
+        of the silent None that made such offers un-alertable (finding B8)."""
+        from datetime import datetime, timedelta, timezone
+        future = (datetime.now(timezone.utc) + timedelta(days=10))
+        for form in (future.strftime("%Y-%m-%dT%H:%M:%S"),   # naive datetime
+                     future.strftime("%Y-%m-%d")):           # bare date
+            offer = CasinoOffer.from_api({"campaignOffer": {
+                "offerCode": "26AA9", "reserveByDate": form}})
+            days = offer.days_until_reserve_by()
+            assert days is not None and 8 <= days <= 10, (form, days)
+        # the Z form keeps working
+        offer = CasinoOffer.from_api({"campaignOffer": {
+            "offerCode": "26AA9", "reserveByDate": future.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+        assert offer.days_until_reserve_by() is not None

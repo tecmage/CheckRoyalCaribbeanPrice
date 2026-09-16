@@ -97,6 +97,11 @@ class CasinoOffer:
             return None
         try:
             deadline = datetime.fromisoformat(self.reserve_by_date.replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                # A timezone-less date ("2026-09-30" or "...T23:59:59") used to
+                # raise on the aware-minus-naive subtraction below, silently
+                # making such offers un-alertable; assume UTC like the Z form
+                deadline = deadline.replace(tzinfo=timezone.utc)
             return (deadline - datetime.now(timezone.utc)).days
         except (ValueError, TypeError):
             return None
