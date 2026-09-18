@@ -1508,6 +1508,71 @@ def is_upgrade_candidate(booked_rank: Optional[int], booked_now: Optional[float]
             and not LESSER_PRODUCT.search(row_name or ""))
 
 
+def should_apply_dp340(eligible: bool, booked_with_code: bool, guest_count: int) -> bool:
+    """Quote a solo booking with the DP340 single-supplement code when the
+    account qualifies (Royal, 340+ Crown & Anchor points), or when the booking
+    already carries the code - repricing keeps the terms it was booked on.
+    Never on multi-guest bookings."""
+    return (eligible or booked_with_code) and guest_count == 1
+
+
+def _get_upgrade_category_prices(url_params: CruiseURLParams, stype: Optional[str],
+                                 dp340: bool = False) -> tuple[Dict[str, float], bool]:
+    """
+    Per-CATEGORY all-in totals inside ONE subtype family (e.g. 2D alongside 4D
+    under subtype D), via the room-selection JSON API - one POST per booking,
+    fetched only for the booked family. Sept 2026: this endpoint is
+    POST-with-JSON-body; the old GET form gets a blanket Akamai 403.
+
+    Returns ({categoryCode: total}, dp340_actually_applied).
+    """
+    room: Dict[str, Any] = {
+        "adultCount": int(url_params.number_of_adults or 1),
+        "childCount": int(url_params.number_of_children or 0),
+        "stateroomTypeCode": stype,
+        "stateroomSubtypeCode": url_params.stateroom_subtype,
+        "accessible": False, "selectionFallbackStrategy": "RECOMMENDATION",
+        "editMode": True, "reset": False, "taxesAndFeesBundled": True,
+    }
+    if url_params.loyalty_number:
+        room["qualifiers"] = {"loyaltyNumber": str(url_params.loyalty_number)}
+    if dp340:
+        room["couponCode"] = "DP340"
+    flt = {"countryCode": url_params.booking_office_country_code or "USA",
+           "packageId": url_params.package_code,
+           "sailDate": url_params.sail_date,
+           "currencyCode": url_params.currency_code or "USD",
+           "language": "en", "options": True, "roomNumbers": True,
+           "rooms": [room], "platform": "web"}
+    headers = {"user-agent": USER_AGENT_WEB, "accept": "*/*",
+               "content-type": "application/json",
+               "brand": "R" if url_params.is_royal else "C", "country": "USA"}
+
+    response = _execute_api_request(
+        account_info=None, method="POST",
+        url=f"https://www.{url_params.url_brand}.com/room-selection/api/v1/rooms",
+        data=json.dumps(flt), headers=headers, on_failure="skip")
+
+    prices: Dict[str, float] = {}
+    if response is not None:
+        try:
+            for rm in (response.json().get("rooms") or []):
+                for cat in ((rm.get("roomNumbers") or {}).get("categories") or []):
+                    code = cat.get("categoryCode") or cat.get("code")
+                    total = (((cat.get("pricing") or {}).get("invoice")) or {}).get("total")
+                    if code and isinstance(total, (int, float)):
+                        prices[code] = float(total)
+        except Exception:
+            prices = {}
+    if not prices and dp340:
+        # A coupon-priced request can fail as a 4xx or an empty body when the
+        # coupon is rejected - retry once without the code instead of silently
+        # losing the per-category view
+        log(f"\t{YELLOW}DP340-priced category request failed; retrying without the code{RESET}")
+        return _get_upgrade_category_prices(url_params, stype, dp340=False)
+    return prices, dp340
+
+
 def _upgrade_money(v: Optional[float]) -> str:
     return f"${v:,.2f}" if isinstance(v, (int, float)) else "-"
 
@@ -1905,6 +1970,8 @@ def get_voyages(
         discounted_fare = None
         taxes_and_fees = None
         casino_rate_flag = False
+        refundabilities = set()
+        booked_with_dp340 = False
         cruise_paid_price_from_API = result.get("prices", [])
 
         # Extract direct YAML overrides for this reservation ID (if configured)
@@ -1957,6 +2024,12 @@ def get_voyages(
                 for item in (cur_price.get("priceItems") or []):
                     if CASINO_MARKER.search(item.get("description") or ""):
                         casino_rate_flag = True
+                    # the DISCOUNT items carry the fare's refundability
+                    # (DEPOSIT_NOT_REFUNDABLE = an NRD fare)
+                    if item.get("refundability"):
+                        refundabilities.add(item["refundability"])
+                    if item.get("promoCd") == "DP340":
+                        booked_with_dp340 = True
 
             if not amount:
                 continue
@@ -1998,6 +2071,16 @@ def get_voyages(
             if isinstance(discounted_fare, (int, float)) and isinstance(taxes_and_fees, (int, float)):
                 paid_price_struct['fareAndTaxes'] = round(discounted_fare + taxes_and_fees, 2)
             paid_price_struct['isCasino'] = casino_rate_flag
+            if "DEPOSIT_NOT_REFUNDABLE" in refundabilities:
+                paid_price_struct['depositType'] = "NRD"
+            elif "REFUNDABLE" in refundabilities:
+                paid_price_struct['depositType'] = "REFUNDABLE"
+            paid_price_struct['bookedWithDP340'] = booked_with_dp340
+            # Diamond Plus 340+ single-supplement eligibility (Royal only)
+            _pts = getattr(account_info, 'loyalty_points', 0)
+            paid_price_struct['dp340Eligible'] = bool(
+                account_info.is_royal is True
+                and isinstance(_pts, (int, float)) and _pts >= 340)
             log(f"Cruise Fare - Total {gross_totals:.2f}{payment_string}")
 
         # Record this booking for the end-of-run check-in / final-payment summary table.
@@ -2211,6 +2294,24 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     booked_rank = (TYPE_RANK.get(booked_row.get('type')) if booked_row
                    else TYPE_RANK.get(url_params.cabin_class_string))
 
+    # Phase 2: per-category prices inside the booked family (2D alongside 4D),
+    # priced with the booking's own qualifiers. Only this one extra POST is
+    # made per booking; DP340 single-supplement is applied to it for a solo
+    # booking when the account qualifies (340+ points) or the booking already
+    # carries the code, with a retry-without-code fallback.
+    guest_count = int(url_params.number_of_adults or 0) + int(url_params.number_of_children or 0)
+    apply_dp340 = should_apply_dp340(bool(struct.get('dp340Eligible')),
+                                     bool(struct.get('bookedWithDP340')), guest_count)
+    family_prices: Dict[str, float] = {}
+    dp340_used = False
+    if booked_row is not None:
+        family_prices, dp340_used = _get_upgrade_category_prices(
+            url_params, booked_row.get('type'), dp340=apply_dp340)
+    booked_cat = url_params.stateroom_category_code
+    if booked_cat and booked_cat in family_prices:
+        # exact booked category beats the family's lead-in as the dl-rate anchor
+        booked_now = family_prices[booked_cat]
+
     # dl-paid basis: fare + taxes when the ledger supplied both (a reprice
     # keeps prepaid add-ons); otherwise fall back to the gross paid price.
     fare_and_taxes = struct.get('fareAndTaxes')
@@ -2246,18 +2347,31 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
                     else plain_header.replace('dl-paid', f"{BOLD}dl-paid{RESET}"))
     log(shown_header)
     log("\t  " + "-" * (len(plain_header) - 4))
+    # Expand the booked family's lead-in row into its per-category rows
+    table_rows: List[Dict[str, Any]] = []
+    for r in candidates:
+        if r is booked_row and family_prices:
+            table_rows.extend({**booked_row, 'category': code, 'price': total}
+                              for code, total in sorted(family_prices.items(),
+                                                        key=lambda kv: kv[1]))
+        else:
+            table_rows.append(r)
+
     hits: List[str] = []
     threshold = config.upgrade_alert_below if isinstance(config.upgrade_alert_below, (int, float)) else None
-    for r in candidates:
+    for r in table_rows:
         d_paid = (r['price'] - paid_basis) if isinstance(paid_basis, (int, float)) else None
         d_rate = (r['price'] - booked_now) if isinstance(booked_now, (int, float)) else None
-        mark = "*" if r.get('subtype') == booked_sub else " "
+        mark = "*" if (r.get('subtype') == booked_sub
+                       and (not family_prices or r.get('category') == booked_cat)) else " "
         log(f"\t  {mark} {str(r.get('category') or r.get('subtype')):5} {str(r.get('type')):9} "
             f"{_upgrade_money(r['price']):>12} {_emph(_upgrade_delta(d_paid), not prefer_rate)} "
             f"{_emph(_upgrade_delta(d_rate), prefer_rate)}  "
             f"{r.get('display_name', '')}")
 
-        if threshold is not None and r.get('subtype') != booked_sub:
+        is_booked_cat = (r.get('subtype') == booked_sub
+                         and (not family_prices or r.get('category') == booked_cat))
+        if threshold is not None and not is_booked_cat:
             basis = d_rate if d_rate is not None else d_paid
             if (basis is not None and basis <= threshold
                     and is_upgrade_candidate(booked_rank, booked_now,
@@ -2268,6 +2382,12 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
                 hits.append(f"{r.get('category') or r.get('subtype')} {r.get('display_name', '')} "
                             f"for {sign}${abs(basis):,.2f}{via} (now ${r['price']:,.2f})")
 
+    if struct.get('bookedWithDP340'):
+        log(f"\t  DP340 single-supplement discount is applied on this booking")
+    if dp340_used:
+        log(f"\t  Booked-family rows are quoted with the DP340 single-supplement code "
+            f"(solo, 340+ points); other families show standard solo rates.")
+
     if struct.get('isCasino'):
         log(f"\t  {YELLOW}Note: casino-rate booking - a straight reprice (dl-paid) would forfeit "
             f"the comp; {BOLD}dl-rate{RESET}{YELLOW} approximates the category difference a casino "
@@ -2275,6 +2395,19 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     elif isinstance(paid_basis, (int, float)):
         log(f"\t  Upgrading or downgrading would use {BOLD}dl-paid{RESET} - "
             f"the difference between a category's price today and what you paid.")
+
+    # Royal's published NRD deposit rules, same notes the fork's checker shows
+    quotes_nrd = any(r.get('refundability') == "DEPOSIT_NOT_REFUNDABLE" for r in candidates)
+    if struct.get('depositType') == "NRD" and not struct.get('isCasino'):
+        log(f"\t  {YELLOW}NRD fare notes:{RESET} category changes on this same ship/sail date "
+            f"(including downgrades) have no change fee and keep your deposit. Reprices must "
+            f"stay on a non-refundable fare{' (the prices above are NRD rates)' if quotes_nrd else ''}. "
+            f"Changing ship or sail date costs $100/person; cancelling forfeits the deposit.")
+    elif (struct.get('depositType') == "REFUNDABLE" and quotes_nrd
+          and not struct.get('isCasino')):
+        log(f"\t  Note: the prices above are non-refundable-deposit rates - matching one may "
+            f"require switching this refundable booking to NRD (allowed before final "
+            f"payment; the switch is one-way).")
     if threshold is not None and booked_rank is None:
         log(f"\t  {YELLOW}Booked class unknown - upgrade alerts skipped for this booking.{RESET}")
 
@@ -3027,6 +3160,7 @@ def check_if_room_is_available(params: CruiseURLParams,
                 "display_name": stateroom_subtype.get("name", ""),
                 "guarantee": bool(stateroom_subtype.get("guarantee")),
                 "connecting": "connect" in (stateroom_subtype.get("name") or "").lower(),
+                "refundability": (pricing_struct or {}).get("refundability"),
             })
 
     # Letters fallback: the booked subtype code is not offered under that name,

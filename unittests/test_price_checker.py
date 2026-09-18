@@ -4453,6 +4453,9 @@ class TestCheckForUpgrades:
             {"priceTypeCode": "TAXES_AND_FEES", "amount": 200.0},
             {"priceTypeCode": "OPTIONS", "amount": 0.0, "priceItems": [
                 {"code": "CAS1", "description": "CASINO DISC - GOBO"}]},
+            {"priceTypeCode": "DISCOUNT", "amount": -100.0, "priceItems": [
+                {"code": "PROMO1", "description": "Savings", "promoCd": "DP340",
+                 "refundability": "DEPOSIT_NOT_REFUNDABLE"}]},
         ]}
         mock_metrics = {"passenger_names": "Matt Smith", "checkin_string": "Boarding Time 11:00",
                         "category_code": "4D", "sub_type": "4D"}
@@ -4466,12 +4469,16 @@ class TestCheckForUpgrades:
         struct = mock_price.call_args.kwargs["paid_price_struct"]
         assert struct["fareAndTaxes"] == 1700.0     # fare + taxes, NOT gross 2050
         assert struct["isCasino"] is True
+        assert struct["depositType"] == "NRD"
+        assert struct["bookedWithDP340"] is True
+        assert struct["dp340Eligible"] is False      # no loyalty points on record
 
     def _render(self, struct=None, rows=None, threshold=None, subtype="D",
-                cabin_class="BALCONY"):
+                cabin_class="BALCONY", family=None, family_dp340=False, adults=2):
         import CheckRoyalCaribbeanPrice as CRCP
         params = _availability_params(subtype=subtype, category_code="2D")
         params.cabin_class_string = cabin_class
+        params.number_of_adults = adults
         rich = rows if rows is not None else [
             {"type": t, "subtype": code, "category": cat, "display_name": name,
              "name": f"{name} {cat} {code}", "price": total, "rooms_left": 5,
@@ -4481,16 +4488,18 @@ class TestCheckForUpgrades:
         apobj = MagicMock()
         logged = []
         with patch('CheckRoyalCaribbeanPrice.log',
-                   side_effect=lambda m, *a, **k: logged.append(str(m))):
+                   side_effect=lambda m, *a, **k: logged.append(str(m))), \
+             patch('CheckRoyalCaribbeanPrice._get_upgrade_category_prices',
+                   return_value=(family or {}, family_dp340)) as mock_family:
             CRCP._maybe_report_upgrades(
                 params, {"upgrade_rows": rich},
                 struct if struct is not None else
                 {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False},
                 "2027-01-29 Ovation BALCONY 2D", "1234567", apobj)
-        return "\n".join(logged), apobj
+        return "\n".join(logged), apobj, mock_family
 
     def test_table_uses_fare_taxes_basis_and_excludes_gty_connecting(self):
-        out, _ = self._render()
+        out, _, _ = self._render()
         # dl-paid for the Grand Suite: 2400 - 1700 = +700 (not 2400 - 2050 = +350)
         assert "+$700.00" in out and "+$350.00" not in out
         # dl-rate anchored on the booked D row: 2400 - 1100 = +1300
@@ -4505,7 +4514,7 @@ class TestCheckForUpgrades:
         assert "Upgrading or downgrading would use" in out
 
     def test_casino_note_and_gross_fallback(self):
-        out, _ = self._render(struct={"paid_price": 2050.0, "isCasino": True})
+        out, _, _ = self._render(struct={"paid_price": 2050.0, "isCasino": True})
         assert "casino-rate booking" in out
         assert "gross paid" in out                # fareAndTaxes absent -> disclosed fallback
         # casino booking: dl-rate governs (repricing forfeits the comp) - the
@@ -4515,7 +4524,7 @@ class TestCheckForUpgrades:
 
     def test_alert_fires_only_for_genuine_upgrades_at_threshold(self):
         import CheckRoyalCaribbeanPrice as CRCP
-        out, apobj = self._render(threshold=1500.0)
+        out, apobj, _ = self._render(threshold=1500.0)
         apobj.notify.assert_called_once()
         body = apobj.notify.call_args.kwargs["body"]
         assert "Grand Suite" in body              # class jump within threshold
@@ -4524,18 +4533,107 @@ class TestCheckForUpgrades:
         CRCP.config.upgrade_alert_below = None
 
     def test_no_alert_without_threshold_and_no_table_without_rows(self):
-        out, apobj = self._render(threshold=None)
+        out, apobj, _ = self._render(threshold=None)
         apobj.notify.assert_not_called()
-        out2, apobj2 = self._render(rows=[], threshold=1500.0)
+        out2, apobj2, _ = self._render(rows=[], threshold=1500.0)
         assert out2 == ""                          # flag path: no rows -> silent
         apobj2.notify.assert_not_called()
 
     def test_gty_booking_gets_paid_only_table(self):
         """A GTY booking has no subtype row of its own: dl-rate column empty,
         class rank falls back to the URL's cabin class, no crash."""
-        out, apobj = self._render(subtype="XB", threshold=1500.0)
+        out, apobj, _ = self._render(subtype="XB", threshold=1500.0)
         assert "+$700.00" in out                  # dl-paid still computed
         assert "Grand Suite" in out
+
+    # ---------------- Phase 2: booked-family categories, DP340, NRD ----------
+
+    def test_family_categories_expand_with_exact_dl_rate_anchor(self):
+        """The booked family's lead-in row expands into per-category rows, and
+        dl-rate anchors on the EXACT booked category (2D), not the family's
+        cheapest lead-in (4D)."""
+        out, _, mock_family = self._render(family={"2D": 1180.0, "4D": 1100.0})
+        # family fetched for the booked row's stateroom type
+        assert mock_family.call_args.args[1] == "BALCONY"
+        # both sister categories rendered; the booked category carries the star
+        assert "* 2D" in out and "  4D" in out
+        # Grand Suite dl-rate: 2400 - 1180 (exact 2D) = +1220, not 2400 - 1100
+        assert "+$1,220.00" in out and "+$1,300.00" not in out
+
+    def test_should_apply_dp340_gate(self):
+        from CheckRoyalCaribbeanPrice import should_apply_dp340
+        assert should_apply_dp340(True, False, 1) is True    # qualifies, solo
+        assert should_apply_dp340(False, True, 1) is True    # booked with code
+        assert should_apply_dp340(True, True, 2) is False    # never multi-guest
+        assert should_apply_dp340(False, False, 1) is False
+
+    def test_dp340_applied_for_eligible_solo_and_noted(self):
+        struct = {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False,
+                  "dp340Eligible": True, "bookedWithDP340": True}
+        out, _, mock_family = self._render(struct=struct, adults=1,
+                                           family={"2D": 900.0}, family_dp340=True)
+        assert mock_family.call_args.kwargs.get("dp340") is True
+        assert "DP340 single-supplement discount is applied on this booking" in out
+        assert "quoted with the DP340" in out
+
+        # two guests: the code must never be requested
+        out2, _, mock_family2 = self._render(struct=struct, adults=2, family={"2D": 1180.0})
+        assert mock_family2.call_args.kwargs.get("dp340") is False
+        assert "quoted with the DP340" not in out2
+
+    def test_category_prices_post_shape_and_dp340_retry(self):
+        """The rooms POST carries the booking's occupancy/loyalty (and the
+        DP340 coupon when asked); an empty coupon-priced response retries once
+        without the code instead of silently losing the per-category view."""
+        import CheckRoyalCaribbeanPrice as CRCP
+        params = _availability_params(subtype="D", category_code="2D")
+        params.loyalty_number = "123456"
+
+        good = MagicMock()
+        good.json.return_value = {"rooms": [{"roomNumbers": {"categories": [
+            {"categoryCode": "2D", "pricing": {"invoice": {"total": 1180.0}}},
+            {"categoryCode": "4D", "pricing": {"invoice": {"total": 1100.0}}}]}}]}
+        empty = MagicMock()
+        empty.json.return_value = {"rooms": []}
+
+        bodies = []
+        def fake_net(*args, **kwargs):
+            bodies.append(json.loads(kwargs["data"]))
+            return empty if len(bodies) == 1 else good
+
+        with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=fake_net), \
+             patch('CheckRoyalCaribbeanPrice.log', lambda *a, **k: None):
+            prices, dp340_used = CRCP._get_upgrade_category_prices(params, "BALCONY", dp340=True)
+
+        assert prices == {"2D": 1180.0, "4D": 1100.0}
+        assert dp340_used is False                      # succeeded on the retry
+        assert len(bodies) == 2
+        assert bodies[0]["rooms"][0]["couponCode"] == "DP340"
+        assert "couponCode" not in bodies[1]["rooms"][0]
+        assert bodies[0]["rooms"][0]["qualifiers"] == {"loyaltyNumber": "123456"}
+        assert bodies[0]["rooms"][0]["adultCount"] == 2
+
+    def test_nrd_notes_follow_deposit_type(self):
+        nrd_rows = [
+            {"type": "BALCONY", "subtype": "D", "category": "4D",
+             "display_name": "Ocean View Balcony", "name": "OVB", "price": 1100.0,
+             "rooms_left": 5, "guarantee": False, "connecting": False,
+             "refundability": "DEPOSIT_NOT_REFUNDABLE"},
+        ]
+        out, _, _ = self._render(rows=nrd_rows, struct={
+            "paid_price": 2050.0, "fareAndTaxes": 1700.0,
+            "isCasino": False, "depositType": "NRD"})
+        assert "NRD fare notes" in out and "the prices above are NRD rates" in out
+
+        out2, _, _ = self._render(rows=nrd_rows, struct={
+            "paid_price": 2050.0, "fareAndTaxes": 1700.0,
+            "isCasino": False, "depositType": "REFUNDABLE"})
+        assert "switching this refundable booking to NRD" in out2
+
+        out3, _, _ = self._render(rows=nrd_rows, struct={
+            "paid_price": 2050.0, "fareAndTaxes": 1700.0,
+            "isCasino": True, "depositType": "NRD"})
+        assert "NRD fare notes" not in out3             # casino overrides
 
     def test_flag_off_and_watchlist_never_collect(self, mock_global_config, base_account_info):
         import CheckRoyalCaribbeanPrice as CRCP

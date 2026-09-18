@@ -177,5 +177,8 @@ Optionally set `upgradeAlertBelow: 100` to send one Apprise alert per booking
 listing upgrade options (a higher class, or a pricier non-niche category in your
 class) whose category-difference cost is at or below that amount.
 
-Phase 1 shows each subtype family's lead-in price; per-category sister prices
-(e.g. 2D alongside 4D) and DP340 solo pricing are planned as a follow-up.
+The booked family additionally shows its per-category sister prices (e.g. 2D
+alongside 4D), fetched with one extra request per booking; solo bookings on a
+Royal account with 340+ Crown & Anchor points (or already booked with the code)
+have that family quoted with the DP340 single-supplement discount. Bookings on
+non-refundable-deposit fares get Royal's published NRD change/cancel notes.
