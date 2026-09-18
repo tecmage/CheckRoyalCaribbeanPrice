@@ -2224,15 +2224,28 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         log(f"\tUpgrade check: no priceable stateroom inventory returned for this sailing")
         return
 
+    # Which delta actually applies to THIS booking: a normal booking reprices
+    # for the dl-paid difference; a casino/comped booking can't reprice without
+    # forfeiting the comp, so the desk's category-difference (dl-rate) governs.
+    # Bold the governing column so the two deltas don't read as equals.
+    BOLD = "\033[1m"
+    prefer_rate = bool(struct.get('isCasino')) or not isinstance(paid_basis, (int, float))
+
+    def _emph(cell: str, on: bool) -> str:
+        return f"{BOLD}{cell}{RESET}" if on else cell
+
     log(f"\t{BLUE}Upgrade options (subtype lead-in prices, this booking's guests){RESET}")
     if isinstance(paid_basis, (int, float)):
         basis_note = ("gross paid (fare+taxes unavailable)" if basis_is_gross
                       else "fare + taxes paid; prepaid add-ons excluded")
         log(f"\t  dl-paid basis: {_upgrade_money(paid_basis)} ({basis_note})   "
             f"dl-rate basis: {_upgrade_money(booked_now)} (booked category today)")
-    header = f"\t  {'':1} {'cat':5} {'type':9} {'now':>12} {'dl-paid':>12} {'dl-rate':>12}  description"
-    log(header)
-    log("\t  " + "-" * (len(header) - 4))
+    # dashes are sized from the PLAIN header - ANSI emphasis must not stretch them
+    plain_header = f"\t  {'':1} {'cat':5} {'type':9} {'now':>12} {'dl-paid':>12} {'dl-rate':>12}  description"
+    shown_header = (plain_header.replace('dl-rate', f"{BOLD}dl-rate{RESET}") if prefer_rate
+                    else plain_header.replace('dl-paid', f"{BOLD}dl-paid{RESET}"))
+    log(shown_header)
+    log("\t  " + "-" * (len(plain_header) - 4))
     hits: List[str] = []
     threshold = config.upgrade_alert_below if isinstance(config.upgrade_alert_below, (int, float)) else None
     for r in candidates:
@@ -2240,7 +2253,8 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         d_rate = (r['price'] - booked_now) if isinstance(booked_now, (int, float)) else None
         mark = "*" if r.get('subtype') == booked_sub else " "
         log(f"\t  {mark} {str(r.get('category') or r.get('subtype')):5} {str(r.get('type')):9} "
-            f"{_upgrade_money(r['price']):>12} {_upgrade_delta(d_paid)} {_upgrade_delta(d_rate)}  "
+            f"{_upgrade_money(r['price']):>12} {_emph(_upgrade_delta(d_paid), not prefer_rate)} "
+            f"{_emph(_upgrade_delta(d_rate), prefer_rate)}  "
             f"{r.get('display_name', '')}")
 
         if threshold is not None and r.get('subtype') != booked_sub:
@@ -2256,8 +2270,11 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
 
     if struct.get('isCasino'):
         log(f"\t  {YELLOW}Note: casino-rate booking - a straight reprice (dl-paid) would forfeit "
-            f"the comp; dl-rate approximates the category difference a casino desk charges. "
-            f"Confirm with the casino desk before changing anything.{RESET}")
+            f"the comp; {BOLD}dl-rate{RESET}{YELLOW} approximates the category difference a casino "
+            f"desk charges. Confirm with the casino desk before changing anything.{RESET}")
+    elif isinstance(paid_basis, (int, float)):
+        log(f"\t  Upgrading or downgrading would use {BOLD}dl-paid{RESET} - "
+            f"the difference between a category's price today and what you paid.")
     if threshold is not None and booked_rank is None:
         log(f"\t  {YELLOW}Booked class unknown - upgrade alerts skipped for this booking.{RESET}")
 

@@ -4498,11 +4498,20 @@ class TestCheckForUpgrades:
         assert "Interior GTY" not in out          # guarantees excluded
         assert "Connecting Balcony" not in out    # connecting excluded
         assert "fare + taxes paid" in out
+        # normal booking: dl-paid is the governing column - bolded in the
+        # header, and the guidance line names it
+        assert "\033[1mdl-paid" in out
+        assert "\033[1mdl-rate" not in out
+        assert "Upgrading or downgrading would use" in out
 
     def test_casino_note_and_gross_fallback(self):
         out, _ = self._render(struct={"paid_price": 2050.0, "isCasino": True})
         assert "casino-rate booking" in out
         assert "gross paid" in out                # fareAndTaxes absent -> disclosed fallback
+        # casino booking: dl-rate governs (repricing forfeits the comp) - the
+        # header bolds dl-rate and the normal-booking guidance line is absent
+        assert "\033[1mdl-rate" in out
+        assert "Upgrading or downgrading would use" not in out
 
     def test_alert_fires_only_for_genuine_upgrades_at_threshold(self):
         import CheckRoyalCaribbeanPrice as CRCP
