@@ -4502,25 +4502,34 @@ class TestCheckForUpgrades:
         out, _, _ = self._render()
         # dl-paid for the Grand Suite: 2400 - 1700 = +700 (not 2400 - 2050 = +350)
         assert "+$700.00" in out and "+$350.00" not in out
-        # dl-rate anchored on the booked D row: 2400 - 1100 = +1300
-        assert "+$1,300.00" in out
         assert "Interior GTY" not in out          # guarantees excluded
         assert "Connecting Balcony" not in out    # connecting excluded
         assert "fare + taxes paid" in out
-        # normal booking: dl-paid is the governing column - bolded in the
-        # header, and the guidance line names it
-        assert "\033[1mdl-paid" in out
-        assert "\033[1mdl-rate" not in out
+        # normal booking: ONLY the governing dl-paid column renders - the
+        # dl-rate column, its basis line, and its values are absent entirely
+        assert "dl-rate" not in out
+        assert "+$1,300.00" not in out            # would be GS dl-rate
         assert "Upgrading or downgrading would use" in out
+        assert "\033[1mdl-paid" in out           # named in the guidance line
 
     def test_casino_note_and_gross_fallback(self):
         out, _, _ = self._render(struct={"paid_price": 2050.0, "isCasino": True})
         assert "casino-rate booking" in out
-        assert "gross paid" in out                # fareAndTaxes absent -> disclosed fallback
         # casino booking: dl-rate governs (repricing forfeits the comp) - the
-        # header bolds dl-rate and the normal-booking guidance line is absent
+        # dl-paid COLUMN disappears (the word survives only inside the note)
+        header = next(l for l in out.split("\n") if "cat" in l and "type" in l)
+        assert "dl-rate" in header and "dl-paid" not in header
+        assert "dl-paid basis" not in out
         assert "\033[1mdl-rate" in out
         assert "Upgrading or downgrading would use" not in out
+        # GS dl-rate vs booked lead-in 1100: +1300 shown; dl-paid +350/+700 absent
+        assert "+$1,300.00" in out and "+$350.00" not in out and "+$700.00" not in out
+
+    def test_gross_fallback_disclosed_for_normal_booking(self):
+        out, _, _ = self._render(struct={"paid_price": 2050.0, "isCasino": False})
+        assert "gross paid" in out                # fareAndTaxes absent -> disclosed
+        # dl-paid still governs: GS 2400 - 2050 = +350
+        assert "+$350.00" in out
 
     def test_alert_fires_only_for_genuine_upgrades_at_threshold(self):
         import CheckRoyalCaribbeanPrice as CRCP
@@ -4550,15 +4559,23 @@ class TestCheckForUpgrades:
 
     def test_family_categories_expand_with_exact_dl_rate_anchor(self):
         """The booked family's lead-in row expands into per-category rows, and
-        dl-rate anchors on the EXACT booked category (2D), not the family's
-        cheapest lead-in (4D)."""
-        out, _, mock_family = self._render(family={"2D": 1180.0, "4D": 1100.0})
+        dl-rate (shown for casino bookings) anchors on the EXACT booked
+        category (2D), not the family's cheapest lead-in (4D)."""
+        out, _, mock_family = self._render(
+            struct={"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": True},
+            family={"2D": 1180.0, "4D": 1100.0})
         # family fetched for the booked row's stateroom type
         assert mock_family.call_args.args[1] == "BALCONY"
         # both sister categories rendered; the booked category carries the star
         assert "* 2D" in out and "  4D" in out
         # Grand Suite dl-rate: 2400 - 1180 (exact 2D) = +1220, not 2400 - 1100
         assert "+$1,220.00" in out and "+$1,300.00" not in out
+
+    def test_family_categories_show_dl_paid_for_normal_booking(self):
+        out, _, _ = self._render(family={"2D": 1180.0, "4D": 1100.0})
+        # sister categories against the fare+taxes basis: 1180-1700 / 1100-1700
+        assert "-$520.00" in out and "-$600.00" in out
+        assert "dl-rate" not in out
 
     def test_should_apply_dp340_gate(self):
         from CheckRoyalCaribbeanPrice import should_apply_dp340
