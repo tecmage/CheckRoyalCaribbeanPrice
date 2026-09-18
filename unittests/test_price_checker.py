@@ -4470,6 +4470,7 @@ class TestCheckForUpgrades:
         assert struct["fareAndTaxes"] == 1700.0     # fare + taxes, NOT gross 2050
         assert struct["isCasino"] is True
         assert struct["depositType"] == "NRD"
+        assert struct["isAgency"] is False
         assert struct["bookedWithDP340"] is True
         assert struct["dp340Eligible"] is False      # no loyalty points on record
 
@@ -4629,6 +4630,18 @@ class TestCheckForUpgrades:
         assert "couponCode" not in bodies[1]["rooms"][0]
         assert bodies[0]["rooms"][0]["qualifiers"] == {"loyaltyNumber": "123456"}
         assert bodies[0]["rooms"][0]["adultCount"] == 2
+
+    def test_agency_booking_gets_ta_note(self):
+        """TA money is invisible to Royal's ledger: agent fees/rebates never
+        appear in dl-paid, and any upgrade goes through the TA. Say so."""
+        out, _, _ = self._render(struct={
+            "paid_price": 2050.0, "fareAndTaxes": 1700.0,
+            "isCasino": False, "isAgency": True})
+        assert "TA/group booking" in out
+        assert "goes through your TA" in out
+
+        out2, _, _ = self._render()
+        assert "TA/group booking" not in out2
 
     def test_nrd_notes_follow_deposit_type(self):
         nrd_rows = [

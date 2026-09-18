@@ -2071,6 +2071,7 @@ def get_voyages(
             if isinstance(discounted_fare, (int, float)) and isinstance(taxes_and_fees, (int, float)):
                 paid_price_struct['fareAndTaxes'] = round(discounted_fare + taxes_and_fees, 2)
             paid_price_struct['isCasino'] = casino_rate_flag
+            paid_price_struct['isAgency'] = is_agency_booking(booking)
             if "DEPOSIT_NOT_REFUNDABLE" in refundabilities:
                 paid_price_struct['depositType'] = "NRD"
             elif "REFUNDABLE" in refundabilities:
@@ -2396,6 +2397,11 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     elif isinstance(paid_basis, (int, float)):
         log(f"\t  Upgrading or downgrading would use {BOLD}dl-paid{RESET} - "
             f"the difference between a category's price today and what you paid.")
+
+    if struct.get('isAgency'):
+        log(f"\t  {YELLOW}TA/group booking: figures are Royal's ledger - your agent's own fees "
+            f"or discounts aren't visible here, and any reprice or upgrade goes through your "
+            f"TA (who may charge their own change fee).{RESET}")
 
     # Royal's published NRD deposit rules, same notes the fork's checker shows
     quotes_nrd = any(r.get('refundability') == "DEPOSIT_NOT_REFUNDABLE" for r in candidates)
