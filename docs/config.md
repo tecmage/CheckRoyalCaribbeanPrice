@@ -159,3 +159,23 @@ logFile: "output.txt"
 outputWatchAsJson: true # Optional, write the watchlist add-on prices from each run to a JSON file
 outputJsonFile: "output-json-watch.txt" # Optional, override the JSON output path
 ```
+
+## Upgrade checking (optional)
+
+Set `checkForUpgrades: true` to list, under each booked cruise, what every other
+stateroom subtype costs right now - priced for your booking's guests, loyalty
+number and qualifiers, from the same room-selection sweep the price check
+already performs (no extra API requests). Two deltas are shown per row:
+
+- **dl-paid**: against what you actually paid, on a fare + taxes basis (prepaid
+  gratuities/packages are excluded, since a reprice keeps them).
+- **dl-rate**: against your booked category's rate today - the category-difference
+  math an upgrade or casino desk works from. Club Royale casino-rate bookings get
+  a note, since a straight reprice would forfeit the comp.
+
+Optionally set `upgradeAlertBelow: 100` to send one Apprise alert per booking
+listing upgrade options (a higher class, or a pricier non-niche category in your
+class) whose category-difference cost is at or below that amount.
+
+Phase 1 shows each subtype family's lead-in price; per-category sister prices
+(e.g. 2D alongside 4D) and DP340 solo pricing are planned as a follow-up.

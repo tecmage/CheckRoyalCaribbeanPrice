@@ -4365,3 +4365,200 @@ def test_availability_exact_match_still_wins_unchanged():
         available, alternates = check_if_room_is_available(params)
     assert available is True and alternates == []
     assert params.stateroom_subtype == "D"
+
+
+# ============================================================================
+# checkForUpgrades (Phase 1): collection sweep, deltas, alerts
+# ============================================================================
+def _upgrade_rsc(subtypes):
+    """RSC payload with several subtype rows: (type, code, cat, name, total, gty)."""
+    return json.dumps({"rooms": [{"options": {"stateroomTypes": [
+        {"code": t, "stateroomSubtypes": [{
+            "code": code, "categoryCode": cat, "name": name,
+            "pricing": {"invoice": {"total": total}},
+            "roomsLeft": 5, "guarantee": gty,
+        }]} for (t, code, cat, name, total, gty) in subtypes
+    ]}}]})
+
+
+_UPGRADE_SWEEP = [
+    ("INTERIOR", "ZI", "ZI", "Interior GTY", 655.0, True),
+    ("INTERIOR", "V", "4U", "Interior", 756.0, False),
+    ("BALCONY", "D", "4D", "Ocean View Balcony", 1100.0, False),
+    ("BALCONY", "DC", "4DC", "Connecting Balcony", 1150.0, False),
+    ("DELUXE", "GS", "GS", "Grand Suite", 2400.0, False),
+]
+
+
+class TestCheckForUpgrades:
+
+    def _collect(self, subtype="D", category="2D", fixture=None):
+        params = _availability_params(subtype=subtype, category_code=category)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = fixture or _upgrade_rsc(_UPGRADE_SWEEP)
+        with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_resp):
+            available, rows = check_if_room_is_available(params, collect_all=True)
+        return params, available, rows
+
+    def test_collect_all_sweeps_past_the_exact_match(self):
+        """Default behavior returns (True, []) at the booked subtype; collect_all
+        completes the sweep so the upgrade table sees every row - including the
+        booked one, which anchors the dl-rate column."""
+        _, available, rows = self._collect()
+        assert available is True
+        assert [r["subtype"] for r in rows] == ["ZI", "V", "D", "DC", "GS"]
+        booked = next(r for r in rows if r["subtype"] == "D")
+        assert booked["price"] == 1100.0 and booked["type"] == "BALCONY"
+        assert next(r for r in rows if r["subtype"] == "ZI")["guarantee"] is True
+        assert next(r for r in rows if r["subtype"] == "DC")["connecting"] is True
+
+    def test_collect_all_renamed_code_still_adopts_and_collects(self):
+        """The letters fallback (renamed funnel codes, the exact place upstream
+        got stuck before #118) must keep working under collect_all: the booked
+        code is rewritten AND the rows come back."""
+        params, available, rows = self._collect(subtype="U", category="2U")
+        assert available is True
+        assert params.stateroom_subtype == "V"     # U -> V adopted as before
+        assert len(rows) == len(_UPGRADE_SWEEP)
+
+    def test_ledger_supplies_fare_taxes_and_casino_flag(self):
+        """get_voyages must hand the upgrade report an honest dl-paid basis
+        (fare + taxes - a reprice keeps prepaid add-ons) plus casino-rate
+        detection, even when the casino marker sits on a zero-amount OPTIONS
+        record."""
+        account_info = AccountInfo(username="test_user", password="password", cruise_line="royal")
+        account_info.access = MagicMock()
+        account_info.access.token = "fake_token"
+        account_info.access.id = "fake_id"
+
+        def mock_api_router(*args, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            url = args[2] if len(args) > 2 else kwargs.get("url", "")
+            if "profileBookings" in url:
+                mock_resp.json.return_value = {"payload": {"profileBookings": [{
+                    "bookingId": "1234567", "passengerId": "33333333",
+                    "sailDate": "20261225", "numberOfNights": 7, "shipCode": "AL",
+                    "stateroomNumber": "6543", "stateroomType": "B",
+                    "passengersInStateroom": [{"firstName": "Matt", "lastName": "Smith",
+                                               "stateroomCategoryCode": "4D"}]}]}}
+            else:
+                mock_resp.json.return_value = {"payload": []}
+            return mock_resp
+
+        ledger = {"dining_selection": [], "prices": [
+            {"priceTypeCode": "GROSS_TOTALS", "amount": 2050.0},
+            {"priceTypeCode": "DISCOUNTED_CRUISE_FARE", "amount": 1500.0},
+            {"priceTypeCode": "TAXES_AND_FEES", "amount": 200.0},
+            {"priceTypeCode": "OPTIONS", "amount": 0.0, "priceItems": [
+                {"code": "CAS1", "description": "CASINO DISC - GOBO"}]},
+        ]}
+        mock_metrics = {"passenger_names": "Matt Smith", "checkin_string": "Boarding Time 11:00",
+                        "category_code": "4D", "sub_type": "4D"}
+        with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
+             patch('CheckRoyalCaribbeanPrice._calculate_passenger_metrics', return_value=mock_metrics), \
+             patch('CheckRoyalCaribbeanPrice.get_dining_and_prices', return_value=ledger), \
+             patch('CheckRoyalCaribbeanPrice.get_checkin_info'), \
+             patch('CheckRoyalCaribbeanPrice.get_cruise_price') as mock_price:
+            get_voyages(account_info, CruiseURLParams(), ShipRegistry())
+
+        struct = mock_price.call_args.kwargs["paid_price_struct"]
+        assert struct["fareAndTaxes"] == 1700.0     # fare + taxes, NOT gross 2050
+        assert struct["isCasino"] is True
+
+    def _render(self, struct=None, rows=None, threshold=None, subtype="D",
+                cabin_class="BALCONY"):
+        import CheckRoyalCaribbeanPrice as CRCP
+        params = _availability_params(subtype=subtype, category_code="2D")
+        params.cabin_class_string = cabin_class
+        rich = rows if rows is not None else [
+            {"type": t, "subtype": code, "category": cat, "display_name": name,
+             "name": f"{name} {cat} {code}", "price": total, "rooms_left": 5,
+             "guarantee": gty, "connecting": "connect" in name.lower()}
+            for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP]
+        CRCP.config.upgrade_alert_below = threshold
+        apobj = MagicMock()
+        logged = []
+        with patch('CheckRoyalCaribbeanPrice.log',
+                   side_effect=lambda m, *a, **k: logged.append(str(m))):
+            CRCP._maybe_report_upgrades(
+                params, {"upgrade_rows": rich},
+                struct if struct is not None else
+                {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False},
+                "2027-01-29 Ovation BALCONY 2D", "1234567", apobj)
+        return "\n".join(logged), apobj
+
+    def test_table_uses_fare_taxes_basis_and_excludes_gty_connecting(self):
+        out, _ = self._render()
+        # dl-paid for the Grand Suite: 2400 - 1700 = +700 (not 2400 - 2050 = +350)
+        assert "+$700.00" in out and "+$350.00" not in out
+        # dl-rate anchored on the booked D row: 2400 - 1100 = +1300
+        assert "+$1,300.00" in out
+        assert "Interior GTY" not in out          # guarantees excluded
+        assert "Connecting Balcony" not in out    # connecting excluded
+        assert "fare + taxes paid" in out
+
+    def test_casino_note_and_gross_fallback(self):
+        out, _ = self._render(struct={"paid_price": 2050.0, "isCasino": True})
+        assert "casino-rate booking" in out
+        assert "gross paid" in out                # fareAndTaxes absent -> disclosed fallback
+
+    def test_alert_fires_only_for_genuine_upgrades_at_threshold(self):
+        import CheckRoyalCaribbeanPrice as CRCP
+        out, apobj = self._render(threshold=1500.0)
+        apobj.notify.assert_called_once()
+        body = apobj.notify.call_args.kwargs["body"]
+        assert "Grand Suite" in body              # class jump within threshold
+        assert "Interior" not in body             # downgrade never alerts
+        assert "1234567" in body
+        CRCP.config.upgrade_alert_below = None
+
+    def test_no_alert_without_threshold_and_no_table_without_rows(self):
+        out, apobj = self._render(threshold=None)
+        apobj.notify.assert_not_called()
+        out2, apobj2 = self._render(rows=[], threshold=1500.0)
+        assert out2 == ""                          # flag path: no rows -> silent
+        apobj2.notify.assert_not_called()
+
+    def test_gty_booking_gets_paid_only_table(self):
+        """A GTY booking has no subtype row of its own: dl-rate column empty,
+        class rank falls back to the URL's cabin class, no crash."""
+        out, apobj = self._render(subtype="XB", threshold=1500.0)
+        assert "+$700.00" in out                  # dl-paid still computed
+        assert "Grand Suite" in out
+
+    def test_flag_off_and_watchlist_never_collect(self, mock_global_config, base_account_info):
+        import CheckRoyalCaribbeanPrice as CRCP
+        CRCP.config.check_for_upgrades = False
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                   return_value={"room_available": False}) as mock_price:
+            get_cruise_price(
+                account_info=base_account_info,
+                booking={"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
+                         "stateroomType": "B", "stateroomSubtype": "4D",
+                         "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]},
+                ship_dictionary=ShipRegistry(),
+                automatic_URL=True)
+        assert mock_price.call_args.kwargs.get("collect_all") is False
+
+        CRCP.config.check_for_upgrades = True
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                   return_value={"room_available": False}) as mock_price:
+            get_cruise_price(
+                account_info=base_account_info,
+                booking={"url": _WATCH_URL, "stateroomType": "SUITE"},
+                ship_dictionary=ShipRegistry(),
+                automatic_URL=False)      # watchlist: never collect
+        assert mock_price.call_args.kwargs.get("collect_all") is False
+
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                   return_value={"room_available": False}) as mock_price:
+            get_cruise_price(
+                account_info=base_account_info,
+                booking={"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
+                         "stateroomType": "B", "stateroomSubtype": "4D",
+                         "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]},
+                ship_dictionary=ShipRegistry(),
+                automatic_URL=True)       # booked + flag on -> collect
+        assert mock_price.call_args.kwargs.get("collect_all") is True
