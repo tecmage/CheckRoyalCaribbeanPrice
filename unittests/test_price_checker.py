@@ -4972,24 +4972,26 @@ class TestCheckForUpgrades:
         assert "[NRD rate]" not in out4 and "[refundable rate]" not in out4
         assert "refundable-deposit rates" not in out4
 
-    def test_casino_booking_gets_no_fare_tags_and_no_ta_note(self):
-        """Live finding: Club Royale bookings are flagged as agency bookings in
-        the payload and read as 'refundable' against all-NRD quotes - the table
-        printed [NRD rate] on all 13 rows plus 'goes through your TA' for a
-        booking that goes through the casino desk."""
+    def test_casino_booking_gets_no_fare_tags_but_keeps_a_real_ta_note(self):
+        """Live finding: a casino comp read as 'refundable' against all-NRD
+        quotes, stamping [NRD rate] on all 13 rows - moot on a comped fare.
+        The same booking WAS genuinely TA-booked, so its TA note is correct and
+        must stay; the casino note then names the TA as a contact too."""
         casino = {"paid_price": 1277.12, "isCasino": True, "isAgency": True,
                   "depositType": "REFUNDABLE"}
         rows = self._fare_rows(["DEPOSIT_NOT_REFUNDABLE", "REFUNDABLE",
                                 "DEPOSIT_NOT_REFUNDABLE"])       # even when mixed
         out, _, _ = self._render(rows=rows, struct=casino)
         assert "[NRD rate]" not in out and "[refundable rate]" not in out
-        assert "TA/group booking" not in out
         assert "casino-rate booking" in out
         assert "A cheaper category returns nothing on a comped fare" in out
+        assert "TA/group booking" in out                   # TA-booked comp: both notes
+        assert "Confirm with your TA or the casino desk" in out
 
-        # a genuine (non-casino) TA booking still gets its note
-        out2, _, _ = self._render(rows=rows, struct=dict(casino, isCasino=False))
-        assert "TA/group booking" in out2
+        # a casino comp booked direct: no TA note, desk-only wording
+        out2, _, _ = self._render(rows=rows, struct=dict(casino, isAgency=False))
+        assert "TA/group booking" not in out2
+        assert "Confirm with the casino desk" in out2
 
     def test_connecting_cabin_booking_keeps_its_own_family(self):
         """A booking IN a connecting cabin was filtered out of its own table

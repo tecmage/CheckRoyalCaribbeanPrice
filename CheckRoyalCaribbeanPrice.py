@@ -2527,7 +2527,8 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         log(f"\t  {YELLOW}Note: casino-rate booking - a straight reprice (dl-paid) would forfeit "
             f"the comp; {BOLD}dl-rate{RESET}{YELLOW} approximates the category difference a casino "
             f"desk charges to move UP. A cheaper category returns nothing on a comped fare. "
-            f"Confirm with the casino desk before changing anything.{RESET}")
+            f"Confirm with {'your TA or ' if struct.get('isAgency') else ''}the casino desk "
+            f"before changing anything.{RESET}")
         if casino_without_anchor:
             log(f"\t  {YELLOW}No comparable rate row was returned for this booking, so dl-paid "
                 f"is shown instead - treat it as a rough guide only.{RESET}")
@@ -2544,9 +2545,9 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         log(f"\t  {YELLOW}Past final payment: upgrades are still possible at today's rates, "
             f"but a cheaper category returns no refund (shown as {sym}0.00).{RESET}")
 
-    # (live: casino bookings are flagged as agency bookings - Club Royale is the
-    # "agency" - and the casino note above already says who to call)
-    if struct.get('isAgency') and not is_casino:
+    # A casino comp CAN be TA-booked (seen live), so this note is independent
+    # of the casino note: both apply, and the casino note names the TA too.
+    if struct.get('isAgency'):
         log(f"\t  {YELLOW}TA/group booking: figures are Royal's ledger - your agent's own fees "
             f"or discounts aren't visible here, and any reprice or upgrade goes through your "
             f"TA (who may charge their own change fee).{RESET}")
