@@ -69,8 +69,8 @@ cabin moves are allowed in that mode.
 
 For every booking on your account, shows **what it would cost to move to a better
 stateroom** on the same sailing. Reads the booking's real pricing ledger from the
-amend page, then prices every category currently for sale – with your loyalty number
-and the booking's guest count – and shows two deltas per candidate:
+amend page, then prices every category currently for sale – with your loyalty number,
+your residency discount and the booking's guest count – and shows two deltas per candidate:
 
 - **dl-paid** – candidate's current all-in total minus your fare + taxes today
   (what a straight repricing would owe; prepaid gratuities/insurance/packages are

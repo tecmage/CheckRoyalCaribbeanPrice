@@ -77,6 +77,9 @@ def build_account(config_path: str):
     account.access = crccl.login(account)
     state, loyalty, points = crccl.get_profile(account)
     account.access.loyalty_number = loyalty
+    # a state set on the account in config.yaml overrides the profile's, same
+    # precedence the main checker uses for the residency discount
+    state = a.get("state") or state
     return account, state, loyalty, points, data
 
 
@@ -239,7 +242,8 @@ def _rsc_get(account, url: str, params: Dict[str, Any]):
 
 
 def get_sailing_inventory(account, booking: Dict[str, Any], loyalty: Optional[str],
-                          dp340: bool = False) -> List[Dict[str, Any]]:
+                          dp340: bool = False,
+                          state: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every stateroom subtype currently for sale on the booking's sailing, with the
     subtype-level all-in total (taxes included) priced for this booking's guest count
     and the account's loyalty number. One RSC call (two when a DP340-priced request
@@ -261,6 +265,13 @@ def get_sailing_inventory(account, booking: Dict[str, Any], loyalty: Optional[st
         params["r0l"] = str(loyalty)
     if dp340:
         params["r0i"] = "DP340"   # single-supplement code, same param as the main checker
+    if state:
+        # The funnel's own residency parameter. This sweep never sent it while
+        # the per-category request and the main checker's checkout POST did, so
+        # every OTHER family's price lacked the residency discount - verified
+        # live: adding it dropped those rows ~7% and closed a gap between a
+        # family's sweep price and its per-category price.
+        params["r0k"] = state
 
     def fetch() -> List[Dict[str, Any]]:
         r = _rsc_get(account, f"https://www.{account.url_brand}.com/room-selection/type-and-subtype",
@@ -295,11 +306,17 @@ def get_sailing_inventory(account, booking: Dict[str, Any], loyalty: Optional[st
         log(f"{YELLOW}DP340-priced request returned nothing; retrying without the code{RESET}")
         params.pop("r0i", None)
         out = fetch()
+    if state and not out:
+        # same defensive shape: never let an added qualifier blank the table
+        log(f"{YELLOW}Residency-priced request returned nothing; retrying without it{RESET}")
+        params.pop("r0k", None)
+        out = fetch()
     return out
 
 
 def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: str,
-                        loyalty: Optional[str], dp340: bool = False) -> Dict[str, float]:
+                        loyalty: Optional[str], dp340: bool = False,
+                        state: Optional[str] = None) -> Dict[str, float]:
     """Per-CATEGORY all-in totals inside one subtype (e.g. 2D vs 4D), via the
     room-selection JSON API with the loyalty qualifier."""
     sd = str(booking.get("sailDate") or "")
@@ -312,8 +329,13 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
         "accessible": False, "selectionFallbackStrategy": "RECOMMENDATION",
         "editMode": True, "reset": False, "taxesAndFeesBundled": True,
     }
+    qualifiers: Dict[str, Any] = {}
     if loyalty:
-        room["qualifiers"] = {"loyaltyNumber": str(loyalty)}
+        qualifiers["loyaltyNumber"] = str(loyalty)
+    if state:
+        qualifiers["stateCode"] = state        # as the main checker's checkout POST sends
+    if qualifiers:
+        room["qualifiers"] = qualifiers
     if dp340:
         room["couponCode"] = "DP340"   # same field the main checker sets on this API
     flt = {"countryCode": booking.get("bookingOfficeCountryCode") or "USA",
@@ -332,7 +354,8 @@ def get_category_prices(account, booking: Dict[str, Any], subtype: str, stype: s
             return {}
         if log:   # bound in build_account(); unit tests may call without it
             log(f"{YELLOW}DP340-priced category request failed; retrying without the code{RESET}")
-        return get_category_prices(account, booking, subtype, stype, loyalty, dp340=False)
+        return get_category_prices(account, booking, subtype, stype, loyalty,
+                                   dp340=False, state=state)
 
     try:
         # Sept 2026: Royal switched this endpoint to POST-with-JSON-body; the old
@@ -389,7 +412,8 @@ def delta(v: Optional[float], width: int = 12) -> str:
 def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
                    limit: int,
                    alert_below: Optional[float] = None,
-                   dp340_ok: bool = False) -> List[str]:
+                   dp340_ok: bool = False,
+                   state: Optional[str] = None) -> List[str]:
     bid = booking.get("bookingId")
     guests = booking.get("passengersInStateroom") or []
     booked_cat = next((g.get("stateroomCategoryCode") for g in guests
@@ -442,7 +466,8 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         log("  DP340 single-supplement discount is applied on this booking")
     apply_dp340 = should_apply_dp340(dp340_ok, booked_with_dp340, len(guests))
 
-    inventory = get_sailing_inventory(account, booking, loyalty, dp340=apply_dp340)
+    inventory = get_sailing_inventory(account, booking, loyalty, dp340=apply_dp340,
+                                      state=state)
     if not inventory:
         log(f"  {YELLOW}No categories currently for sale on this sailing "
             f"(sold out or too close to departure) - cannot price upgrades.{RESET}")
@@ -469,7 +494,7 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
                 booked_type = renamed["type"]
         if booked_type:
             cat_prices = get_category_prices(account, booking, booked_sub, booked_type, loyalty,
-                                             dp340=apply_dp340)
+                                             dp340=apply_dp340, state=state)
             booked_now = cat_prices.get(booked_cat)
 
     if booked_now is not None:
@@ -495,6 +520,8 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         return []
 
     loyalty_note = "loyalty applied" if loyalty else "loyalty UNAVAILABLE - rack rates"
+    if state:
+        loyalty_note += f", {state} residency applied"
     if apply_dp340:
         loyalty_note += " + DP340"
     log(f"\n  Current prices for {max(1, len(guests))} guest(s), {loyalty_note} "
@@ -586,7 +613,7 @@ def main() -> None:
                              "upgradeAlertBelow in config.yaml)")
     args = parser.parse_args()
 
-    account, _state, loyalty, points, data = build_account(args.config)
+    account, state, loyalty, points, data = build_account(args.config)
     dp340_ok = dp340_eligible(account, points)
     if dp340_ok:
         log(f"Diamond Plus 340+: solo bookings will be priced with the DP340 code")
@@ -617,7 +644,8 @@ def main() -> None:
                 f"(no sail date or amend token).{RESET}")
             continue
         all_hits += report_booking(account, booking, loyalty, args.limit,
-                                   alert_below=alert_below, dp340_ok=dp340_ok)
+                                   alert_below=alert_below, dp340_ok=dp340_ok,
+                                   state=state)
 
     if alert_below is not None:
         if all_hits:

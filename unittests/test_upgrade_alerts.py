@@ -318,7 +318,7 @@ def test_booked_subtype_resolves_renamed_funnel_code(monkeypatch):
     ]
     captured = {}
 
-    def fake_cat_prices(account, booking, subtype, stype, loyalty, dp340=False):
+    def fake_cat_prices(account, booking, subtype, stype, loyalty, dp340=False, state=None):
         captured["subtype"] = subtype
         return {"2U": 769.0}
 
@@ -353,7 +353,7 @@ def test_renamed_fallback_skips_connecting_rooms(monkeypatch):
     ]
     captured = {}
 
-    def fake_cat_prices(account, booking, subtype, stype, loyalty, dp340=False):
+    def fake_cat_prices(account, booking, subtype, stype, loyalty, dp340=False, state=None):
         captured["subtype"] = subtype
         return {"2U": 769.0}
 
@@ -531,3 +531,64 @@ def test_sailing_inventory_parses_rsc_payload(monkeypatch):
         {"type": "BALCONY", "subtype": "DC", "category": "4DC", "name": "Connecting Balcony",
          "guarantee": False, "connecting": True, "total": None, "refundability": None},
     ]
+
+
+def test_inventory_sweep_sends_residency_and_falls_back(monkeypatch):
+    """The sweep never sent the residency state while the per-category request
+    and the main checker's checkout POST did - so every OTHER family's price
+    lacked the residency discount (verified live: ~7% too high). r0k is the
+    funnel's own residency parameter; an empty residency-priced response
+    retries once without it rather than blanking the table."""
+    import CheckRoyalCaribbeanUpgrades as up
+    captured = []
+
+    def fake_rsc_get(account, url, params):
+        captured.append(dict(params))
+        return None                      # empty -> exercises the fallback
+
+    monkeypatch.setattr(up, "_rsc_get", fake_rsc_get)
+    monkeypatch.setattr(up, "log", lambda *a, **k: None)
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+
+    booking = {"sailDate": "20270815", "packageCode": "WN07X123",
+               "passengersInStateroom": [{"firstName": "A"}, {"firstName": "B"}]}
+    up.get_sailing_inventory(_Acct(), booking, "123456", state="CA")
+    assert captured[0].get("r0k") == "CA"
+    assert len(captured) == 2 and "r0k" not in captured[1]      # one retry, without it
+
+    captured.clear()
+    up.get_sailing_inventory(_Acct(), booking, "123456")         # no state on file
+    assert all("r0k" not in c for c in captured)
+
+
+def test_category_prices_send_state_qualifier(monkeypatch):
+    import CheckRoyalCaribbeanUpgrades as up
+    bodies = []
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"rooms": [{"roomNumbers": {"categories": [
+                {"categoryCode": "2D", "pricing": {"invoice": {"total": 1180.0}}}]}}]}
+
+    class _Session:
+        def post(self, url, json=None, headers=None):
+            bodies.append(json)
+            return _Resp()
+
+    class _Acct:
+        url_brand = "royalcaribbean"
+        is_royal = True
+        access = type("A", (), {"session": _Session()})()
+
+    booking = {"sailDate": "20270815", "packageCode": "WN07X123",
+               "passengersInStateroom": [{"firstName": "A"}, {"firstName": "B"}]}
+    prices = up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456", state="CA")
+    assert prices == {"2D": 1180.0}
+    assert bodies[0]["rooms"][0]["qualifiers"] == {"loyaltyNumber": "123456", "stateCode": "CA"}
+
+    bodies.clear()
+    up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456")
+    assert bodies[0]["rooms"][0]["qualifiers"] == {"loyaltyNumber": "123456"}
