@@ -162,28 +162,41 @@ outputJsonFile: "output-json-watch.txt" # Optional, override the JSON output pat
 
 ## Upgrade checking (optional)
 
-Set `checkForUpgrades: true` to list, under each booked cruise, what every other
-stateroom subtype costs right now - priced for your booking's guests, loyalty
-number and qualifiers, from the same room-selection sweep the price check
-already performs (no extra API requests). Two deltas are shown per row:
+Set `checkForUpgrades: true` to list, under each booked cruise, what the other
+staterooms on the sailing cost right now - priced for your booking's guests,
+loyalty number and qualifiers. The rows come from the same room-selection sweep
+the price check already performs; your booked family additionally shows its
+per-category sister prices (e.g. 2D alongside 4D), which costs one extra request
+per booking (set `upgradeSisterCategories: false` to skip it and see each
+family's cheapest tier only).
 
-- **dl-paid**: against what you actually paid, on a fare + taxes basis (prepaid
-  gratuities/packages are excluded, since a reprice keeps them).
-- **dl-rate**: against your booked category's rate today - the category-difference
-  math an upgrade or casino desk works from. Club Royale casino-rate bookings get
-  a note, since a straight reprice would forfeit the comp.
+**One delta column is shown - the one that applies to your booking:**
+
+- **dl-paid** for a normal booking: a category's price today minus what you
+  paid. The "paid" basis is, in order: a `reservationPricePaid` you configured
+  (less any prepaid gratuities/insurance the ledger shows, since the rows are bare
+  cabin totals), otherwise the ledger's fare + taxes, otherwise the gross total.
+  The basis line under the table heading always says which one was used.
+- **dl-rate** for a Club Royale casino/comped booking: a category's price today
+  minus your booked category's rate today - the category-difference a casino desk
+  charges, since a straight reprice would forfeit the comp. GTY bookings anchor
+  on their own guarantee row, or the cheapest guarantee of the same class.
+
+Things the table tells you when they apply: an upgrade replaces your original
+promotions/onboard credit with today's; cheaper rows are effectively reprices,
+which Royal may refuse in place when the current sale is "new bookings only";
+after final payment a cheaper category returns no refund (shown as 0.00) while
+upgrades remain possible; rows priced on a different deposit type than your
+booking are tagged `[NRD rate]` / `[refundable rate]`; TA/group bookings are
+flagged because agent fees and discounts never appear in Royal's ledger.
+Guarantee, connecting and sold-out (0 rooms left) rows are not offered.
 
 Scope the check with `upgradeReservations: ["1234567"]` to run it only for the
-listed reservation IDs (absent or empty = every booking). Set
-`upgradeSisterCategories: false` to skip the per-category request and show each
-family's cheapest tier only.
+listed reservation IDs (absent or empty = every booking; a listed ID that matches
+no booking is warned about).
 
 Optionally set `upgradeAlertBelow: 100` to send one Apprise alert per booking
-listing upgrade options (a higher class, or a pricier non-niche category in your
-class) whose category-difference cost is at or below that amount.
-
-The booked family additionally shows its per-category sister prices (e.g. 2D
-alongside 4D), fetched with one extra request per booking; solo bookings on a
-Royal account with 340+ Crown & Anchor points (or already booked with the code)
-have that family quoted with the DP340 single-supplement discount. Bookings on
-non-refundable-deposit fares get Royal's published NRD change/cancel notes.
+listing genuine upgrades (a higher class, or a pricier non-niche category within
+your class) whose cost - on the same basis the table shows - is at or below that
+amount. Solo bookings the main checker prices with the DP340 single-supplement
+code (or that were booked with it) have the booked family quoted with it too.
