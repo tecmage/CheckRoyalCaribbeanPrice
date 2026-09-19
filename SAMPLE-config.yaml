@@ -46,5 +46,7 @@ logFile: "output.txt"
 # historyDb: "price_history.db" # Optional (off by default). Uncomment to append every price check to a local SQLite file for history/trends
 # checkForUpgrades: true # Optional (off by default). For each booked cruise, also list what better staterooms cost right now - vs what you paid (fare+taxes) and vs your category's current rate
 # upgradeAlertBelow: 100 # Optional, needs checkForUpgrades. Send an Apprise alert when an upgrade's category-difference cost is at or below this amount
+# upgradeReservations: ["1234567"] # Optional, needs checkForUpgrades. Only run the upgrade check for these reservation IDs (absent/empty = every booking)
+# upgradeSisterCategories: false # Optional, needs checkForUpgrades. Set false to skip the per-category prices inside your booked family (one fewer API request per booking; the table then shows each family's cheapest tier only)
 outputWatchAsJson: true # Optional, if true, will write the watchlist price results to a JSON file for external consumption
 outputJsonFile: "output-json-watch.txt" # Optional, only needed if you want to override the default output file name for the watchlist price results JSON file

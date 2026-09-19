@@ -4556,6 +4556,74 @@ class TestCheckForUpgrades:
         assert "+$700.00" in out                  # dl-paid still computed
         assert "Grand Suite" in out
 
+    def test_upgrade_reservations_scopes_collection(self, mock_global_config, base_account_info):
+        import CheckRoyalCaribbeanPrice as CRCP
+        CRCP.config.check_for_upgrades = True
+        booking = {"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
+                   "stateroomType": "B", "stateroomSubtype": "4D",
+                   "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]}
+
+        CRCP.config.upgrade_reservations = ["9999999"]     # different booking
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                   return_value={"room_available": False}) as mock_price:
+            get_cruise_price(account_info=base_account_info, booking=booking,
+                             ship_dictionary=ShipRegistry(), automatic_URL=True)
+        assert mock_price.call_args.kwargs.get("collect_all") is False
+
+        CRCP.config.upgrade_reservations = [1234567]       # listed (int form ok)
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                   return_value={"room_available": False}) as mock_price:
+            get_cruise_price(account_info=base_account_info, booking=booking,
+                             ship_dictionary=ShipRegistry(), automatic_URL=True)
+        assert mock_price.call_args.kwargs.get("collect_all") is True
+
+        CRCP.config.upgrade_reservations = []              # empty = every booking
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                   return_value={"room_available": False}) as mock_price:
+            get_cruise_price(account_info=base_account_info, booking=booking,
+                             ship_dictionary=ShipRegistry(), automatic_URL=True)
+        assert mock_price.call_args.kwargs.get("collect_all") is True
+
+    def test_sister_categories_toggle_skips_family_request(self):
+        import CheckRoyalCaribbeanPrice as CRCP
+        CRCP.config.upgrade_sister_categories = False
+        out, _, mock_family = self._render(family={"2D": 1180.0})
+        mock_family.assert_not_called()
+        assert "4D" in out                     # lead-in row still renders
+        CRCP.config.upgrade_sister_categories = True
+        out2, _, mock_family2 = self._render(family={"2D": 1180.0})
+        mock_family2.assert_called_once()
+
+    def test_config_loads_upgrade_scoping_keys(self, tmp_path):
+        yaml_content = """
+        accountInfo:
+          - username: "test_user"
+            password: "password123"
+        checkForUpgrades: true
+        upgradeReservations:
+          - 1234567
+          - "7654321"
+        upgradeSisterCategories: false
+        """
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(yaml_content)
+        with patch('CheckRoyalCaribbeanPrice.setup_hybrid_logging'):
+            cfg = load_config_objects(str(config_file))
+        assert cfg.upgrade_reservations == ["1234567", "7654321"]   # normalized to str
+        assert cfg.upgrade_sister_categories is False
+
+        # present-but-null section must not crash (the #125 class)
+        config_file.write_text("""
+        accountInfo:
+          - username: "test_user"
+            password: "password123"
+        upgradeReservations:
+        """)
+        with patch('CheckRoyalCaribbeanPrice.setup_hybrid_logging'):
+            cfg = load_config_objects(str(config_file))
+        assert cfg.upgrade_reservations == []
+        assert cfg.upgrade_sister_categories is True                # default on
+
     # ---------------- Phase 2: booked-family categories, DP340, NRD ----------
 
     def test_family_categories_expand_with_exact_dl_rate_anchor(self):

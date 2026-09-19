@@ -173,6 +173,11 @@ already performs (no extra API requests). Two deltas are shown per row:
   math an upgrade or casino desk works from. Club Royale casino-rate bookings get
   a note, since a straight reprice would forfeit the comp.
 
+Scope the check with `upgradeReservations: ["1234567"]` to run it only for the
+listed reservation IDs (absent or empty = every booking). Set
+`upgradeSisterCategories: false` to skip the per-category request and show each
+family's cheapest tier only.
+
 Optionally set `upgradeAlertBelow: 100` to send one Apprise alert per booking
 listing upgrade options (a higher class, or a pricier non-niche category in your
 class) whose category-difference cost is at or below that amount.

@@ -615,6 +615,8 @@ class CruiseAppConfig:
     history_db: Optional[str] = None
     check_for_upgrades: bool = False
     upgrade_alert_below: Optional[float] = None
+    upgrade_reservations: List[str] = field(default_factory=list)
+    upgrade_sister_categories: bool = True
     output_watch_as_json: bool = False
     output_json_watch_file: Optional[str] = "output-json-watch.txt"
     apprise_urls: List[str] = field(default_factory=list)
@@ -2305,7 +2307,9 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
                                      bool(struct.get('bookedWithDP340')), guest_count)
     family_prices: Dict[str, float] = {}
     dp340_used = False
-    if booked_row is not None:
+    if booked_row is not None and config.upgrade_sister_categories is not False:
+        # upgradeSisterCategories: false skips the per-category request - the
+        # table then shows each family's lead-in only (and no extra API call)
         family_prices, dp340_used = _get_upgrade_category_prices(
             url_params, booked_row.get('type'), dp340=apply_dp340)
     booked_cat = url_params.stateroom_category_code
@@ -2566,6 +2570,13 @@ def get_cruise_price(account_info: AccountInfo,
     # every subtype row from the same availability sweep (no extra requests);
     # booked cruises only - upgrade tables mean nothing for a watchlist URL.
     collect_upgrades = bool(automatic_URL and config.check_for_upgrades is True)
+    if collect_upgrades:
+        # optional scoping: upgradeReservations limits the upgrade check (and
+        # its extra family request) to the listed bookings only
+        _upgrade_scope = (config.upgrade_reservations
+                          if isinstance(config.upgrade_reservations, (list, set, tuple)) else [])
+        if _upgrade_scope and str(reservation_id) not in [str(r) for r in _upgrade_scope]:
+            collect_upgrades = False
     results = get_room_price_via_API(url_params, room_number, collect_all=collect_upgrades)
     room_available = results.get("room_available")
 
@@ -4400,6 +4411,9 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         check_for_upgrades=bool(data.get("checkForUpgrades", False)),
         upgrade_alert_below=(float(data["upgradeAlertBelow"])
                              if data.get("upgradeAlertBelow") is not None else None),
+        # ids normalized to str once here (YAML users write them unquoted)
+        upgrade_reservations=[str(r) for r in (data.get("upgradeReservations") or [])],
+        upgrade_sister_categories=bool(data.get("upgradeSisterCategories", True)),
         output_watch_as_json=data.get("outputWatchAsJson",False),
         output_json_watch_file=data.get("outputJsonFile","output-json-watch.txt"),
         apobj=apobj,
