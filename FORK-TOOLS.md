@@ -106,6 +106,11 @@ pricier category within your class – whose category-difference cost is at or b
 Uses the top-level `apprise:` URLs from your config (per-account apprise entries
 are ignored by this tool). Without a threshold set the script is display-only.
 
+Guarantee categories are listed tagged `[GTY]` - often the cheapest way up a class,
+but the cruise line assigns the cabin and you can't choose it - and connecting cabins
+tagged `[connecting]`. Both alert only as a move to a higher class, never as a
+pricier option within your own class, and keep their tag in the alert.
+
 Notes: uses the first `accountInfo` entry in your config. Sailings with no inventory
 for sale (sold out / too close to departure) are reported as such rather than priced.
 `--limit N` caps how many candidate categories are listed per booking (0 = all).

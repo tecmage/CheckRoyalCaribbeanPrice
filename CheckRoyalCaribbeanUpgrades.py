@@ -113,6 +113,12 @@ def should_apply_dp340(eligible: bool, booked_with_code: bool, guest_count: int)
     return (eligible or booked_with_code) and guest_count == 1
 
 
+def product_tags(row: Dict[str, Any]) -> List[str]:
+    """Display tags for products that are listed but are not an ordinary cabin pick."""
+    return (["[GTY]"] if row.get("guarantee") else []) + \
+           (["[connecting]"] if row.get("connecting") else [])
+
+
 def build_apprise(data: Dict[str, Any]):
     """Apprise notifier from any apprise URLs in the configuration (or None)."""
     urls = [i["url"] for i in data.get("apprise", []) if isinstance(i, dict) and "url" in i]
@@ -504,8 +510,9 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         log(f"  Booked category {booked_cat} is not currently for sale "
             f"(dl-rate column unavailable).")
 
-    rows = [r for r in inventory
-            if r["total"] is not None and not r["guarantee"] and not r["connecting"]]
+    # Guarantee and connecting rows ARE listed (tagged): a guarantee is often the
+    # cheapest way up a class, and a connecting cabin is a real bookable cabin.
+    rows = [r for r in inventory if r["total"] is not None]
     # The table rows are each subtype's lead-in category; if the booked category is a
     # different tier of its subtype (e.g. booked 2D when 4D is the lead-in), add it as
     # its own row so it appears starred in the list.
@@ -543,11 +550,13 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         d_paid = (r["total"] - paid) if isinstance(paid, (int, float)) else None
         d_rate = (r["total"] - booked_now) if isinstance(booked_now, (int, float)) else None
 
+        product = product_tags(r)
         if not limit or shown < limit:
             mark = "*" if (r["category"] == booked_cat or
                            (booked_now is None and r["subtype"] == booked_sub)) else " "
             log(f"    {mark} {str(r['category'] or r['subtype']):5} {str(r['type']):8} "
-                f"{money(r['total']):>12} {delta(d_paid)} {delta(d_rate)}  {r['name']}")
+                f"{money(r['total']):>12} {delta(d_paid)} {delta(d_rate)}  {r['name']}"
+                + "".join(f"  {t}" for t in product))
             shown += 1
 
         # Alerting scans EVERY row regardless of the display --limit: a HIGHER-class
@@ -556,19 +565,33 @@ def report_booking(account, booking: Dict[str, Any], loyalty: Optional[str],
         if alert_below is not None and r["category"] != booked_cat:
             basis = d_rate if d_rate is not None else d_paid
             # An upgrade is a higher CLASS, or a pricier category within the same class
-            # (e.g. Balcony 2D -> Spacious Balcony 4B)
-            is_upgrade = is_upgrade_candidate(booked_rank, booked_now,
+            # (e.g. Balcony 2D -> Spacious Balcony 4B). Within the booked class
+            # "pricier" is no proxy for "better" on a guarantee (no cabin choice) or
+            # a connecting cabin (same cabin with a door): those alert only as a move
+            # UP a class, which withholding the same-class anchor enforces
+            is_upgrade = is_upgrade_candidate(booked_rank, None if product else booked_now,
                                               TYPE_RANK.get(r["type"]), r["total"],
                                               r.get("name") or "")
             if basis is not None and basis <= alert_below and is_upgrade:
                 sign = "+" if basis > 0 else "-" if basis < 0 else ""
                 via = "" if d_rate is not None else " (vs fare+taxes paid)"
                 hits.append(f"{booking.get('shipCode')} {sail_disp} #{bid}: "
-                            f"{booked_cat} -> {r['category']} {r['name']} "
-                            f"for {sign}${abs(basis):,.2f}{via} "
+                            f"{booked_cat} -> {r['category']} {r['name']}"
+                            + "".join(f" {t}" for t in product) +
+                            f" for {sign}${abs(basis):,.2f}{via} "
                             f"(now ${r['total']:,.2f})")
     if limit and len(rows) > limit:
         log(f"    ... and {len(rows) - limit} more (use --limit 0 to show all)")
+
+    shown_rows = rows[:limit] if limit else rows
+    tag_notes = []
+    if any(r.get("guarantee") for r in shown_rows):
+        tag_notes.append("[GTY] = guarantee fare: the cruise line assigns the cabin and "
+                         "its location - you can't choose it")
+    if any(r.get("connecting") for r in shown_rows):
+        tag_notes.append("[connecting] = has a door to the adjoining cabin")
+    if tag_notes:
+        log("  " + "; ".join(tag_notes) + ".")
 
     if ledger["is_casino"]:
         log(f"  {YELLOW}Note: casino-rate booking - a straight repricing (dl-paid) would forfeit "

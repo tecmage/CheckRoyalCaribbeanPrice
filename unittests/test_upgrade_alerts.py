@@ -342,8 +342,8 @@ def test_booked_subtype_resolves_renamed_funnel_code(monkeypatch):
 
 def test_renamed_fallback_skips_connecting_rooms(monkeypatch):
     """The letters fallback must not resolve a booked code to a connecting-room
-    subtype: connecting categories price differently and are excluded from the
-    upgrade table, so resolving to one priced the wrong product."""
+    subtype: connecting categories price differently, so resolving to one
+    priced the wrong product."""
     import CheckRoyalCaribbeanUpgrades as up
     inventory = [
         {"type": "INTERIOR", "subtype": "IC", "category": "4U", "name": "Interior Connecting",
@@ -592,3 +592,83 @@ def test_category_prices_send_state_qualifier(monkeypatch):
     bodies.clear()
     up.get_category_prices(_Acct(), booking, "D", "BALCONY", "123456")
     assert bodies[0]["rooms"][0]["qualifiers"] == {"loyaltyNumber": "123456"}
+
+
+def _tagged_inventory(extra=()):
+    base = [
+        ("INTERIOR", "ZI", "ZI", "Interior GTY", 655.0, True),
+        ("INTERIOR", "V", "4U", "Interior", 756.0, False),
+        ("BALCONY", "D", "4D", "Ocean View Balcony", 1100.0, False),
+        ("BALCONY", "DC", "4DC", "Connecting Balcony", 1150.0, False),
+        ("DELUXE", "GS", "GS", "Grand Suite", 2400.0, False),
+    ]
+    return [{"type": t, "subtype": code, "category": cat, "name": name,
+             "guarantee": gty, "connecting": "connect" in name.lower(),
+             "total": total, "refundability": None}
+            for (t, code, cat, name, total, gty) in base + list(extra)]
+
+
+def _report_tagged(monkeypatch, inventory, subtype, category, cat_prices, limit=0):
+    import CheckRoyalCaribbeanUpgrades as up
+    monkeypatch.setattr(up, "get_sailing_inventory", lambda *a, **k: inventory)
+    monkeypatch.setattr(up, "get_category_prices", lambda *a, **k: cat_prices)
+    monkeypatch.setattr(up, "read_ledger", lambda a, b: {
+        "gross": 1700.0, "original_fare": 1700.0, "discounted_fare": 1500.0, "discount": -200.0,
+        "taxes": 200.0, "payments_applied": 1700.0, "balance_due": None, "deposit_type": None,
+        "casino_items": [], "promo_items": [], "is_casino": False})
+    logged = []
+    monkeypatch.setattr(up, "log", lambda m, *a, **k: logged.append(str(m)))
+    booking = {"bookingId": "1234567", "sailDate": "20270111", "shipCode": "OV",
+               "stateroomNumber": "9999", "stateroomSubtype": subtype,
+               "passengersInStateroom": [{"stateroomCategoryCode": category, "firstName": "A"},
+                                         {"stateroomCategoryCode": category, "firstName": "B"}]}
+    hits = up.report_booking(None, booking, "123456", limit=limit, alert_below=5000.0)
+    return "\n".join(logged), "\n".join(hits)
+
+
+def test_guarantee_and_connecting_rows_are_listed_with_tags(monkeypatch):
+    """They used to be hidden - a default inherited from the same-cabin finder.
+    A guarantee is often the cheapest way up a class, so hiding it hid the best
+    row; listing it needs the tag so nobody expects to choose the cabin."""
+    out, hits = _report_tagged(
+        monkeypatch, _tagged_inventory([("BALCONY", "XB", "XB", "Balcony GTY", 950.0, True)]),
+        subtype="V", category="4U", cat_prices={"4U": 756.0})
+    lines = out.split("\n")
+    gty_line = next(l for l in lines if "Interior GTY" in l)
+    assert "[GTY]" in gty_line and "[connecting]" not in gty_line
+    conn_line = next(l for l in lines if "Connecting Balcony" in l)
+    assert "[connecting]" in conn_line and "[GTY]" not in conn_line
+    plain_line = next(l for l in lines if "Grand Suite" in l)
+    assert "[GTY]" not in plain_line and "[connecting]" not in plain_line
+    assert "[GTY] = guarantee fare" in out and "[connecting] = has a door" in out
+    # from an interior both are genuine class jumps: alerted, tag riding along
+    assert "Balcony GTY [GTY] for" in hits
+    assert "Connecting Balcony [connecting] for" in hits
+    assert "Interior GTY" not in hits                     # same class, and cheaper
+
+
+def test_guarantee_and_connecting_never_alert_within_the_booked_class(monkeypatch):
+    """Within the booked class 'pricier' stands in for 'better' - untrue of a
+    guarantee (no cabin choice) or a connecting cabin (same cabin plus a door)."""
+    out, hits = _report_tagged(
+        monkeypatch, _tagged_inventory([
+            ("BALCONY", "XB", "XB", "Balcony GTY", 1120.0, True),
+            ("BALCONY", "E", "2E", "Spacious Balcony", 1200.0, False)]),
+        subtype="D", category="2D", cat_prices={"2D": 1100.0})
+    assert "Spacious Balcony for" in hits                 # ordinary pricier balcony alerts
+    assert "Grand Suite for" in hits
+    assert "Balcony GTY" not in hits and "Connecting Balcony" not in hits
+    assert "Balcony GTY" in out and "Connecting Balcony" in out      # still listed
+
+
+def test_tag_legend_only_when_a_tagged_row_is_shown(monkeypatch):
+    plain = [r for r in _tagged_inventory() if not r["guarantee"] and not r["connecting"]]
+    out, _ = _report_tagged(monkeypatch, plain, subtype="D", category="2D",
+                            cat_prices={"2D": 1100.0})
+    assert "[GTY]" not in out and "[connecting]" not in out
+    assert not any(l.strip() == "." for l in out.split("\n"))
+    # --limit hides rows: the legend must describe only what is on screen
+    out2, _ = _report_tagged(monkeypatch, _tagged_inventory(), subtype="D", category="2D",
+                             cat_prices={"2D": 1100.0}, limit=1)
+    assert "Interior GTY" in out2 and "[GTY] = guarantee fare" in out2
+    assert "[connecting] =" not in out2                   # that row is past the limit
