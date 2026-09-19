@@ -45,6 +45,7 @@ from CheckRoyalCaribbeanPrice import (
     ShipRegistry,
     WatchItemContext,
     _booking_country_code,
+    _booking_payment_market,
     _build_checkout_url,
     _calculate_passenger_metrics,
     _execute_api_request,
@@ -63,6 +64,9 @@ from CheckRoyalCaribbeanPrice import (
     get_orders,
     get_profile,
     get_room_price_via_API,
+    _get_upgrade_category_prices,
+    _maybe_report_upgrades,
+    _UPGRADE_SCOPE_SEEN,
     get_ship_dictionary_web,
     get_voyages,
     history,
@@ -226,10 +230,10 @@ def test_checkout_post_failure_is_not_reported_as_not_for_sale(mock_global_confi
     exhausted): that is NOT 'Not For Sale'. No push, no not_for_sale history
     row - a network blip used to false-alert watchers and poison back-in-stock
     queries with a permanent not_for_sale/notified=1 record."""
-    import CheckRoyalCaribbeanPrice as CRCP
 
     with patch('CheckRoyalCaribbeanPrice.check_if_room_is_available', return_value=(True, [])), \
-         patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=None):
+         patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=None), \
+         patch('CheckRoyalCaribbeanPrice.history') as mock_history:
         get_cruise_price(
             account_info=base_account_info,
             booking={"url": _WATCH_URL, "stateroomType": "SUITE"},
@@ -238,16 +242,16 @@ def test_checkout_post_failure_is_not_reported_as_not_for_sale(mock_global_confi
         )
 
     mock_global_config.notify.assert_not_called()
-    kwargs = CRCP.history.record_cabin_fare.call_args.kwargs
+    kwargs = mock_history.record_cabin_fare.call_args.kwargs
     assert kwargs["status"] == "no_price_data"
 
 
 def test_availability_fetch_failure_is_not_reported_as_not_for_sale(mock_global_config, base_account_info):
     """check_if_room_is_available returning None (its request failed) must not
     be pushed or recorded as Not For Sale either."""
-    import CheckRoyalCaribbeanPrice as CRCP
 
-    with patch('CheckRoyalCaribbeanPrice.check_if_room_is_available', return_value=(None, [])):
+    with patch('CheckRoyalCaribbeanPrice.check_if_room_is_available', return_value=(None, [])), \
+         patch('CheckRoyalCaribbeanPrice.history') as mock_history:
         get_cruise_price(
             account_info=base_account_info,
             booking={"url": _WATCH_URL, "stateroomType": "SUITE"},
@@ -256,18 +260,18 @@ def test_availability_fetch_failure_is_not_reported_as_not_for_sale(mock_global_
         )
 
     mock_global_config.notify.assert_not_called()
-    kwargs = CRCP.history.record_cabin_fare.call_args.kwargs
+    kwargs = mock_history.record_cabin_fare.call_args.kwargs
     assert kwargs["status"] == "no_price_data"
 
 
 def test_post_empty_rooms_still_reports_not_for_sale(mock_global_config, base_account_info):
     """Control: a checkout POST that SUCCEEDS with no rooms is a genuine
     sold-out - the watchlist push and the not_for_sale row are unchanged."""
-    import CheckRoyalCaribbeanPrice as CRCP
 
     empty_resp = MagicMock()
     empty_resp.json.return_value = {"rooms": []}
     with patch('CheckRoyalCaribbeanPrice.check_if_room_is_available', return_value=(True, [])), \
+         patch('CheckRoyalCaribbeanPrice.history') as mock_history, \
          patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=empty_resp):
         get_cruise_price(
             account_info=base_account_info,
@@ -278,7 +282,7 @@ def test_post_empty_rooms_still_reports_not_for_sale(mock_global_config, base_ac
 
     mock_global_config.notify.assert_called_once()
     assert "Not For Sale" in mock_global_config.notify.call_args[1]['body']
-    kwargs = CRCP.history.record_cabin_fare.call_args.kwargs
+    kwargs = mock_history.record_cabin_fare.call_args.kwargs
     assert kwargs["status"] == "not_for_sale"
 
 
@@ -929,7 +933,6 @@ def test_reservation_price_paid_dict_of_dicts_prices_not_crashes():
     - the payment-override path reads that shape explicitly, but the paid-price
     path did float(dict) and the TypeError killed the entire run at the first
     booking."""
-    import CheckRoyalCaribbeanPrice as CRCP
     account_info = AccountInfo(username="test_user", password="password", cruise_line="royal")
     account_info.access = MagicMock()
     account_info.access.token = "fake_token"
@@ -950,12 +953,15 @@ def test_reservation_price_paid_dict_of_dicts_prices_not_crashes():
             mock_resp.json.return_value = {"payload": []}
         return mock_resp
 
-    CRCP.config.reservation_prices = {
+    mock_config = CruiseAppConfig()
+    mock_config.reservation_prices = {
         "1234567": {"paidPrice": 900.0, "finalPaymentDaysBeforeSailing": 90}}
-    CRCP.config.display_cruise_prices = True
+    mock_config.display_cruise_prices = True
+
     mock_metrics = {"passenger_names": "Matt Smith", "checkin_string": "Boarding Time 11:00",
                     "category_code": "4D", "sub_type": "4D"}
-    with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
+    with patch('CheckRoyalCaribbeanPrice.config', mock_config), \
+         patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
          patch('CheckRoyalCaribbeanPrice._calculate_passenger_metrics', return_value=mock_metrics), \
          patch('CheckRoyalCaribbeanPrice.get_dining_and_prices',
                return_value={"dining_selection": [], "prices": []}), \
@@ -968,8 +974,9 @@ def test_reservation_price_paid_dict_of_dicts_prices_not_crashes():
     assert mock_price.call_args.kwargs["paid_price_struct"]["paidPriceOverridden"] is True
 
     # a null configured price is NOT an override (list shape)
-    CRCP.config.reservation_prices = [{"reservation": "1234567", "paidPrice": None}]
-    with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
+    mock_config.reservation_prices = [{"reservation": "1234567", "paidPrice": None}]
+    with patch('CheckRoyalCaribbeanPrice.config', mock_config), \
+         patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
          patch('CheckRoyalCaribbeanPrice._calculate_passenger_metrics', return_value=mock_metrics), \
          patch('CheckRoyalCaribbeanPrice.get_dining_and_prices',
                return_value={"dining_selection": [], "prices": []}), \
@@ -3489,7 +3496,6 @@ class TestFinalPaymentDate:
         office. A code MARKET_RULES doesn't know must fall through to the
         next candidate - resolve_lead_time silently defaults unknown codes
         to the US windows, which would turn a 30-day market into 90 days."""
-        from CheckRoyalCaribbeanPrice import _booking_payment_market
 
         # CHS is now a known alias, so the market wins directly
         assert _booking_payment_market(
@@ -3509,7 +3515,6 @@ class TestFinalPaymentDate:
         """The real shape from #99: CHS market / DEU office, 7 nights,
         sails 2026-12-27 -> final payment 30 days out, 2026-11-27 (via the
         CHS alias; the DEU fallback would agree - both are 30-day markets)."""
-        from CheckRoyalCaribbeanPrice import _booking_payment_market
 
         resolved = get_final_payment_date(
             number_of_nights=7,
@@ -3523,12 +3528,11 @@ class TestFinalPaymentDate:
     @patch("CheckRoyalCaribbeanPrice.get_room_price_via_API")
     @patch("CheckRoyalCaribbeanPrice.notifier_for")
     def test_best_price_past_final_payment_records_distinct_decision(
-        self, mock_notifier, mock_api_pricing
+        self, mock_notifier, mock_api_pricing, mock_global_history
     ):
         """'past_final_payment' historically meant a LOWER price you are locked
         out of; a best-price booking past final payment (#119 display note)
         must record a distinct value so history queries can tell them apart."""
-        import CheckRoyalCaribbeanPrice as CRCP
 
         mock_notifier.return_value = None
         mock_api_pricing.return_value = {
@@ -3536,6 +3540,7 @@ class TestFinalPaymentDate:
             "sailing_nights": 7,
             "base_fare": {"fare": 1100.0, "gratuities": 0.0, "insurance": 0.0, "obc": 0.0},
         }
+
         mock_account = MagicMock()
         mock_account.access.session = MagicMock()
         registry = MagicMock()
@@ -3548,7 +3553,7 @@ class TestFinalPaymentDate:
         }
         # the price-history sink is the module-global `history` (PR #115
         # refactor), patched per-test by the autouse mock_global_history fixture
-        CRCP.history.record_cabin_fare.reset_mock()
+        mock_global_history.record_cabin_fare.reset_mock()
 
         get_cruise_price(
             account_info=mock_account,
@@ -3558,7 +3563,7 @@ class TestFinalPaymentDate:
                                "finalPaymentDate": "2020-01-01"},
         )
 
-        kwargs = CRCP.history.record_cabin_fare.call_args.kwargs
+        kwargs = mock_global_history.record_cabin_fare.call_args.kwargs
         assert kwargs["status"] == "priced"
         assert kwargs["rebook_decision"] == "best_price_past_final_payment"
 
@@ -4491,8 +4496,8 @@ class TestCheckForUpgrades:
     def _render(self, struct=None, rows=None, threshold=None, subtype="D",
                 cabin_class="BALCONY", family=None, family_dp340=False, adults=2,
                 category="2D", coupon=None, coupon_rejected=False,
-                past_final_payment=False, currency="USD", family_raises=False):
-        import CheckRoyalCaribbeanPrice as CRCP
+                past_final_payment=False, currency="USD", family_raises=False,
+                sister=True, results_extra=None):
         params = _availability_params(subtype=subtype, category_code=category)
         params.cabin_class_string = cabin_class
         params.number_of_adults = adults
@@ -4503,17 +4508,20 @@ class TestCheckForUpgrades:
              "name": f"{name} {cat} {code}", "price": total, "rooms_left": 5,
              "guarantee": gty, "connecting": "connect" in name.lower()}
             for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP]
-        CRCP.config.upgrade_alert_below = threshold
+        cfg = CruiseAppConfig(upgrade_alert_below=threshold,
+                              upgrade_sister_categories=sister)
         apobj = MagicMock()
         logged = []
-        with patch('CheckRoyalCaribbeanPrice.log',
+        with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+             patch('CheckRoyalCaribbeanPrice.log',
                    side_effect=lambda m, *a, **k: logged.append(str(m))), \
              patch('CheckRoyalCaribbeanPrice._get_upgrade_category_prices',
                    return_value=(family or {}, family_dp340)) as mock_family:
             if family_raises:
                 mock_family.side_effect = RuntimeError("boom")
-            CRCP._maybe_report_upgrades(
-                params, {"upgrade_rows": rich, "coupon_rejected": coupon_rejected},
+            _maybe_report_upgrades(
+                params, dict({"upgrade_rows": rich, "coupon_rejected": coupon_rejected},
+                             **(results_extra or {})),
                 struct if struct is not None else
                 {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False},
                 "2027-01-29 Ovation BALCONY 2D", "1234567", apobj,
@@ -4565,14 +4573,12 @@ class TestCheckForUpgrades:
         assert "+$350.00" in out
 
     def test_alert_fires_only_for_genuine_upgrades_at_threshold(self):
-        import CheckRoyalCaribbeanPrice as CRCP
         out, apobj, _ = self._render(threshold=1500.0)
         apobj.notify.assert_called_once()
         body = apobj.notify.call_args.kwargs["body"]
         assert "Grand Suite" in body              # class jump within threshold
         assert "Interior" not in body             # downgrade never alerts
         assert "1234567" in body
-        CRCP.config.upgrade_alert_below = None
 
     def test_no_alert_without_threshold_and_no_table_without_rows(self):
         out, apobj, _ = self._render(threshold=None)
@@ -4589,43 +4595,43 @@ class TestCheckForUpgrades:
         assert "Grand Suite" in out
 
     def test_upgrade_reservations_scopes_collection(self, mock_global_config, base_account_info):
-        import CheckRoyalCaribbeanPrice as CRCP
-        CRCP.config.check_for_upgrades = True
         booking = {"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
                    "stateroomType": "B", "stateroomSubtype": "4D",
                    "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]}
 
-        CRCP.config.upgrade_reservations = ["9999999"]     # different booking
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+        cfg = CruiseAppConfig(check_for_upgrades=True,
+                              upgrade_reservations=["9999999"])       # different booking
+        with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+             patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
                    return_value={"room_available": False}) as mock_price:
             get_cruise_price(account_info=base_account_info, booking=booking,
                              ship_dictionary=ShipRegistry(), automatic_URL=True)
         assert mock_price.call_args.kwargs.get("collect_all") is False
 
-        CRCP.config.upgrade_reservations = [1234567]       # listed (int form ok)
-        CRCP._UPGRADE_SCOPE_SEEN.discard("1234567")
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+        cfg = CruiseAppConfig(check_for_upgrades=True,
+                              upgrade_reservations=[1234567])         # listed (int form ok)
+        _UPGRADE_SCOPE_SEEN.discard("1234567")
+        with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+             patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
                    return_value={"room_available": False}) as mock_price:
             get_cruise_price(account_info=base_account_info, booking=booking,
                              ship_dictionary=ShipRegistry(), automatic_URL=True)
         assert mock_price.call_args.kwargs.get("collect_all") is True
-        assert "1234567" in CRCP._UPGRADE_SCOPE_SEEN       # feeds the typo warning
+        assert "1234567" in _UPGRADE_SCOPE_SEEN            # feeds the typo warning
 
-        CRCP.config.upgrade_reservations = []              # empty = every booking
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+        cfg = CruiseAppConfig(check_for_upgrades=True)     # no scope = every booking
+        with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+             patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
                    return_value={"room_available": False}) as mock_price:
             get_cruise_price(account_info=base_account_info, booking=booking,
                              ship_dictionary=ShipRegistry(), automatic_URL=True)
         assert mock_price.call_args.kwargs.get("collect_all") is True
 
     def test_sister_categories_toggle_skips_family_request(self):
-        import CheckRoyalCaribbeanPrice as CRCP
-        CRCP.config.upgrade_sister_categories = False
-        out, _, mock_family = self._render(family={"2D": 1180.0})
+        out, _, mock_family = self._render(family={"2D": 1180.0}, sister=False)
         mock_family.assert_not_called()
         assert "4D" in out                     # lead-in row still renders
-        CRCP.config.upgrade_sister_categories = True
-        out2, _, mock_family2 = self._render(family={"2D": 1180.0})
+        out2, _, mock_family2 = self._render(family={"2D": 1180.0}, sister=True)
         mock_family2.assert_called_once()
 
     def test_config_loads_upgrade_scoping_keys(self, tmp_path):
@@ -4733,7 +4739,6 @@ class TestCheckForUpgrades:
         """The rooms POST carries the booking's occupancy/loyalty (and the
         DP340 coupon when asked); an empty coupon-priced response retries once
         without the code instead of silently losing the per-category view."""
-        import CheckRoyalCaribbeanPrice as CRCP
         params = _availability_params(subtype="D", category_code="2D")
         params.loyalty_number = "123456"
 
@@ -4751,7 +4756,7 @@ class TestCheckForUpgrades:
 
         with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=fake_net), \
              patch('CheckRoyalCaribbeanPrice.log', lambda *a, **k: None):
-            prices, dp340_used = CRCP._get_upgrade_category_prices(params, "BALCONY", dp340=True)
+            prices, dp340_used = _get_upgrade_category_prices(params, "BALCONY", dp340=True)
 
         assert prices == {"2D": 1180.0, "4D": 1100.0}
         assert dp340_used is False                      # succeeded on the retry
@@ -4995,54 +5000,35 @@ class TestCheckForUpgrades:
         assert "TA/group booking" in out2
 
     def test_checkout_price_is_the_authoritative_dl_rate_anchor(self):
-        """Replays a live booking: the main check priced the booked 2D at
-        1471.60 via checkout, but the rooms API omitted 2D - the table anchored
-        every delta on a 1557.60 lead-in and printed '2D returned no price'
-        directly beneath 'now 1471.60'. The checkout fare is authoritative, and
-        the booked category gets a starred row of its own."""
-        import CheckRoyalCaribbeanPrice as CRCP
+        """Replays a live shape: the main check priced the booked 2D via
+        checkout, but the rooms API omitted 2D - the table anchored every delta
+        on the family lead-in and printed '2D returned no price' directly
+        beneath the main line's 'now' figure. The checkout fare is
+        authoritative, and the booked category gets a starred row of its own."""
         rows = [{"type": t_, "subtype": code, "category": cat, "display_name": name,
                  "name": name, "price": total, "rooms_left": None, "guarantee": False,
                  "connecting": False, "refundability": None}
                 for (t_, code, cat, name, total) in [
-                    ("INTERIOR", "V", "4V", "Interior", 998.60),
-                    ("BALCONY", "D", "4D", "Ocean View Balcony", 1557.60),
-                    ("BALCONY", "B", "4B", "Spacious Ocean View Balcony", 1619.60),
-                    ("DELUXE", "OS", "OS", "Owner's Suite - 1 Bedroom", 7148.60)]]
-        params = _availability_params(subtype="D", category_code="2D")
-        params.cabin_class_string = "BALCONY"
-        CRCP.config.upgrade_alert_below = None
-        logged = []
-        results = {"upgrade_rows": rows,
-                   "base_fare": {"fare": 1471.60, "gratuities": 0.0, "insurance": 0.0}}
-        with patch('CheckRoyalCaribbeanPrice.log',
-                   side_effect=lambda m, *a, **k: logged.append(str(m))), \
-             patch('CheckRoyalCaribbeanPrice._get_upgrade_category_prices',
-                   return_value=({"4D": 1452.60}, False)):        # 2D omitted, as live
-            CRCP._maybe_report_upgrades(params, results,
-                                        {"paid_price": 1227.60, "isCasino": True},
-                                        "x", "1234567", None)
-        out = "\n".join(logged)
-        assert "dl-rate basis: $1,471.60 (your booked category 2D today)" in out
+                    ("INTERIOR", "V", "4V", "Interior", 900.0),
+                    ("BALCONY", "D", "4D", "Ocean View Balcony", 1500.0),   # sweep lead-in
+                    ("BALCONY", "B", "4B", "Spacious Ocean View Balcony", 1600.0),
+                    ("DELUXE", "OS", "OS", "Owner's Suite - 1 Bedroom", 7000.0)]]
+        out, _, _ = self._render(
+            rows=rows, family={"4D": 1400.0},                 # booked 2D omitted
+            struct={"paid_price": 1200.0, "isCasino": True},
+            results_extra={"base_fare": {"fare": 1450.0, "gratuities": 0.0,
+                                         "insurance": 0.0}})
+        assert "dl-rate basis: $1,450.00 (your booked category 2D today)" in out
         assert "returned no price" not in out
         assert "* 2D" in out                                 # starred row synthesized
-        assert "+$148.00" in out                             # 4B: 1619.60 - 1471.60
-        assert "+$62.00" not in out                          # the old lead-in anchor
+        assert "+$150.00" in out                             # 4B: 1600 - 1450 (checkout)
+        assert "+$100.00" not in out                         # ...not 1600 - 1500 (lead-in)
 
     def test_checkout_anchor_also_works_without_family_data(self):
-        import CheckRoyalCaribbeanPrice as CRCP
-        CRCP.config.upgrade_sister_categories = False        # no family request at all
-        rows = self._rich_rows()                             # booked family lead-in is 4D @ 1100
-        params = _availability_params(subtype="D", category_code="2D")
-        params.cabin_class_string = "BALCONY"
-        CRCP.config.upgrade_alert_below = None
-        logged = []
-        with patch('CheckRoyalCaribbeanPrice.log',
-                   side_effect=lambda m, *a, **k: logged.append(str(m))):
-            CRCP._maybe_report_upgrades(
-                params, {"upgrade_rows": rows, "base_fare": {"fare": 1180.0}},
-                {"paid_price": 900.0, "isCasino": True}, "x", "1234567", None)
-        out = "\n".join(logged)
+        out, _, _ = self._render(
+            sister=False,                                     # no family request at all
+            struct={"paid_price": 900.0, "isCasino": True},
+            results_extra={"base_fare": {"fare": 1180.0}})
         assert "* 2D" in out and "  4D" in out               # lead-in kept, exact row starred
         assert "marks your booked family's lead-in row" not in out
         assert "+$1,220.00" in out                           # GS 2400 - 1180 (exact anchor)
@@ -5130,24 +5116,19 @@ class TestCheckForUpgrades:
         assert len(rows) == len(_UPGRADE_SWEEP)              # bypass must not drop them
 
     def test_pricing_call_publishes_the_collected_rows(self):
-        import CheckRoyalCaribbeanPrice as CRCP
         rows = [{"subtype": "D", "price": 1100.0}]
         params = _availability_params(subtype="D", category_code="2D")
         with patch('CheckRoyalCaribbeanPrice.check_if_room_is_available',
                    return_value=(False, rows)) as gate:
-            res = CRCP.get_room_price_via_API(params, None, collect_all=True)
+            res = get_room_price_via_API(params, None, collect_all=True)
             assert gate.call_args.kwargs.get("collect_all") is True
             assert res["upgrade_rows"] == rows
-            res_off = CRCP.get_room_price_via_API(params, None)
+            res_off = get_room_price_via_API(params, None)
             assert "upgrade_rows" not in res_off
 
     def _e2e(self, account, results, struct, side_effect=None):
-        import CheckRoyalCaribbeanPrice as CRCP
-        CRCP.config.check_for_upgrades = True
-        CRCP.config.upgrade_reservations = []
-        CRCP.config.upgrade_alert_below = None
-        CRCP.config.upgrade_sister_categories = False        # no family POST here
-        CRCP.config.minimum_saving_alert = None              # mainline compares against it
+        cfg = CruiseAppConfig(check_for_upgrades=True,
+                              upgrade_sister_categories=False)   # no family POST here
         logged = []
         booking = {"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
                    "packageCode": "WN07X123", "stateroomType": "B",
@@ -5155,7 +5136,8 @@ class TestCheckForUpgrades:
                    "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101",
                                               "stateroomCategoryCode": "2D"}]}
         kwargs = {"side_effect": side_effect} if side_effect else {"return_value": results}
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API', **kwargs) as mock_price, \
+        with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+             patch('CheckRoyalCaribbeanPrice.get_room_price_via_API', **kwargs) as mock_price, \
              patch('CheckRoyalCaribbeanPrice.notifier_for', return_value=None), \
              patch('CheckRoyalCaribbeanPrice.log',
                    side_effect=lambda m, *a, **k: logged.append(str(m))):
@@ -5243,36 +5225,22 @@ class TestCheckForUpgrades:
         assert "NRD fare notes" not in out3             # casino overrides
 
     def test_flag_off_and_watchlist_never_collect(self, mock_global_config, base_account_info):
-        import CheckRoyalCaribbeanPrice as CRCP
-        CRCP.config.check_for_upgrades = False
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
-                   return_value={"room_available": False}) as mock_price:
-            get_cruise_price(
-                account_info=base_account_info,
-                booking={"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
-                         "stateroomType": "B", "stateroomSubtype": "4D",
-                         "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]},
-                ship_dictionary=ShipRegistry(),
-                automatic_URL=True)
-        assert mock_price.call_args.kwargs.get("collect_all") is False
+        booked = {"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
+                  "stateroomType": "B", "stateroomSubtype": "4D",
+                  "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]}
 
-        CRCP.config.check_for_upgrades = True
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
-                   return_value={"room_available": False}) as mock_price:
-            get_cruise_price(
-                account_info=base_account_info,
-                booking={"url": _WATCH_URL, "stateroomType": "SUITE"},
-                ship_dictionary=ShipRegistry(),
-                automatic_URL=False)      # watchlist: never collect
-        assert mock_price.call_args.kwargs.get("collect_all") is False
+        def collected(cfg, booking, automatic):
+            with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+                 patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                       return_value={"room_available": False}) as mock_price:
+                get_cruise_price(account_info=base_account_info, booking=booking,
+                                 ship_dictionary=ShipRegistry(), automatic_URL=automatic)
+            return mock_price.call_args.kwargs.get("collect_all")
 
-        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
-                   return_value={"room_available": False}) as mock_price:
-            get_cruise_price(
-                account_info=base_account_info,
-                booking={"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
-                         "stateroomType": "B", "stateroomSubtype": "4D",
-                         "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]},
-                ship_dictionary=ShipRegistry(),
-                automatic_URL=True)       # booked + flag on -> collect
-        assert mock_price.call_args.kwargs.get("collect_all") is True
+        # flag off (the default): never collect
+        assert collected(CruiseAppConfig(), booked, True) is False
+        on = CruiseAppConfig(check_for_upgrades=True)
+        # watchlist/prospective URL: never collect, even with the flag on
+        assert collected(on, {"url": _WATCH_URL, "stateroomType": "SUITE"}, False) is False
+        # booked cruise + flag on: collect
+        assert collected(on, booked, True) is True
