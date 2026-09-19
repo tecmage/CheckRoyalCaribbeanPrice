@@ -2392,6 +2392,29 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     anchor_exact = bool(booked_row and booked_cat and
                         (booked_cat in family_prices
                          or booked_row.get('category') == booked_cat))
+
+    # The main check's checkout POST has ALREADY priced the exact booked
+    # category - it is the "now X" printed on the line above this table - and
+    # that is the authoritative anchor. Seen live: the rooms API omitted a
+    # booked 2D that checkout priced fine, so the table anchored on a lead-in
+    # and claimed "2D returned no price" directly under "now 1471.60".
+    fare_key = "all_included_fare" if url_params.all_included else "base_fare"
+    checkout_fare = (results.get(fare_key) or {}).get("fare")
+    family_display: Dict[str, float] = dict(family_prices)
+    if (isinstance(checkout_fare, (int, float)) and not isinstance(checkout_fare, bool)
+            and checkout_fare > 0):
+        booked_now = float(checkout_fare)
+        anchor_exact = True
+        rate_anchor_label = (f"your booked category {booked_cat} today" if booked_cat
+                             else "your booked cabin today")
+        # make sure the exact booked category has a (starred) row of its own
+        if booked_row is not None and booked_cat:
+            lead_cat = booked_row.get('category')
+            if (not family_display and lead_cat and lead_cat != booked_cat
+                    and isinstance(booked_row.get('price'), (int, float))):
+                family_display[lead_cat] = booked_row['price']     # keep the lead-in visible
+            if family_display or lead_cat != booked_cat:
+                family_display[booked_cat] = float(checkout_fare)
     alert_booked_now = booked_now if anchor_exact else None
 
     # ---- dl-paid basis: configured price > ledger fare+taxes > gross ---------
@@ -2441,9 +2464,9 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     for r in rows:
         if not listable(r):
             continue
-        if r is booked_row and family_prices:
+        if r is booked_row and family_display:
             table_rows.extend({**booked_row, 'category': code, 'price': total}
-                              for code, total in sorted(family_prices.items(),
+                              for code, total in sorted(family_display.items(),
                                                         key=lambda kv: kv[1]))
         elif isinstance(r.get('price'), (int, float)):
             table_rows.append(r)
@@ -2485,7 +2508,7 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     threshold = config.upgrade_alert_below if isinstance(config.upgrade_alert_below, (int, float)) else None
     for r in table_rows:
         is_booked_cat = (r.get('subtype') == booked_sub
-                         and (not family_prices or r.get('category') == booked_cat))
+                         and (not family_display or r.get('category') == booked_cat))
         anchor_price = booked_now if prefer_rate else paid_basis
         delta = (r['price'] - anchor_price) if isinstance(anchor_price, (int, float)) else None
         if delta is not None and delta < 0 and not is_booked_cat:
@@ -2511,7 +2534,7 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
 
     # ---- notes ---------------------------------------------------------------
     if booked_row is not None and not anchor_exact:
-        if family_prices and booked_cat:
+        if family_display and booked_cat:
             log(f"\t  Your category {booked_cat} returned no price today (it may be sold out "
                 f"within its family) - no row is starred.")
         elif booked_cat:
@@ -2527,7 +2550,7 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         log(f"\t  {YELLOW}Note: casino-rate booking - a straight reprice (dl-paid) would forfeit "
             f"the comp; {BOLD}dl-rate{RESET}{YELLOW} approximates the category difference a casino "
             f"desk charges to move UP. A cheaper category returns nothing on a comped fare. "
-            f"Confirm with {'your TA or ' if struct.get('isAgency') else ''}the casino desk "
+            f"Confirm with the casino desk - or your travel agent, if one booked this comp - "
             f"before changing anything.{RESET}")
         if casino_without_anchor:
             log(f"\t  {YELLOW}No comparable rate row was returned for this booking, so dl-paid "
@@ -2545,9 +2568,11 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         log(f"\t  {YELLOW}Past final payment: upgrades are still possible at today's rates, "
             f"but a cheaper category returns no refund (shown as {sym}0.00).{RESET}")
 
-    # A casino comp CAN be TA-booked (seen live), so this note is independent
-    # of the casino note: both apply, and the casino note names the TA too.
-    if struct.get('isAgency'):
+    # Two live data points: is_agency_booking() fired for a comp a TA really
+    # booked AND for one booked directly with the casino - on a casino-rate
+    # booking the flag cannot tell them apart. So no separate TA note there;
+    # the casino note is worded to be true either way.
+    if struct.get('isAgency') and not is_casino:
         log(f"\t  {YELLOW}TA/group booking: figures are Royal's ledger - your agent's own fees "
             f"or discounts aren't visible here, and any reprice or upgrade goes through your "
             f"TA (who may charge their own change fee).{RESET}")

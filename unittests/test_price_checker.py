@@ -4972,11 +4972,13 @@ class TestCheckForUpgrades:
         assert "[NRD rate]" not in out4 and "[refundable rate]" not in out4
         assert "refundable-deposit rates" not in out4
 
-    def test_casino_booking_gets_no_fare_tags_but_keeps_a_real_ta_note(self):
-        """Live finding: a casino comp read as 'refundable' against all-NRD
-        quotes, stamping [NRD rate] on all 13 rows - moot on a comped fare.
-        The same booking WAS genuinely TA-booked, so its TA note is correct and
-        must stay; the casino note then names the TA as a contact too."""
+    def test_casino_booking_gets_no_fare_tags_and_one_note_true_either_way(self):
+        """Two live data points: is_agency_booking() fired for a comp a TA
+        really booked AND for one booked directly with the casino, so on a
+        casino-rate booking the flag cannot tell them apart. No separate TA
+        note there - the casino note is worded to be true in both cases. Also
+        live: a comp read as 'refundable' against all-NRD quotes, stamping
+        [NRD rate] on all 13 rows - moot on a comped fare."""
         casino = {"paid_price": 1277.12, "isCasino": True, "isAgency": True,
                   "depositType": "REFUNDABLE"}
         rows = self._fare_rows(["DEPOSIT_NOT_REFUNDABLE", "REFUNDABLE",
@@ -4985,13 +4987,65 @@ class TestCheckForUpgrades:
         assert "[NRD rate]" not in out and "[refundable rate]" not in out
         assert "casino-rate booking" in out
         assert "A cheaper category returns nothing on a comped fare" in out
-        assert "TA/group booking" in out                   # TA-booked comp: both notes
-        assert "Confirm with your TA or the casino desk" in out
+        assert "TA/group booking" not in out
+        assert "or your travel agent, if one booked this comp" in out
 
-        # a casino comp booked direct: no TA note, desk-only wording
-        out2, _, _ = self._render(rows=rows, struct=dict(casino, isAgency=False))
-        assert "TA/group booking" not in out2
-        assert "Confirm with the casino desk" in out2
+        # a genuine non-casino TA booking still gets its own note
+        out2, _, _ = self._render(rows=rows, struct=dict(casino, isCasino=False))
+        assert "TA/group booking" in out2
+
+    def test_checkout_price_is_the_authoritative_dl_rate_anchor(self):
+        """Replays a live booking: the main check priced the booked 2D at
+        1471.60 via checkout, but the rooms API omitted 2D - the table anchored
+        every delta on a 1557.60 lead-in and printed '2D returned no price'
+        directly beneath 'now 1471.60'. The checkout fare is authoritative, and
+        the booked category gets a starred row of its own."""
+        import CheckRoyalCaribbeanPrice as CRCP
+        rows = [{"type": t_, "subtype": code, "category": cat, "display_name": name,
+                 "name": name, "price": total, "rooms_left": None, "guarantee": False,
+                 "connecting": False, "refundability": None}
+                for (t_, code, cat, name, total) in [
+                    ("INTERIOR", "V", "4V", "Interior", 998.60),
+                    ("BALCONY", "D", "4D", "Ocean View Balcony", 1557.60),
+                    ("BALCONY", "B", "4B", "Spacious Ocean View Balcony", 1619.60),
+                    ("DELUXE", "OS", "OS", "Owner's Suite - 1 Bedroom", 7148.60)]]
+        params = _availability_params(subtype="D", category_code="2D")
+        params.cabin_class_string = "BALCONY"
+        CRCP.config.upgrade_alert_below = None
+        logged = []
+        results = {"upgrade_rows": rows,
+                   "base_fare": {"fare": 1471.60, "gratuities": 0.0, "insurance": 0.0}}
+        with patch('CheckRoyalCaribbeanPrice.log',
+                   side_effect=lambda m, *a, **k: logged.append(str(m))), \
+             patch('CheckRoyalCaribbeanPrice._get_upgrade_category_prices',
+                   return_value=({"4D": 1452.60}, False)):        # 2D omitted, as live
+            CRCP._maybe_report_upgrades(params, results,
+                                        {"paid_price": 1227.60, "isCasino": True},
+                                        "x", "1234567", None)
+        out = "\n".join(logged)
+        assert "dl-rate basis: $1,471.60 (your booked category 2D today)" in out
+        assert "returned no price" not in out
+        assert "* 2D" in out                                 # starred row synthesized
+        assert "+$148.00" in out                             # 4B: 1619.60 - 1471.60
+        assert "+$62.00" not in out                          # the old lead-in anchor
+
+    def test_checkout_anchor_also_works_without_family_data(self):
+        import CheckRoyalCaribbeanPrice as CRCP
+        CRCP.config.upgrade_sister_categories = False        # no family request at all
+        rows = self._rich_rows()                             # booked family lead-in is 4D @ 1100
+        params = _availability_params(subtype="D", category_code="2D")
+        params.cabin_class_string = "BALCONY"
+        CRCP.config.upgrade_alert_below = None
+        logged = []
+        with patch('CheckRoyalCaribbeanPrice.log',
+                   side_effect=lambda m, *a, **k: logged.append(str(m))):
+            CRCP._maybe_report_upgrades(
+                params, {"upgrade_rows": rows, "base_fare": {"fare": 1180.0}},
+                {"paid_price": 900.0, "isCasino": True}, "x", "1234567", None)
+        out = "\n".join(logged)
+        assert "* 2D" in out and "  4D" in out               # lead-in kept, exact row starred
+        assert "marks your booked family's lead-in row" not in out
+        assert "+$1,220.00" in out                           # GS 2400 - 1180 (exact anchor)
 
     def test_connecting_cabin_booking_keeps_its_own_family(self):
         """A booking IN a connecting cabin was filtered out of its own table
