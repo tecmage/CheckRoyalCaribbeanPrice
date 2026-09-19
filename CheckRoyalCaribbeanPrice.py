@@ -2396,8 +2396,8 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     # The main check's checkout POST has ALREADY priced the exact booked
     # category - it is the "now X" printed on the line above this table - and
     # that is the authoritative anchor. Seen live: the rooms API omitted a
-    # booked 2D that checkout priced fine, so the table anchored on a lead-in
-    # and claimed "2D returned no price" directly under "now 1471.60".
+    # booked category that checkout priced fine, so the table anchored on a
+    # lead-in and claimed "returned no price" directly under the "now" figure.
     fare_key = "all_included_fare" if url_params.all_included else "base_fare"
     checkout_fare = (results.get(fare_key) or {}).get("fare")
     family_display: Dict[str, float] = dict(family_prices)
@@ -2407,6 +2407,11 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         anchor_exact = True
         rate_anchor_label = (f"your booked category {booked_cat} today" if booked_cat
                              else "your booked cabin today")
+        if url_params.refundable:
+            # the main line above prints the REFUNDABLE fare for this booking;
+            # the anchor is the non-refundable one so it compares like-for-like
+            # with the rows - say so, since the two numbers differ
+            rate_anchor_label += " at the non-refundable rate, to match the rows"
         # make sure the exact booked category has a (starred) row of its own
         if booked_row is not None and booked_cat:
             lead_cat = booked_row.get('category')
@@ -3216,7 +3221,8 @@ def get_room_price_via_API(url_params: CruiseURLParams, room_number: Optional[st
 
 
 def check_if_room_is_available(params: CruiseURLParams,
-                               collect_all: bool = False) -> tuple[bool, List[Dict[str, Any]]]:
+                               collect_all: bool = False,
+                               _send_residency: bool = True) -> tuple[bool, List[Dict[str, Any]]]:
     """
     RSC Scraper Engine wrapper that verifies physical cabin availability on active voyages.
 
@@ -3257,6 +3263,16 @@ def check_if_room_is_available(params: CruiseURLParams,
         'rgVisited': 'true',
         'r0C': 'y',
     }
+    sent_residency = bool(collect_all and params.state and _send_residency)
+    if sent_residency:
+        # checkForUpgrades only: the checkout POST and the booked-family request
+        # both send the residency state, but this sweep never did - so every
+        # OTHER family's row was priced without the residency discount while the
+        # booked category was priced with it, overstating each cross-family
+        # delta by that discount. r0k is the funnel's own residency parameter
+        # (the same one _build_checkout_url emits). Sent only under collect_all
+        # so the core price check's request stays byte-identical.
+        request_params['r0k'] = params.state
 
     api_URL = f'https://www.{params.url_brand}.com/room-selection/type-and-subtype'
 
@@ -3270,7 +3286,18 @@ def check_if_room_is_available(params: CruiseURLParams,
         use_impersonation=False
     )
 
+    # Under collect_all this sweep also gates the MAIN price check, and r0k on
+    # this endpoint is an addition of ours: if the request fails or comes back
+    # without inventory, retry once without it (same defensive shape as the
+    # coupon retry) rather than let an optional feature break core pricing.
+    def _retry_without_residency() -> tuple[bool, List[Dict[str, Any]]]:
+        log("\tResidency-priced availability request returned nothing; retrying without it")
+        return check_if_room_is_available(params, collect_all=collect_all,
+                                          _send_residency=False)
+
     if response is None:
+        if sent_residency:
+            return _retry_without_residency()
         log("Unable to check room availability with server")
         # None = "could not check" - distinct from False = "confirmed not
         # for sale", so a failed request is never reported (or pushed) as
@@ -3282,6 +3309,8 @@ def check_if_room_is_available(params: CruiseURLParams,
     rooms = _extract_json_array(response.text, "rooms")
 
     if not rooms:
+        if sent_residency:
+            return _retry_without_residency()
         return False, available_rooms
 
     try:

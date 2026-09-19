@@ -4430,6 +4430,55 @@ class TestCheckForUpgrades:
         assert next(r for r in rows if r["subtype"] == "ZI")["guarantee"] is True
         assert next(r for r in rows if r["subtype"] == "DC")["connecting"] is True
 
+    def test_sweep_sends_residency_only_when_collecting(self):
+        """The checkout POST and the booked-family request both send the
+        residency state; the sweep never did, so every OTHER family's row lacked
+        the residency discount the booked category had - overstating each
+        cross-family delta. r0k is sent under collect_all ONLY, so the core
+        price check's availability request stays byte-identical."""
+        def sweep_params(collect_all, state):
+            params = _availability_params(subtype="D", category_code="2D")
+            params.state = state
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = _upgrade_rsc(_UPGRADE_SWEEP)
+            with patch('CheckRoyalCaribbeanPrice._execute_api_request',
+                       return_value=mock_resp) as net:
+                check_if_room_is_available(params, collect_all=collect_all)
+            return net.call_args.kwargs["params"]
+
+        assert sweep_params(True, "CA").get("r0k") == "CA"
+        assert "r0k" not in sweep_params(False, "CA")        # flag off: untouched
+        assert "r0k" not in sweep_params(True, None)         # no residency on file
+
+    @pytest.mark.parametrize("first_response", ["none", "no_rooms"])
+    def test_residency_sweep_falls_back_rather_than_break_core_pricing(self, first_response):
+        """Under collect_all the sweep also gates the MAIN price check, and r0k
+        on this endpoint is our own addition: a failed or empty residency-priced
+        request retries once without it instead of turning every booking into
+        'could not check price'."""
+        params = _availability_params(subtype="D", category_code="2D")
+        params.state = "CA"
+        good = MagicMock()
+        good.status_code = 200
+        good.text = _upgrade_rsc(_UPGRADE_SWEEP)
+        empty = MagicMock()
+        empty.status_code = 200
+        empty.text = "<html>no inventory here</html>"
+        seen = []
+
+        def fake_net(*args, **kwargs):
+            seen.append(dict(kwargs["params"]))
+            if len(seen) == 1:
+                return None if first_response == "none" else empty
+            return good
+
+        with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=fake_net):
+            available, rows = check_if_room_is_available(params, collect_all=True)
+        assert available is True and len(rows) == len(_UPGRADE_SWEEP)
+        assert seen[0].get("r0k") == "CA" and "r0k" not in seen[1]
+        assert len(seen) == 2                                # exactly one retry
+
     def test_collect_all_renamed_code_still_adopts_and_collects(self):
         """The letters fallback (renamed funnel codes, the exact place upstream
         got stuck before #118) must keep working under collect_all: the booked
@@ -4497,8 +4546,9 @@ class TestCheckForUpgrades:
                 cabin_class="BALCONY", family=None, family_dp340=False, adults=2,
                 category="2D", coupon=None, coupon_rejected=False,
                 past_final_payment=False, currency="USD", family_raises=False,
-                sister=True, results_extra=None):
+                sister=True, results_extra=None, refundable=False):
         params = _availability_params(subtype=subtype, category_code=category)
+        params.refundable = refundable
         params.cabin_class_string = cabin_class
         params.number_of_adults = adults
         params.coupon_code = coupon
@@ -4984,7 +5034,7 @@ class TestCheckForUpgrades:
         note there - the casino note is worded to be true in both cases. Also
         live: a comp read as 'refundable' against all-NRD quotes, stamping
         [NRD rate] on all 13 rows - moot on a comped fare."""
-        casino = {"paid_price": 1277.12, "isCasino": True, "isAgency": True,
+        casino = {"paid_price": 1250.0, "isCasino": True, "isAgency": True,
                   "depositType": "REFUNDABLE"}
         rows = self._fare_rows(["DEPOSIT_NOT_REFUNDABLE", "REFUNDABLE",
                                 "DEPOSIT_NOT_REFUNDABLE"])       # even when mixed
@@ -5023,6 +5073,16 @@ class TestCheckForUpgrades:
         assert "* 2D" in out                                 # starred row synthesized
         assert "+$150.00" in out                             # 4B: 1600 - 1450 (checkout)
         assert "+$100.00" not in out                         # ...not 1600 - 1500 (lead-in)
+
+    def test_refundable_booking_anchor_says_it_uses_the_non_refundable_rate(self):
+        """The main line prints the refundable fare for a refundable booking,
+        while the anchor is the non-refundable one (like-for-like with the
+        rows) - two different numbers, so the label has to say why."""
+        out, _, _ = self._render(
+            refundable=True,
+            struct={"paid_price": 900.0, "isCasino": True},
+            results_extra={"base_fare": {"fare": 1180.0}})
+        assert "at the non-refundable rate, to match the rows" in out
 
     def test_checkout_anchor_also_works_without_family_data(self):
         out, _, _ = self._render(

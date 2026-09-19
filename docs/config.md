@@ -179,17 +179,22 @@ family's cheapest tier only).
   The basis line under the table heading always says which one was used.
 - **dl-rate** for a Club Royale casino/comped booking: a category's price today
   minus your booked category's rate today - the category-difference a casino desk
-  charges, since a straight reprice would forfeit the comp. GTY bookings anchor
-  on their own guarantee row, or the cheapest guarantee of the same class.
+  charges to move up, since a straight reprice would forfeit the comp (a cheaper
+  category returns nothing on a comped fare). The anchor is the exact price the
+  main check just found for your category; failing that, your family's per-category
+  price, its cheapest tier, or - for a GTY booking - the cheapest guarantee of
+  the same class. The basis line always says which one was used.
 
 Things the table tells you when they apply: an upgrade replaces your original
 promotions/onboard credit with today's; cheaper rows are effectively reprices,
 which Royal may refuse in place when the current sale is "new bookings only";
 after final payment a cheaper category returns no refund (shown as 0.00) while
-upgrades remain possible; rows priced on a different deposit type than your
-booking are tagged `[NRD rate]` / `[refundable rate]`; TA/group bookings are
-flagged because agent fees and discounts never appear in Royal's ledger.
-Guarantee, connecting and sold-out (0 rooms left) rows are not offered.
+upgrades remain possible; when the table mixes deposit types, rows on a different
+type than your booking are tagged `[NRD rate]` / `[refundable rate]` (if every
+row differs, one note says so instead); TA/group bookings are flagged because
+agent fees and discounts never appear in Royal's ledger. Guarantee, connecting
+and sold-out (0 rooms left) rows are not offered. Every row is priced with your
+booking's qualifiers, including your residency discount.
 
 Scope the check with `upgradeReservations: ["1234567"]` to run it only for the
 listed reservation IDs (absent or empty = every booking; a listed ID that matches
