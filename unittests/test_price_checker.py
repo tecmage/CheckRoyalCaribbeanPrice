@@ -4968,6 +4968,30 @@ class TestCheckForUpgrades:
         header = next(l for l in out2.split("\n") if "cat" in l and "type" in l)
         assert "dl-paid" in header
 
+    def test_gty_anchor_ignores_lesser_product_guarantees(self):
+        """Royal flags ordinary subtypes as guarantees too - for a solo that can
+        be a studio balcony, which is cheaper because it is a lesser product.
+        Anchoring on it understated the booked rate and inflated every dl-rate."""
+        def rows_with(extra):
+            return [{"type": t, "subtype": code, "category": cat, "display_name": name,
+                     "name": name, "price": total, "rooms_left": 5, "guarantee": gty,
+                     "connecting": False, "refundability": None}
+                    for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP + extra]
+        studio = ("BALCONY", "F", "2F", "Studio Ocean View Balcony", 700.0, True)
+        regular = ("BALCONY", "XN", "XN", "Ocean View Balcony", 900.0, True)
+        casino = {"paid_price": 2050.0, "isCasino": True}
+
+        out, _, _ = self._render(rows=rows_with([studio, regular]), subtype="XB",
+                                 category="XB", adults=1, struct=casino)
+        assert "cheapest BALCONY guarantee today" in out
+        assert "dl-rate basis: $900.00" in out                # not the 700 studio
+        assert "+$1,500.00" in out and "+$1,700.00" not in out    # GS 2400 - 900
+
+        # only a lesser-product guarantee on offer: no honest anchor exists
+        out2, _, _ = self._render(rows=rows_with([studio]), subtype="XB",
+                                  category="XB", adults=1, struct=casino)
+        assert "rough guide only" in out2
+
     def _tagged_rows(self, extra=()):
         return [{"type": t, "subtype": code, "category": cat, "display_name": name,
                  "name": name, "price": total, "rooms_left": 5, "guarantee": gty,

@@ -2378,10 +2378,13 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
             rate_anchor_label = "your booked family's lead-in category today"
     else:
         # No row of its own (a GTY booking - casino comps very often are): anchor
-        # on the cheapest guarantee of the booked class rather than an all-dash table
+        # on the cheapest guarantee of the booked class rather than an all-dash table.
+        # Royal flags ordinary subtypes as guarantees too (seen live for solos: a
+        # studio balcony) - a lesser product would understate the booked rate
         same_class_gty = [r for r in rows
                           if r.get('guarantee') and r.get('type') == url_params.cabin_class_string
-                          and isinstance(r.get('price'), (int, float))]
+                          and isinstance(r.get('price'), (int, float))
+                          and not LESSER_PRODUCT.search(r.get('display_name') or "")]
         if same_class_gty:
             booked_now = min(r['price'] for r in same_class_gty)
             rate_anchor_label = (f"cheapest {url_params.cabin_class_string} guarantee today "
