@@ -4473,14 +4473,18 @@ class TestCheckForUpgrades:
         assert struct["depositType"] == "NRD"
         assert struct["isAgency"] is False
         assert struct["bookedWithDP340"] is True
-        assert struct["dp340Eligible"] is False      # no loyalty points on record
+        # eligibility is mainline's own decision (url_params.coupon_code), never
+        # re-derived from points in the struct
+        assert "dp340Eligible" not in struct
 
     def _render(self, struct=None, rows=None, threshold=None, subtype="D",
-                cabin_class="BALCONY", family=None, family_dp340=False, adults=2):
+                cabin_class="BALCONY", family=None, family_dp340=False, adults=2,
+                category="2D", coupon=None, coupon_rejected=False):
         import CheckRoyalCaribbeanPrice as CRCP
-        params = _availability_params(subtype=subtype, category_code="2D")
+        params = _availability_params(subtype=subtype, category_code=category)
         params.cabin_class_string = cabin_class
         params.number_of_adults = adults
+        params.coupon_code = coupon
         rich = rows if rows is not None else [
             {"type": t, "subtype": code, "category": cat, "display_name": name,
              "name": f"{name} {cat} {code}", "price": total, "rooms_left": 5,
@@ -4494,7 +4498,7 @@ class TestCheckForUpgrades:
              patch('CheckRoyalCaribbeanPrice._get_upgrade_category_prices',
                    return_value=(family or {}, family_dp340)) as mock_family:
             CRCP._maybe_report_upgrades(
-                params, {"upgrade_rows": rich},
+                params, {"upgrade_rows": rich, "coupon_rejected": coupon_rejected},
                 struct if struct is not None else
                 {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False},
                 "2027-01-29 Ovation BALCONY 2D", "1234567", apobj)
@@ -4583,11 +4587,13 @@ class TestCheckForUpgrades:
         assert mock_price.call_args.kwargs.get("collect_all") is False
 
         CRCP.config.upgrade_reservations = [1234567]       # listed (int form ok)
+        CRCP._UPGRADE_SCOPE_SEEN.discard("1234567")
         with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
                    return_value={"room_available": False}) as mock_price:
             get_cruise_price(account_info=base_account_info, booking=booking,
                              ship_dictionary=ShipRegistry(), automatic_URL=True)
         assert mock_price.call_args.kwargs.get("collect_all") is True
+        assert "1234567" in CRCP._UPGRADE_SCOPE_SEEN       # feeds the typo warning
 
         CRCP.config.upgrade_reservations = []              # empty = every booking
         with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
@@ -4681,19 +4687,31 @@ class TestCheckForUpgrades:
         assert should_apply_dp340(True, True, 2) is False    # never multi-guest
         assert should_apply_dp340(False, False, 1) is False
 
-    def test_dp340_applied_for_eligible_solo_and_noted(self):
-        struct = {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False,
-                  "dp340Eligible": True, "bookedWithDP340": True}
-        out, _, mock_family = self._render(struct=struct, adults=1,
+    def test_dp340_follows_mainlines_coupon_decision(self):
+        """Eligibility is mainline's call (shared C&A points), expressed as
+        url_params.coupon_code - the report reuses it rather than re-deriving."""
+        plain = {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False}
+        out, _, mock_family = self._render(struct=plain, adults=1, coupon="DP340",
                                            family={"2D": 900.0}, family_dp340=True)
         assert mock_family.call_args.kwargs.get("dp340") is True
-        assert "DP340 single-supplement discount is applied on this booking" in out
         assert "quoted with the DP340" in out
 
+        # booked with the code keeps its terms even without a live coupon
+        booked = dict(plain, bookedWithDP340=True)
+        out_b, _, mock_b = self._render(struct=booked, adults=1, family={"2D": 900.0},
+                                        family_dp340=True)
+        assert mock_b.call_args.kwargs.get("dp340") is True
+        assert "DP340 single-supplement discount is applied on this booking" in out_b
+
+        # the main flow just proved the coupon rejected -> never re-try it
+        _, _, mock_r = self._render(struct=booked, adults=1, coupon="DP340",
+                                    coupon_rejected=True, family={"2D": 900.0})
+        assert mock_r.call_args.kwargs.get("dp340") is False
+
         # two guests: the code must never be requested
-        out2, _, mock_family2 = self._render(struct=struct, adults=2, family={"2D": 1180.0})
-        assert mock_family2.call_args.kwargs.get("dp340") is False
-        assert "quoted with the DP340" not in out2
+        _, _, mock_2 = self._render(struct=booked, adults=2, coupon="DP340",
+                                    family={"2D": 1180.0})
+        assert mock_2.call_args.kwargs.get("dp340") is False
 
     def test_category_prices_post_shape_and_dp340_retry(self):
         """The rooms POST carries the booking's occupancy/loyalty (and the
@@ -4724,7 +4742,11 @@ class TestCheckForUpgrades:
         assert len(bodies) == 2
         assert bodies[0]["rooms"][0]["couponCode"] == "DP340"
         assert "couponCode" not in bodies[1]["rooms"][0]
-        assert bodies[0]["rooms"][0]["qualifiers"] == {"loyaltyNumber": "123456"}
+        # the booking's qualifiers ride along, same block as the checkout POST,
+        # so the booked family prices on the same basis as the rest of the table
+        quals = bodies[0]["rooms"][0]["qualifiers"]
+        assert quals["loyaltyNumber"] == "123456"
+        assert set(quals) >= {"fireFighter", "military", "police", "senior"}
         assert bodies[0]["rooms"][0]["adultCount"] == 2
 
     def test_agency_booking_gets_ta_note(self):
@@ -4738,6 +4760,86 @@ class TestCheckForUpgrades:
 
         out2, _, _ = self._render()
         assert "TA/group booking" not in out2
+
+    def test_unpriced_booked_category_never_alerts_a_lesser_sister(self):
+        """Booked 1D sold out inside its family: the anchor is only the 4D
+        lead-in, so 2D pricing above it must NOT be pushed as an 'upgrade'
+        (never guess without the exact booked rate). Class jumps still alert."""
+        out, apobj, _ = self._render(category="1D", threshold=5000.0,
+                                     family={"4D": 1100.0, "2D": 1180.0})
+        body = apobj.notify.call_args.kwargs["body"]
+        hit_lines = [l for l in body.split("\n") if l.startswith("- ")]
+        assert any("Grand Suite" in l for l in hit_lines)      # genuine class jump
+        assert not any(l.startswith(("- 2D", "- 4D")) for l in hit_lines)
+
+    @pytest.mark.parametrize("price_items", [
+        "$2e",                                   # RSC reference string
+        [None],                                  # null inside the list
+        ["$2e"],                                 # string inside the list
+        {"description": "casino"},               # dict instead of list
+        [{"description": 12345}],                # non-string description
+        [{"description": "x", "refundability": ["A"]}],   # unhashable refundability
+    ])
+    def test_ledger_walk_survives_malformed_price_items(self, price_items):
+        """The casino/deposit walk runs for EVERY user, flag on or off, over an
+        RSC-extracted payload: a malformed priceItems must never end the run."""
+        account_info = AccountInfo(username="test_user", password="password", cruise_line="royal")
+        account_info.access = MagicMock()
+        account_info.access.token = "fake_token"
+        account_info.access.id = "fake_id"
+
+        def mock_api_router(*args, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            url = args[2] if len(args) > 2 else kwargs.get("url", "")
+            if "profileBookings" in url:
+                mock_resp.json.return_value = {"payload": {"profileBookings": [{
+                    "bookingId": "1234567", "passengerId": "33333333",
+                    "sailDate": "20261225", "numberOfNights": 7, "shipCode": "AL",
+                    "stateroomNumber": "6543", "stateroomType": "B",
+                    "passengersInStateroom": [{"firstName": "Matt", "lastName": "Smith",
+                                               "stateroomCategoryCode": "4D"}]}]}}
+            else:
+                mock_resp.json.return_value = {"payload": []}
+            return mock_resp
+
+        ledger = {"dining_selection": [], "prices": [
+            {"priceTypeCode": "GROSS_TOTALS", "amount": 2050.0},
+            {"priceTypeCode": "DISCOUNT", "amount": -100.0, "priceItems": price_items},
+        ]}
+        mock_metrics = {"passenger_names": "Matt Smith", "checkin_string": "Boarding Time 11:00",
+                        "category_code": "4D", "sub_type": "4D"}
+        with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
+             patch('CheckRoyalCaribbeanPrice._calculate_passenger_metrics', return_value=mock_metrics), \
+             patch('CheckRoyalCaribbeanPrice.get_dining_and_prices', return_value=ledger), \
+             patch('CheckRoyalCaribbeanPrice.get_checkin_info'), \
+             patch('CheckRoyalCaribbeanPrice.get_cruise_price') as mock_price:
+            get_voyages(account_info, CruiseURLParams(), ShipRegistry())
+        assert mock_price.called                 # the booking was still processed
+
+    def test_report_failure_is_contained(self):
+        """An optional feature can never end a run: unexpected data inside the
+        report is logged and skipped, not raised."""
+        out, _, _ = self._render(rows=["not-a-row-dict"])
+        assert "Upgrade check skipped for this booking" in out
+
+    def test_config_coercion_is_yaml_tolerant(self, tmp_path):
+        def load(extra):
+            f = tmp_path / "config.yaml"
+            f.write_text('accountInfo:\n  - username: "u"\n    password: "p"\n' + extra)
+            with patch('CheckRoyalCaribbeanPrice.setup_hybrid_logging'):
+                return load_config_objects(str(f))
+
+        # a bare scalar is ONE id - iterating "1234567" scoped to its characters
+        assert load('upgradeReservations: "1234567"\n').upgrade_reservations == ["1234567"]
+        assert load('upgradeReservations: 1234567\n').upgrade_reservations == ["1234567"]
+        # present-but-null toggle keeps the documented default (on)
+        assert load('upgradeSisterCategories:\n').upgrade_sister_categories is True
+        # the STRING "false" is false (bool("false") is True in Python)
+        assert load('checkForUpgrades: "false"\n').check_for_upgrades is False
+        assert load('upgradeAlertBelow: "$1,000"\n').upgrade_alert_below == 1000.0
+        with pytest.raises(ValueError, match="upgradeAlertBelow"):
+            load('upgradeAlertBelow: "cheap"\n')
 
     def test_nrd_notes_follow_deposit_type(self):
         nrd_rows = [

@@ -1487,6 +1487,9 @@ LESSER_PRODUCT = re.compile(r"studio|obstruct|partial view", re.I)
 # Ledger discount/option descriptions that mark a Club Royale casino-rate booking
 CASINO_MARKER = re.compile(r"casino|clubr|club royale", re.I)
 
+# upgradeReservations ids that matched a booking this run (to warn about typos)
+_UPGRADE_SCOPE_SEEN: Set[str] = set()
+
 
 def is_upgrade_candidate(booked_rank: Optional[int], booked_now: Optional[float],
                          row_rank: Optional[int], row_total: float,
@@ -1536,8 +1539,16 @@ def _get_upgrade_category_prices(url_params: CruiseURLParams, stype: Optional[st
         "accessible": False, "selectionFallbackStrategy": "RECOMMENDATION",
         "editMode": True, "reset": False, "taxesAndFeesBundled": True,
     }
+    # same qualifier block the checkout POST sends, so the booked family is
+    # priced on the same basis as every other row of the table
+    room["qualifiers"] = {
+        "fireFighter": url_params.fire, "military": url_params.military,
+        "police": url_params.police, "senior": url_params.senior,
+    }
     if url_params.loyalty_number:
-        room["qualifiers"] = {"loyaltyNumber": str(url_params.loyalty_number)}
+        room["qualifiers"]["loyaltyNumber"] = str(url_params.loyalty_number)
+    if url_params.state:
+        room["qualifiers"]["stateCode"] = url_params.state
     if dp340:
         room["couponCode"] = "DP340"
     flt = {"countryCode": url_params.booking_office_country_code or "USA",
@@ -1548,7 +1559,8 @@ def _get_upgrade_category_prices(url_params: CruiseURLParams, stype: Optional[st
            "rooms": [room], "platform": "web"}
     headers = {"user-agent": USER_AGENT_WEB, "accept": "*/*",
                "content-type": "application/json",
-               "brand": "R" if url_params.is_royal else "C", "country": "USA"}
+               "brand": "R" if url_params.is_royal else "C",
+               "country": url_params.booking_office_country_code or "USA"}
 
     response = _execute_api_request(
         account_info=None, method="POST",
@@ -1570,7 +1582,7 @@ def _get_upgrade_category_prices(url_params: CruiseURLParams, stype: Optional[st
         # A coupon-priced request can fail as a 4xx or an empty body when the
         # coupon is rejected - retry once without the code instead of silently
         # losing the per-category view
-        log(f"\t{YELLOW}DP340-priced category request failed; retrying without the code{RESET}")
+        log(f"\t{YELLOW}DP340-priced category request returned nothing; retrying without the code{RESET}")
         return _get_upgrade_category_prices(url_params, stype, dp340=False)
     return prices, dp340
 
@@ -2023,12 +2035,19 @@ def get_voyages(
             # guard: the OPTIONS record often carries amount 0.0 while its
             # priceItems still name the comp ("CASINO DISC - GOBO", "ClubR...")
             if price_type_code in ("DISCOUNT", "OPTIONS"):
-                for item in (cur_price.get("priceItems") or []):
-                    if CASINO_MARKER.search(item.get("description") or ""):
+                # This walk runs for every user (flag on or off) and the data
+                # comes out of a Next.js RSC stream: priceItems can be a
+                # reference string, or a list holding nulls/strings. Never let
+                # an optional feature's bookkeeping end the run.
+                price_items = cur_price.get("priceItems")
+                for item in (price_items if isinstance(price_items, list) else []):
+                    if not isinstance(item, dict):
+                        continue
+                    if CASINO_MARKER.search(str(item.get("description") or "")):
                         casino_rate_flag = True
                     # the DISCOUNT items carry the fare's refundability
                     # (DEPOSIT_NOT_REFUNDABLE = an NRD fare)
-                    if item.get("refundability"):
+                    if isinstance(item.get("refundability"), str):
                         refundabilities.add(item["refundability"])
                     if item.get("promoCd") == "DP340":
                         booked_with_dp340 = True
@@ -2079,11 +2098,6 @@ def get_voyages(
             elif "REFUNDABLE" in refundabilities:
                 paid_price_struct['depositType'] = "REFUNDABLE"
             paid_price_struct['bookedWithDP340'] = booked_with_dp340
-            # Diamond Plus 340+ single-supplement eligibility (Royal only)
-            _pts = getattr(account_info, 'loyalty_points', 0)
-            paid_price_struct['dp340Eligible'] = bool(
-                account_info.is_royal is True
-                and isinstance(_pts, (int, float)) and _pts >= 340)
             log(f"Cruise Fare - Total {gross_totals:.2f}{payment_string}")
 
         # Record this booking for the end-of-run check-in / final-payment summary table.
@@ -2279,10 +2293,21 @@ def get_dining_and_prices(account_info: AccountInfo, booking: Dict[str, Any]) ->
     return result
 
 
-def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
-                           paid_price_struct: Optional[Dict[str, Any]],
-                           pre_string: str, reservation_id: Optional[str],
-                           apobj: Optional[Apprise]) -> None:
+def _maybe_report_upgrades(*args: Any, **kwargs: Any) -> None:
+    """An optional, informational feature must never end a run: any unexpected
+    data shape inside the upgrade report is logged and that booking's table is
+    skipped - remaining bookings, accounts and the summary are unaffected."""
+    try:
+        _report_upgrades(*args, **kwargs)
+    except Exception as exc:
+        log(f"\t{YELLOW}Upgrade check skipped for this booking (unexpected data: "
+            f"{type(exc).__name__}: {exc}){RESET}")
+
+
+def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
+                     paid_price_struct: Optional[Dict[str, Any]],
+                     pre_string: str, reservation_id: Optional[str],
+                     apobj: Optional[Apprise]) -> None:
     """
     checkForUpgrades (Phase 1): for a booked cruise, list what every other
     stateroom subtype costs right now, two ways - versus what was actually
@@ -2308,9 +2333,13 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     # made per booking; DP340 single-supplement is applied to it for a solo
     # booking when the account qualifies (340+ points) or the booking already
     # carries the code, with a retry-without-code fallback.
+    # DP340 eligibility is mainline's own decision (shared C&A points), already
+    # expressed as url_params.coupon_code - never re-derive it here, and never
+    # retry a coupon the main flow just proved rejected.
     guest_count = int(url_params.number_of_adults or 0) + int(url_params.number_of_children or 0)
-    apply_dp340 = should_apply_dp340(bool(struct.get('dp340Eligible')),
-                                     bool(struct.get('bookedWithDP340')), guest_count)
+    apply_dp340 = (not results.get('coupon_rejected')
+                   and should_apply_dp340(url_params.coupon_code == "DP340",
+                                          bool(struct.get('bookedWithDP340')), guest_count))
     family_prices: Dict[str, float] = {}
     dp340_used = False
     if booked_row is not None and config.upgrade_sister_categories is not False:
@@ -2334,6 +2363,15 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         # the family priced but the booked category didn't (sold out within
         # the family) - the anchor stays the lead-in; say so
         rate_anchor_label = f"family lead-in; {booked_cat} returned no price today"
+
+    # Same-class "pricier than what you hold" alerts are only meaningful against
+    # the EXACT booked category's rate. With a lead-in stand-in, a booked 1D
+    # (unpriced) was alerted to "upgrade" to the lesser 2D because 2D priced
+    # above the 4D lead-in - is_upgrade_candidate's own rule is never to guess.
+    anchor_exact = bool(booked_row and booked_cat and
+                        (booked_cat in family_prices
+                         or booked_row.get('category') == booked_cat))
+    alert_booked_now = booked_now if anchor_exact else None
 
     # dl-paid basis, in order of preference: a manually configured
     # reservationPricePaid value (a deliberate user statement - e.g. the
@@ -2408,7 +2446,7 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
             # alert on the same basis the table shows for this booking
             basis = d_shown
             if (basis is not None and basis <= threshold
-                    and is_upgrade_candidate(booked_rank, booked_now,
+                    and is_upgrade_candidate(booked_rank, alert_booked_now,
                                              TYPE_RANK.get(r.get('type')), r['price'],
                                              r.get('display_name') or "")):
                 sign = "+" if basis > 0 else "-" if basis < 0 else ""
@@ -2602,8 +2640,11 @@ def get_cruise_price(account_info: AccountInfo,
         # its extra family request) to the listed bookings only
         _upgrade_scope = (config.upgrade_reservations
                           if isinstance(config.upgrade_reservations, (list, set, tuple)) else [])
-        if _upgrade_scope and str(reservation_id) not in [str(r) for r in _upgrade_scope]:
-            collect_upgrades = False
+        if _upgrade_scope:
+            if str(reservation_id) in [str(r) for r in _upgrade_scope]:
+                _UPGRADE_SCOPE_SEEN.add(str(reservation_id))
+            else:
+                collect_upgrades = False
     results = get_room_price_via_API(url_params, room_number, collect_all=collect_upgrades)
     room_available = results.get("room_available")
 
@@ -2612,6 +2653,8 @@ def get_cruise_price(account_info: AccountInfo,
         log(f"Coupon Code {url_params.coupon_code} may have failed, trying without using it")
         url_params.coupon_code = None
         results = get_room_price_via_API(url_params, room_number, collect_all=collect_upgrades)
+        # the upgrade report must not re-try a coupon the main flow just proved fails
+        results['coupon_rejected'] = True
         room_available = results.get("room_available")
 
     # === Localized Night Count Extraction ===
@@ -4344,6 +4387,39 @@ def parse_price_alert_exclusions(raw: Any) -> List[PriceAlertExclusion]:
     return rules
 
 
+def _config_bool(value: Any, default: bool) -> bool:
+    """YAML-tolerant boolean. None (a present-but-null key) -> default, and the
+    STRINGS "false"/"no"/"off" are false - bool("false") is True in Python."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "on", "y", "1")
+    return bool(value)
+
+
+def _config_id_list(value: Any, key: str) -> List[str]:
+    """A reservation id or a list of them, normalized to strings. A bare scalar
+    is one id - iterating the string "1234567" would scope to its characters
+    and silently disable the feature for every booking."""
+    if value is None:
+        return []
+    if isinstance(value, (str, int)) and not isinstance(value, bool):
+        return [str(value).strip()] if str(value).strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
+    raise ValueError(f"{key} must be a reservation id or a list of reservation ids")
+
+
+def _config_amount(value: Any, key: str) -> Optional[float]:
+    """A money threshold; tolerates "$100" / "1,000" as users naturally write them."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace("$", "").replace(",", "").strip())
+    except ValueError:
+        raise ValueError(f"{key} must be a number (got {value!r})") from None
+
+
 def load_config_objects(config_path: str) -> CruiseAppConfig:
     """
     Loads, sanitizes, and maps YAML configuration elements into structural dataclass attributes.
@@ -4435,12 +4511,10 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         date_display_format=data.get("dateDisplayFormat", "%x"),
         log_file=data.get("logFile"),
         history_db=data.get("historyDb"),
-        check_for_upgrades=bool(data.get("checkForUpgrades", False)),
-        upgrade_alert_below=(float(data["upgradeAlertBelow"])
-                             if data.get("upgradeAlertBelow") is not None else None),
-        # ids normalized to str once here (YAML users write them unquoted)
-        upgrade_reservations=[str(r) for r in (data.get("upgradeReservations") or [])],
-        upgrade_sister_categories=bool(data.get("upgradeSisterCategories", True)),
+        check_for_upgrades=_config_bool(data.get("checkForUpgrades"), False),
+        upgrade_alert_below=_config_amount(data.get("upgradeAlertBelow"), "upgradeAlertBelow"),
+        upgrade_reservations=_config_id_list(data.get("upgradeReservations"), "upgradeReservations"),
+        upgrade_sister_categories=_config_bool(data.get("upgradeSisterCategories"), True),
         output_watch_as_json=data.get("outputWatchAsJson",False),
         output_json_watch_file=data.get("outputJsonFile","output-json-watch.txt"),
         apobj=apobj,
@@ -4750,6 +4824,15 @@ def main() -> None:
 
             # Safely release the connection socket resources back to the OS
             anon_session.close()
+
+        # A scoped id that matched no booking is almost always a typo - say so,
+        # since the symptom is otherwise just "no upgrade table appeared"
+        _scope = config.upgrade_reservations if isinstance(config.upgrade_reservations, (list, set, tuple)) else []
+        if config.check_for_upgrades is True and _scope:
+            _unmatched = [str(r) for r in _scope if str(r) not in _UPGRADE_SCOPE_SEEN]
+            if _unmatched:
+                log(YELLOW + f"upgradeReservations: no booking matched {', '.join(_unmatched)} "
+                             f"- check the reservation id(s)" + RESET)
 
         # Summary table of upcoming check-in and final-payment dates for booked sailings
         payment_tracker.print_table()
