@@ -967,6 +967,17 @@ def test_reservation_price_paid_dict_of_dicts_prices_not_crashes():
     assert mock_price.call_args.kwargs["paid_price_struct"]["paid_price"] == 900.0
     assert mock_price.call_args.kwargs["paid_price_struct"]["paidPriceOverridden"] is True
 
+    # a null configured price is NOT an override (list shape)
+    CRCP.config.reservation_prices = [{"reservation": "1234567", "paidPrice": None}]
+    with patch('CheckRoyalCaribbeanPrice._execute_api_request', side_effect=mock_api_router), \
+         patch('CheckRoyalCaribbeanPrice._calculate_passenger_metrics', return_value=mock_metrics), \
+         patch('CheckRoyalCaribbeanPrice.get_dining_and_prices',
+               return_value={"dining_selection": [], "prices": []}), \
+         patch('CheckRoyalCaribbeanPrice.get_checkin_info'), \
+         patch('CheckRoyalCaribbeanPrice.get_cruise_price') as mock_price2:
+        get_voyages(account_info, CruiseURLParams(), ShipRegistry())
+    assert "paidPriceOverridden" not in mock_price2.call_args.kwargs["paid_price_struct"]
+
 
 def test_null_passenger_array_does_not_crash_pricing(mock_global_config, base_account_info):
     """'passengersInStateroom': null (present-but-null) crashed get_cruise_price
@@ -4975,6 +4986,146 @@ class TestCheckForUpgrades:
         assert "marks your booked family's lead-in row" in out
         out2, _, _ = self._render(category="1D", family={"4D": 1100.0})
         assert "Your category 1D returned no price today" in out2
+
+    # ---------------- audit batch D: mutation-killing coverage -------------
+
+    @pytest.mark.parametrize("booked_rank, booked_now, row_rank, row_total, name, expected", [
+        (2, 1180.0, 4, 2400.0, "Grand Suite", True),          # class jump
+        (2, 1180.0, 4, 900.0, "Studio Suite", True),          # class jump even if niche/cheaper
+        (2, 1180.0, 2, 1400.0, "Spacious Balcony", True),     # same class, pricier
+        (2, 1180.0, 2, 1180.0, "Ocean View Balcony", False),  # same class, equal price
+        (2, 1180.0, 2, 1100.0, "Ocean View Balcony", False),  # same class, CHEAPER
+        (2, 1180.0, 2, 1400.0, "Studio Balcony", False),      # niche product screen
+        (2, 1180.0, 2, 1400.0, "Obstructed Balcony", False),
+        (2, 1180.0, 2, 1400.0, "Partial View Balcony", False),
+        (2, 1180.0, 0, 1400.0, "Interior", False),            # lower class, pricier
+        (None, 1180.0, 0, 756.0, "Interior", False),          # the 1B -> 4U regression:
+        (None, 1180.0, 4, 2400.0, "Grand Suite", False),      #   unknown class never guesses
+        (2, 1180.0, None, 2400.0, "Mystery", False),          # unranked row type
+        (2, None, 2, 1400.0, "Spacious Balcony", False),      # no exact anchor: no same-class
+        (2, None, 4, 2400.0, "Grand Suite", True),            #   ...but class jumps still count
+    ])
+    def test_is_upgrade_candidate_rules(self, booked_rank, booked_now, row_rank,
+                                        row_total, name, expected):
+        from CheckRoyalCaribbeanPrice import is_upgrade_candidate
+        assert is_upgrade_candidate(booked_rank, booked_now, row_rank, row_total, name) is expected
+
+    def test_alert_threshold_is_inclusive_and_follows_the_shown_basis(self):
+        # normal booking: GS dl-paid is +700, its category difference +1300
+        _, at, _ = self._render(threshold=700.0)
+        at.notify.assert_called_once()                       # <= is inclusive
+        _, under, _ = self._render(threshold=699.99)
+        under.notify.assert_not_called()
+        _, mid, _ = self._render(threshold=1000.0)
+        mid.notify.assert_called_once()                      # 700 <= 1000 on dl-paid
+        # casino: the SAME threshold must not fire - dl-rate (+1300) governs
+        _, casino, _ = self._render(threshold=1000.0, struct={
+            "paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": True})
+        casino.notify.assert_not_called()
+
+    def test_collect_all_exact_match_is_honoured_without_the_letters_fallback(self):
+        """Lead-in category letters that do NOT match the booked code: only the
+        exact subtype match can answer 'available' here."""
+        fixture = _upgrade_rsc([("BALCONY", "D", "9Z", "Ocean View Balcony", 1100.0, False)])
+        params, available, rows = self._collect(subtype="D", category="2D", fixture=fixture)
+        assert available is True and len(rows) == 1
+        assert params.stateroom_subtype == "D"               # no rename happened
+
+    def test_collect_all_keeps_rows_on_the_gty_bypass(self):
+        params, available, rows = self._collect(subtype="XB", category="XB")
+        assert available is True
+        assert len(rows) == len(_UPGRADE_SWEEP)              # bypass must not drop them
+
+    def test_pricing_call_publishes_the_collected_rows(self):
+        import CheckRoyalCaribbeanPrice as CRCP
+        rows = [{"subtype": "D", "price": 1100.0}]
+        params = _availability_params(subtype="D", category_code="2D")
+        with patch('CheckRoyalCaribbeanPrice.check_if_room_is_available',
+                   return_value=(False, rows)) as gate:
+            res = CRCP.get_room_price_via_API(params, None, collect_all=True)
+            assert gate.call_args.kwargs.get("collect_all") is True
+            assert res["upgrade_rows"] == rows
+            res_off = CRCP.get_room_price_via_API(params, None)
+            assert "upgrade_rows" not in res_off
+
+    def _e2e(self, account, results, struct, side_effect=None):
+        import CheckRoyalCaribbeanPrice as CRCP
+        CRCP.config.check_for_upgrades = True
+        CRCP.config.upgrade_reservations = []
+        CRCP.config.upgrade_alert_below = None
+        CRCP.config.upgrade_sister_categories = False        # no family POST here
+        CRCP.config.minimum_saving_alert = None              # mainline compares against it
+        logged = []
+        booking = {"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
+                   "packageCode": "WN07X123", "stateroomType": "B",
+                   "stateroomSubtype": "D",
+                   "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101",
+                                              "stateroomCategoryCode": "2D"}]}
+        kwargs = {"side_effect": side_effect} if side_effect else {"return_value": results}
+        with patch('CheckRoyalCaribbeanPrice.get_room_price_via_API', **kwargs) as mock_price, \
+             patch('CheckRoyalCaribbeanPrice.notifier_for', return_value=None), \
+             patch('CheckRoyalCaribbeanPrice.log',
+                   side_effect=lambda m, *a, **k: logged.append(str(m))):
+            get_cruise_price(account_info=account, booking=booking,
+                             ship_dictionary=ShipRegistry(), automatic_URL=True,
+                             paid_price_struct=struct)
+        return "\n".join(logged), mock_price
+
+    def _rich_rows(self):
+        return [{"type": t, "subtype": code, "category": cat, "display_name": name,
+                 "name": name, "price": total, "rooms_left": 5, "guarantee": gty,
+                 "connecting": False, "refundability": None}
+                for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP]
+
+    @pytest.mark.parametrize("results_extra, struct", [
+        # main priced path (paid known)
+        ({"room_available": True, "sailing_nights": 7,
+          "base_fare": {"fare": 1100.0, "gratuities": 0.0, "insurance": 0.0, "obc": 0.0}},
+         {"paid_price": 2050.0, "fareAndTaxes": 1700.0}),
+        # Path 2: priced, but no paid price on record
+        ({"room_available": True, "sailing_nights": 7,
+          "base_fare": {"fare": 1100.0, "gratuities": 0.0, "insurance": 0.0, "obc": 0.0}},
+         {}),
+        # Path 1: the booked category is not for sale
+        ({"room_available": False, "available_rooms": []},
+         {"paid_price": 2050.0, "fareAndTaxes": 1700.0}),
+        # no-fare exit: sweep succeeded, checkout returned no fare block
+        ({"room_available": True, "sailing_nights": 7},
+         {"paid_price": 2050.0, "fareAndTaxes": 1700.0}),
+        # no-fare exit #2: the fare block exists but its fare is JSON null
+        ({"room_available": True, "sailing_nights": 7,
+          "base_fare": {"fare": None, "gratuities": None, "insurance": None, "obc": 0.0}},
+         {"paid_price": 2050.0, "fareAndTaxes": 1700.0}),
+    ])
+    def test_every_exit_of_the_price_check_renders_the_table(
+            self, mock_global_config, base_account_info, results_extra, struct):
+        results = dict(results_extra, upgrade_rows=self._rich_rows())
+        out, _ = self._e2e(base_account_info, results, struct)
+        assert "Stateroom options on this sailing" in out
+        assert "Grand Suite" in out
+
+        # and with nothing collected, no table - the hooks are inert
+        out_none, _ = self._e2e(base_account_info, dict(results_extra), struct)
+        assert "Stateroom options on this sailing" not in out_none
+
+    def test_coupon_retry_keeps_collecting(self, mock_global_config, base_account_info):
+        """The retry-without-coupon call must still collect rows, and must tell
+        the report not to re-try the coupon it just proved rejected."""
+        calls = []
+
+        def fake_pricing(url_params, room_number, collect_all=False):
+            calls.append(collect_all)
+            if len(calls) == 1:
+                return {"room_available": False, "upgrade_rows": [], "available_rooms": []}
+            return {"room_available": False, "available_rooms": [],
+                    "upgrade_rows": self._rich_rows()}
+
+        out, _ = self._e2e(base_account_info, None,
+                           {"paid_price": 2050.0, "fareAndTaxes": 1700.0,
+                            "couponCode": "SOMECODE"},
+                           side_effect=fake_pricing)
+        assert calls == [True, True]
+        assert "Stateroom options on this sailing" in out
 
     def test_nrd_notes_follow_deposit_type(self):
         nrd_rows = [
