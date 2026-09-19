@@ -2456,14 +2456,18 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     delta_label = 'dl-rate' if prefer_rate else 'dl-paid'
 
     # ---- table rows ----------------------------------------------------------
+    # Guarantee and connecting rows ARE listed (tagged): a guarantee is often the
+    # cheapest way up a class, and a connecting cabin is a real bookable cabin.
     def listable(r: Dict[str, Any]) -> bool:
         if r is booked_row:
             return True                     # always show the booked family
-        if r.get('guarantee') or r.get('connecting'):
-            return False
         if r.get('rooms_left') == 0:        # explicit 0 only; None = count unknown
             return False
         return isinstance(r.get('price'), (int, float))
+
+    def product_tags(r: Dict[str, Any]) -> List[str]:
+        return (["[GTY]"] if r.get('guarantee') else []) + \
+               (["[connecting]"] if r.get('connecting') else [])
 
     table_rows: List[Dict[str, Any]] = []
     for r in rows:
@@ -2521,23 +2525,37 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         # past final payment a cheaper category returns NO refund
         shown = max(delta, 0.0) if (delta is not None and past_final_payment) else delta
 
-        tag = fare_type_mismatch(r) if tag_rows else ""
-        tags = f"  {tag}" if tag else ""
+        product = product_tags(r)
+        fare_tag = fare_type_mismatch(r) if tag_rows else ""
+        tags = "".join(f"  {t}" for t in product + ([fare_tag] if fare_tag else []))
 
         log(f"\t  {'*' if is_booked_cat else ' '} {str(r.get('category') or r.get('subtype')):5} "
             f"{str(r.get('type')):9} {money(r['price']):>12} {_upgrade_delta(shown, 12, sym)}  "
             f"{r.get('display_name', '')}{tags}")
 
+        # Within the booked class "pricier" is no proxy for "better" on these
+        # products (no cabin choice / same cabin with a door): they alert only
+        # as a move UP a class, which withholding the same-class anchor enforces
+        same_class_anchor = None if product else alert_booked_now
         if (threshold is not None and not is_booked_cat and shown is not None
                 and shown <= threshold
-                and is_upgrade_candidate(booked_rank, alert_booked_now,
+                and is_upgrade_candidate(booked_rank, same_class_anchor,
                                          TYPE_RANK.get(r.get('type')), r['price'],
                                          r.get('display_name') or "")):
             sign = "+" if shown > 0 else "-" if shown < 0 else ""
-            hits.append(f"{r.get('category') or r.get('subtype')} {r.get('display_name', '')} "
-                        f"for {sign}{sym}{abs(shown):,.2f} (now {money(r['price'])})")
+            hit_tags = "".join(f" {t}" for t in product)
+            hits.append(f"{r.get('category') or r.get('subtype')} {r.get('display_name', '')}"
+                        f"{hit_tags} for {sign}{sym}{abs(shown):,.2f} (now {money(r['price'])})")
 
     # ---- notes ---------------------------------------------------------------
+    tag_notes = []
+    if any(r.get('guarantee') for r in table_rows):
+        tag_notes.append("[GTY] = guarantee fare: the cruise line assigns the cabin and "
+                         "its location - you can't choose it")
+    if any(r.get('connecting') for r in table_rows):
+        tag_notes.append("[connecting] = has a door to the adjoining cabin")
+    if tag_notes:
+        log("\t  " + "; ".join(tag_notes) + ".")
     if booked_row is not None and not anchor_exact:
         if family_display and booked_cat:
             log(f"\t  Your category {booked_cat} returned no price today (it may be sold out "

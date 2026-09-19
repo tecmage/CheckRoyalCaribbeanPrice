@@ -192,9 +192,11 @@ after final payment a cheaper category returns no refund (shown as 0.00) while
 upgrades remain possible; when the table mixes deposit types, rows on a different
 type than your booking are tagged `[NRD rate]` / `[refundable rate]` (if every
 row differs, one note says so instead); TA/group bookings are flagged because
-agent fees and discounts never appear in Royal's ledger. Guarantee, connecting
-and sold-out (0 rooms left) rows are not offered. Every row is priced with your
-booking's qualifiers, including your residency discount.
+agent fees and discounts never appear in Royal's ledger. Guarantee rows are
+listed tagged `[GTY]` (often the cheapest way up a class, but the cruise line
+assigns the cabin - you can't choose it) and connecting cabins tagged
+`[connecting]`; sold-out (0 rooms left) rows are not offered. Every row is priced
+with your booking's qualifiers, including your residency discount.
 
 Scope the check with `upgradeReservations: ["1234567"]` to run it only for the
 listed reservation IDs (absent or empty = every booking; a listed ID that matches
@@ -203,5 +205,7 @@ no booking is warned about).
 Optionally set `upgradeAlertBelow: 100` to send one Apprise alert per booking
 listing genuine upgrades (a higher class, or a pricier non-niche category within
 your class) whose cost - on the same basis the table shows - is at or below that
-amount. Solo bookings the main checker prices with the DP340 single-supplement
+amount. `[GTY]` and `[connecting]` rows alert only as a move to a higher class,
+never as a pricier option within your own, and keep their tag in the alert. Solo
+bookings the main checker prices with the DP340 single-supplement
 code (or that were booked with it) have the booked family quoted with it too.

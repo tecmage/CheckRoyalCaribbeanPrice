@@ -4578,12 +4578,21 @@ class TestCheckForUpgrades:
                 past_final_payment=past_final_payment)
         return "\n".join(logged), apobj, mock_family
 
-    def test_table_uses_fare_taxes_basis_and_excludes_gty_connecting(self):
+    def test_table_uses_fare_taxes_basis_and_tags_gty_connecting(self):
         out, _, _ = self._render()
         # dl-paid for the Grand Suite: 2400 - 1700 = +700 (not 2400 - 2050 = +350)
         assert "+$700.00" in out and "+$350.00" not in out
-        assert "Interior GTY" not in out          # guarantees excluded
-        assert "Connecting Balcony" not in out    # connecting excluded
+        # guarantee and connecting rows are offered, tagged - a guarantee is
+        # often the cheapest way up a class, so hiding it hid the best row
+        lines = out.split("\n")
+        gty_line = next(l for l in lines if "Interior GTY" in l)
+        assert "[GTY]" in gty_line and "[connecting]" not in gty_line
+        assert "-$1,045.00" in gty_line           # 655 - 1700: priced like any row
+        conn_line = next(l for l in lines if "Connecting Balcony" in l)
+        assert "[connecting]" in conn_line and "[GTY]" not in conn_line
+        plain_line = next(l for l in lines if "Grand Suite" in l)
+        assert "[GTY]" not in plain_line and "[connecting]" not in plain_line
+        assert "[GTY] = guarantee fare" in out and "[connecting] = has a door" in out
         assert "fare + taxes paid" in out
         # normal booking: ONLY the governing dl-paid column renders - the
         # dl-rate column, its basis line, and its values are absent entirely
@@ -4958,6 +4967,47 @@ class TestCheckForUpgrades:
         assert "rough guide only" in out2
         header = next(l for l in out2.split("\n") if "cat" in l and "type" in l)
         assert "dl-paid" in header
+
+    def _tagged_rows(self, extra=()):
+        return [{"type": t, "subtype": code, "category": cat, "display_name": name,
+                 "name": name, "price": total, "rooms_left": 5, "guarantee": gty,
+                 "connecting": "connect" in name.lower(), "refundability": None}
+                for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP + list(extra)]
+
+    def test_gty_and_connecting_alert_as_class_jumps_with_their_tag(self):
+        """From an interior, a balcony guarantee is a real (and usually the
+        cheapest) way up a class: it must alert, and the alert must carry the
+        tag so nobody books it expecting to choose the cabin."""
+        rows = self._tagged_rows([("BALCONY", "XB", "XB", "Balcony GTY", 950.0, True)])
+        out, apobj, _ = self._render(rows=rows, subtype="V", category="4U",
+                                     cabin_class="INTERIOR", threshold=5000.0)
+        body = apobj.notify.call_args.kwargs["body"]
+        assert "Balcony GTY [GTY] for" in body
+        assert "Connecting Balcony [connecting] for" in body
+        assert "Ocean View Balcony for" in body               # untagged rows unchanged
+        assert "Interior GTY" not in body                     # same class, and cheaper
+
+    def test_gty_and_connecting_never_alert_within_the_booked_class(self):
+        """Within the booked class 'pricier' stands in for 'better' - untrue of
+        a guarantee (no cabin choice) or a connecting cabin (same cabin plus a
+        door), so neither may alert as a same-class upgrade."""
+        rows = self._tagged_rows([
+            ("BALCONY", "XB", "XB", "Balcony GTY", 1120.0, True),
+            ("BALCONY", "E", "2E", "Spacious Balcony", 1200.0, False)])
+        out, apobj, _ = self._render(rows=rows, threshold=5000.0,
+                                     results_extra={"base_fare": {"fare": 1100.0}})
+        body = apobj.notify.call_args.kwargs["body"]
+        # the anchor IS exact (1100), so an ordinary pricier balcony alerts ...
+        assert "Spacious Balcony for" in body
+        # ... while the pricier guarantee (1120) and connecting (1150) do not
+        assert "Balcony GTY" not in body and "Connecting Balcony" not in body
+        assert "Balcony GTY" in out and "Connecting Balcony" in out   # still listed
+
+    def test_tag_legend_only_when_a_tagged_row_is_shown(self):
+        rows = [r for r in self._tagged_rows() if not r["guarantee"] and not r["connecting"]]
+        out, _, _ = self._render(rows=rows)
+        assert "[GTY]" not in out and "[connecting]" not in out
+        assert not any(l.strip() == "." for l in out.split("\n"))   # no empty legend line
 
     def test_rows_with_zero_rooms_left_are_not_offered(self):
         rows = [{"type": t, "subtype": code, "category": cat, "display_name": name,
