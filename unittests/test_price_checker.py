@@ -965,6 +965,7 @@ def test_reservation_price_paid_dict_of_dicts_prices_not_crashes():
 
     assert mock_price.called
     assert mock_price.call_args.kwargs["paid_price_struct"]["paid_price"] == 900.0
+    assert mock_price.call_args.kwargs["paid_price_struct"]["paidPriceOverridden"] is True
 
 
 def test_null_passenger_array_does_not_crash_pricing(mock_global_config, base_account_info):
@@ -4525,6 +4526,17 @@ class TestCheckForUpgrades:
         assert "Upgrading or downgrading would use" not in out
         # GS dl-rate vs booked lead-in 1100: +1300 shown; dl-paid +350/+700 absent
         assert "+$1,300.00" in out and "+$350.00" not in out and "+$700.00" not in out
+
+    def test_user_paid_price_override_wins_the_dl_paid_basis(self):
+        """A manually configured reservationPricePaid is a deliberate statement
+        (the docs' change-fee cushion advice): it must beat the ledger's
+        fare+taxes as the dl-paid basis."""
+        out, _, _ = self._render(struct={
+            "paid_price": 1550.0, "paidPriceOverridden": True,
+            "fareAndTaxes": 1700.0, "isCasino": False})
+        # Grand Suite: 2400 - 1550 (user) = +850, not 2400 - 1700 (ledger)
+        assert "+$850.00" in out and "+$700.00" not in out
+        assert "your configured reservationPricePaid" in out
 
     def test_gross_fallback_disclosed_for_normal_booking(self):
         out, _, _ = self._render(struct={"paid_price": 2050.0, "isCasino": False})

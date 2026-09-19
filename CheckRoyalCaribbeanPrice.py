@@ -2173,6 +2173,10 @@ def get_voyages(
                                                     paid_price.get("paid_price"))
                     if paid_price is not None:
                         paid_price_struct['paid_price'] = float(paid_price)
+                        # a manually configured price is a deliberate statement
+                        # (e.g. the documented change-fee cushion) - the upgrade
+                        # table's dl-paid basis must honor it over the ledger
+                        paid_price_struct['paidPriceOverridden'] = True
             elif isinstance(reservation_price_paid, list):
                 for reservation in reservation_price_paid:
                     # str-compare: a missing/non-numeric 'reservation' key must
@@ -2181,6 +2185,8 @@ def get_voyages(
                         for key, val in reservation.items():
                             if key == "paidPrice":
                                 paid_price_struct["paid_price"] = float(val) if val is not None else None
+                                if val is not None:
+                                    paid_price_struct['paidPriceOverridden'] = True
                             else:
                                 paid_price_struct[key] = val
 
@@ -2317,11 +2323,22 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         # exact booked category beats the family's lead-in as the dl-rate anchor
         booked_now = family_prices[booked_cat]
 
-    # dl-paid basis: fare + taxes when the ledger supplied both (a reprice
-    # keeps prepaid add-ons); otherwise fall back to the gross paid price.
+    # dl-paid basis, in order of preference: a manually configured
+    # reservationPricePaid value (a deliberate user statement - e.g. the
+    # documented change-fee cushion - that must win over the ledger), then
+    # fare + taxes from the ledger (a reprice keeps prepaid add-ons), then
+    # the gross paid total.
     fare_and_taxes = struct.get('fareAndTaxes')
-    paid_basis = fare_and_taxes if isinstance(fare_and_taxes, (int, float)) else struct.get('paid_price')
-    basis_is_gross = not isinstance(fare_and_taxes, (int, float))
+    user_paid = struct.get('paid_price') if struct.get('paidPriceOverridden') else None
+    if isinstance(user_paid, (int, float)):
+        paid_basis = user_paid
+        basis_label = "your configured reservationPricePaid"
+    elif isinstance(fare_and_taxes, (int, float)):
+        paid_basis = fare_and_taxes
+        basis_label = "fare + taxes paid; prepaid add-ons excluded"
+    else:
+        paid_basis = struct.get('paid_price')
+        basis_label = "gross paid (fare+taxes unavailable)"
 
     candidates = [r for r in rows
                   if not r.get('guarantee') and not r.get('connecting')
@@ -2347,9 +2364,7 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     if prefer_rate:
         log(f"\t  dl-rate basis: {_upgrade_money(booked_now)} (booked category today)")
     else:
-        basis_note = ("gross paid (fare+taxes unavailable)" if basis_is_gross
-                      else "fare + taxes paid; prepaid add-ons excluded")
-        log(f"\t  dl-paid basis: {_upgrade_money(paid_basis)} ({basis_note})")
+        log(f"\t  dl-paid basis: {_upgrade_money(paid_basis)} ({basis_label})")
     header = f"\t  {'':1} {'cat':5} {'type':9} {'now':>12} {delta_label:>12}  description"
     log(header)
     log("\t  " + "-" * (len(header) - 4))
