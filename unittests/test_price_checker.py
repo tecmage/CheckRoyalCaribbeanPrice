@@ -4651,6 +4651,22 @@ class TestCheckForUpgrades:
         assert "* 2D" in out and "  4D" in out
         # Grand Suite dl-rate: 2400 - 1180 (exact 2D) = +1220, not 2400 - 1100
         assert "+$1,220.00" in out and "+$1,300.00" not in out
+        assert "your booked category 2D today" in out
+
+    def test_dl_rate_anchor_labeled_honestly_when_booked_category_missing(self):
+        """Booked 2D absent from the family response (sold out within the
+        family): the anchor silently stays the lead-in - the basis line must
+        say so instead of claiming 'booked category today'."""
+        out, _, _ = self._render(
+            struct={"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": True},
+            family={"4D": 1100.0})
+        assert "family lead-in; 2D returned no price today" in out
+        assert "your booked category 2D today" not in out
+
+        # no family data at all: lead-in wording, never "booked category"
+        out2, _, _ = self._render(
+            struct={"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": True})
+        assert "booked family's lead-in category today" in out2
 
     def test_family_categories_show_dl_paid_for_normal_booking(self):
         out, _, _ = self._render(family={"2D": 1180.0, "4D": 1100.0})

@@ -2318,10 +2318,22 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         # table then shows each family's lead-in only (and no extra API call)
         family_prices, dp340_used = _get_upgrade_category_prices(
             url_params, booked_row.get('type'), dp340=apply_dp340)
+    # Label the dl-rate anchor honestly: it is only "your booked category"
+    # when that exact category priced; otherwise it is the family's lead-in
+    # (previously the line claimed "booked category today" either way).
     booked_cat = url_params.stateroom_category_code
+    if booked_row and booked_cat and booked_row.get('category') == booked_cat:
+        rate_anchor_label = f"your booked category {booked_cat} today"
+    else:
+        rate_anchor_label = "your booked family's lead-in category today"
     if booked_cat and booked_cat in family_prices:
         # exact booked category beats the family's lead-in as the dl-rate anchor
         booked_now = family_prices[booked_cat]
+        rate_anchor_label = f"your booked category {booked_cat} today"
+    elif family_prices and booked_cat:
+        # the family priced but the booked category didn't (sold out within
+        # the family) - the anchor stays the lead-in; say so
+        rate_anchor_label = f"family lead-in; {booked_cat} returned no price today"
 
     # dl-paid basis, in order of preference: a manually configured
     # reservationPricePaid value (a deliberate user statement - e.g. the
@@ -2362,7 +2374,7 @@ def _maybe_report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
 
     log(f"\t{BLUE}Upgrade options (subtype lead-in prices, this booking's guests){RESET}")
     if prefer_rate:
-        log(f"\t  dl-rate basis: {_upgrade_money(booked_now)} (booked category today)")
+        log(f"\t  dl-rate basis: {_upgrade_money(booked_now)} ({rate_anchor_label})")
     else:
         log(f"\t  dl-paid basis: {_upgrade_money(paid_basis)} ({basis_label})")
     header = f"\t  {'':1} {'cat':5} {'type':9} {'now':>12} {delta_label:>12}  description"
