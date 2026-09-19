@@ -2463,6 +2463,23 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     log("\t  " + "-" * (len(header) - 4))
 
     deposit_type = struct.get('depositType')
+
+    def fare_type_mismatch(r: Dict[str, Any]) -> str:
+        """'' when the row's deposit type matches the booking's (or is unknown)."""
+        row_refund = r.get('refundability')
+        if deposit_type == "NRD" and isinstance(row_refund, str) and row_refund != "DEPOSIT_NOT_REFUNDABLE":
+            return "[refundable rate]"
+        if deposit_type == "REFUNDABLE" and row_refund == "DEPOSIT_NOT_REFUNDABLE":
+            return "[NRD rate]"
+        return ""
+
+    # A per-row tag only informs when the table is MIXED. When every row is on
+    # the other fare type (live: a booking whose ledger reads refundable while
+    # all 13 quotes were NRD rates) the tags are pure noise - one note says it
+    # instead. On a comped casino fare the comparison is moot altogether.
+    mismatches = [fare_type_mismatch(r) for r in table_rows]
+    all_mismatch = bool(mismatches) and all(mismatches)
+    tag_rows = not is_casino and any(mismatches) and not all_mismatch
     hits: List[str] = []
     any_cheaper = False
     threshold = config.upgrade_alert_below if isinstance(config.upgrade_alert_below, (int, float)) else None
@@ -2476,12 +2493,8 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         # past final payment a cheaper category returns NO refund
         shown = max(delta, 0.0) if (delta is not None and past_final_payment) else delta
 
-        tags = ""
-        row_refund = r.get('refundability')
-        if deposit_type == "NRD" and isinstance(row_refund, str) and row_refund != "DEPOSIT_NOT_REFUNDABLE":
-            tags = "  [refundable rate]"
-        elif deposit_type == "REFUNDABLE" and row_refund == "DEPOSIT_NOT_REFUNDABLE":
-            tags = "  [NRD rate]"
+        tag = fare_type_mismatch(r) if tag_rows else ""
+        tags = f"  {tag}" if tag else ""
 
         log(f"\t  {'*' if is_booked_cat else ' '} {str(r.get('category') or r.get('subtype')):5} "
             f"{str(r.get('type')):9} {money(r['price']):>12} {_upgrade_delta(shown, 12, sym)}  "
@@ -2513,7 +2526,8 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
     if is_casino:
         log(f"\t  {YELLOW}Note: casino-rate booking - a straight reprice (dl-paid) would forfeit "
             f"the comp; {BOLD}dl-rate{RESET}{YELLOW} approximates the category difference a casino "
-            f"desk charges. Confirm with the casino desk before changing anything.{RESET}")
+            f"desk charges to move UP. A cheaper category returns nothing on a comped fare. "
+            f"Confirm with the casino desk before changing anything.{RESET}")
         if casino_without_anchor:
             log(f"\t  {YELLOW}No comparable rate row was returned for this booking, so dl-paid "
                 f"is shown instead - treat it as a rough guide only.{RESET}")
@@ -2530,7 +2544,9 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         log(f"\t  {YELLOW}Past final payment: upgrades are still possible at today's rates, "
             f"but a cheaper category returns no refund (shown as {sym}0.00).{RESET}")
 
-    if struct.get('isAgency'):
+    # (live: casino bookings are flagged as agency bookings - Club Royale is the
+    # "agency" - and the casino note above already says who to call)
+    if struct.get('isAgency') and not is_casino:
         log(f"\t  {YELLOW}TA/group booking: figures are Royal's ledger - your agent's own fees "
             f"or discounts aren't visible here, and any reprice or upgrade goes through your "
             f"TA (who may charge their own change fee).{RESET}")
@@ -2547,9 +2563,13 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
                 f"generally keep your deposit, and reprices must stay on a non-refundable fare; "
                 f"ship/date changes and cancellations carry the penalties in your booking terms.")
     elif deposit_type == "REFUNDABLE" and quotes_nrd and not is_casino:
-        log("\t  Note: rows tagged [NRD rate] are non-refundable-deposit prices - matching one "
-            "may require switching this refundable booking to NRD (allowed before final "
-            "payment; the switch is one-way).")
+        which = "rows tagged [NRD rate] are" if tag_rows else "the prices above are"
+        log(f"\t  Note: {which} non-refundable-deposit prices - matching one "
+            f"may require switching this refundable booking to NRD (allowed before final "
+            f"payment; the switch is one-way).")
+    if deposit_type == "NRD" and all_mismatch and not is_casino:
+        log("\t  Note: the prices above are refundable-deposit rates - an NRD booking can only "
+            "reprice onto a non-refundable fare, so these may not be available as priced.")
     if threshold is not None and booked_rank is None:
         log(f"\t  {YELLOW}Booked class unknown - upgrade alerts skipped for this booking.{RESET}")
 

@@ -4935,24 +4935,61 @@ class TestCheckForUpgrades:
         assert "new bookings only" in out2
         assert "original promotions/onboard credit are replaced" in out2
 
-    def test_rows_priced_on_another_fare_type_are_tagged(self):
-        def rows(refund):
-            return [{"type": "DELUXE", "subtype": "GS", "category": "GS",
-                     "display_name": "Grand Suite", "name": "GS", "price": 2400.0,
-                     "rooms_left": 2, "guarantee": False, "connecting": False,
-                     "refundability": refund}]
-        out, _, _ = self._render(rows=rows("REFUNDABLE"), struct={
-            "paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False,
-            "depositType": "NRD"})
-        assert "[refundable rate]" in out
-        out2, _, _ = self._render(rows=rows("DEPOSIT_NOT_REFUNDABLE"), struct={
-            "paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False,
-            "depositType": "REFUNDABLE"})
-        assert "[NRD rate]" in out2
-        out3, _, _ = self._render(rows=rows("DEPOSIT_NOT_REFUNDABLE"), struct={
-            "paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False,
-            "depositType": "NRD"})
-        assert "[NRD rate]" not in out3 and "[refundable rate]" not in out3
+    def _fare_rows(self, refunds):
+        names = [("BALCONY", "D", "4D", "Ocean View Balcony", 1100.0),
+                 ("DELUXE", "GS", "GS", "Grand Suite", 2400.0),
+                 ("DELUXE", "OS", "OS", "Owner's Suite", 3400.0)]
+        return [{"type": t_, "subtype": code, "category": cat, "display_name": name,
+                 "name": name, "price": total, "rooms_left": 2, "guarantee": False,
+                 "connecting": False, "refundability": refund}
+                for (t_, code, cat, name, total), refund in zip(names, refunds)]
+
+    def test_fare_type_tags_only_when_the_table_is_mixed(self):
+        nrd = {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False,
+               "depositType": "NRD"}
+        mixed = self._fare_rows(["DEPOSIT_NOT_REFUNDABLE", "REFUNDABLE",
+                                 "DEPOSIT_NOT_REFUNDABLE"])
+        out, _, _ = self._render(rows=mixed, struct=nrd)
+        gs_line = next(l for l in out.split("\n") if "Grand Suite" in l)
+        os_line = next(l for l in out.split("\n") if "Owner's Suite" in l)
+        assert "[refundable rate]" in gs_line          # only the odd one out is tagged
+        assert "rate]" not in os_line
+
+        # every row on the other fare type: tags are noise - one note instead
+        refundable = dict(nrd, depositType="REFUNDABLE")
+        all_nrd = self._fare_rows(["DEPOSIT_NOT_REFUNDABLE"] * 3)
+        out2, _, _ = self._render(rows=all_nrd, struct=refundable)
+        assert "[NRD rate]" not in out2
+        assert "the prices above are non-refundable-deposit prices" in out2
+
+        all_refundable = self._fare_rows(["REFUNDABLE"] * 3)
+        out3, _, _ = self._render(rows=all_refundable, struct=nrd)
+        assert "[refundable rate]" not in out3
+        assert "the prices above are refundable-deposit rates" in out3
+
+        # matching fare types: nothing to say
+        out4, _, _ = self._render(rows=all_nrd, struct=nrd)
+        assert "[NRD rate]" not in out4 and "[refundable rate]" not in out4
+        assert "refundable-deposit rates" not in out4
+
+    def test_casino_booking_gets_no_fare_tags_and_no_ta_note(self):
+        """Live finding: Club Royale bookings are flagged as agency bookings in
+        the payload and read as 'refundable' against all-NRD quotes - the table
+        printed [NRD rate] on all 13 rows plus 'goes through your TA' for a
+        booking that goes through the casino desk."""
+        casino = {"paid_price": 1277.12, "isCasino": True, "isAgency": True,
+                  "depositType": "REFUNDABLE"}
+        rows = self._fare_rows(["DEPOSIT_NOT_REFUNDABLE", "REFUNDABLE",
+                                "DEPOSIT_NOT_REFUNDABLE"])       # even when mixed
+        out, _, _ = self._render(rows=rows, struct=casino)
+        assert "[NRD rate]" not in out and "[refundable rate]" not in out
+        assert "TA/group booking" not in out
+        assert "casino-rate booking" in out
+        assert "A cheaper category returns nothing on a comped fare" in out
+
+        # a genuine (non-casino) TA booking still gets its note
+        out2, _, _ = self._render(rows=rows, struct=dict(casino, isCasino=False))
+        assert "TA/group booking" in out2
 
     def test_connecting_cabin_booking_keeps_its_own_family(self):
         """A booking IN a connecting cabin was filtered out of its own table
