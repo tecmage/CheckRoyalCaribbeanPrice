@@ -67,6 +67,7 @@ from CheckRoyalCaribbeanPrice import (
     _get_upgrade_category_prices,
     _maybe_report_upgrades,
     _UPGRADE_SCOPE_SEEN,
+    _UPGRADE_WATCH_SEEN,
     get_ship_dictionary_web,
     get_voyages,
     history,
@@ -74,7 +75,9 @@ from CheckRoyalCaribbeanPrice import (
     login,
     main,
     parse_provided_URL,
-    resolve_lead_time
+    read_cabin_state,
+    resolve_lead_time,
+    upgrade_watch_verdict
 )
 
 
@@ -4571,8 +4574,10 @@ class TestCheckForUpgrades:
                 cabin_class="BALCONY", family=None, family_dp340=False, adults=2,
                 category="2D", coupon=None, coupon_rejected=False,
                 past_final_payment=False, currency="USD", family_raises=False,
-                sister=True, results_extra=None, refundable=False):
+                sister=True, results_extra=None, refundable=False,
+                watch=None, state_file=None, notifier=None, loyalty=None):
         params = _availability_params(subtype=subtype, category_code=category)
+        params.loyalty_number = loyalty
         params.refundable = refundable
         params.cabin_class_string = cabin_class
         params.number_of_adults = adults
@@ -4584,8 +4589,11 @@ class TestCheckForUpgrades:
              "guarantee": gty, "connecting": "connect" in name.lower()}
             for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP]
         cfg = CruiseAppConfig(upgrade_alert_below=threshold,
-                              upgrade_sister_categories=sister)
-        apobj = MagicMock()
+                              upgrade_sister_categories=sister,
+                              upgrade_watch=watch or {})
+        if state_file is not None:
+            cfg.cabin_availability_state_file = str(state_file)
+        apobj = notifier if notifier is not None else MagicMock()
         logged = []
         with patch('CheckRoyalCaribbeanPrice.config', cfg), \
              patch('CheckRoyalCaribbeanPrice.log',
@@ -5143,6 +5151,206 @@ class TestCheckForUpgrades:
                                    struct={"paid_price": 2050.0, "isCasino": True,
                                            "depositType": "NRD"})
         assert "rate]" not in apobj.notify.call_args.kwargs["body"]
+
+    # ---------------- upgradeWatch: tell me once when a category opens --------
+
+    @staticmethod
+    def _notifier(result=True):
+        n = MagicMock()
+        n.__len__.return_value = 1
+        n.notify.return_value = result
+        return n
+
+    def _sweep_rows(self, drop=(), overrides=None):
+        overrides = overrides or {}
+        return [dict({"type": t, "subtype": code, "category": cat, "display_name": name,
+                      "name": name, "price": total, "rooms_left": 5, "guarantee": gty,
+                      "connecting": "connect" in name.lower(), "refundability": None},
+                     **overrides.get(code, {}))
+                for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP if code not in drop]
+
+    def test_watch_verdict_matrix(self):
+        rows = self._sweep_rows()
+        booked = next(r for r in rows if r["subtype"] == "D")
+        # listed and priced: by subtype code, or by a family's lead-in category
+        assert upgrade_watch_verdict("GS", rows)[0] is True
+        assert upgrade_watch_verdict("4u", rows)[0] is True             # case-insensitive
+        assert upgrade_watch_verdict("V", rows)[1]["category"] == "4U"
+        # a sister category of the BOOKED family is visible through its prices
+        ok, row = upgrade_watch_verdict("2D", rows, {"2D": 1180.0, "4D": 1100.0}, booked)
+        assert ok is True and row["price"] == 1180.0 and row["category"] == "2D"
+        # ... but a sister of ANOTHER family is not: on sale? unknown, never "closed"
+        unknown_verdict, family_row = upgrade_watch_verdict("2U", rows)
+        assert unknown_verdict is None and family_row["subtype"] == "V"   # names the family
+        # explicit zero stock is a confirmed closure; an unknown count is not
+        zero = self._sweep_rows(overrides={"GS": {"rooms_left": 0}})
+        assert upgrade_watch_verdict("GS", zero)[0] is False
+        unknown = self._sweep_rows(overrides={"GS": {"rooms_left": None}})
+        assert upgrade_watch_verdict("GS", unknown)[0] is True
+        # listed without a price: unknown
+        for bad in (None, -1, 0, True, float("nan"), float("inf")):
+            unpriced = self._sweep_rows(overrides={"GS": {"price": bad}})
+            assert upgrade_watch_verdict("GS", unpriced)[0] is None, bad
+        assert upgrade_watch_verdict("2D", rows, {"2D": -5.0}, booked)[0] is None   # not "on sale"
+        # nothing on the sailing shares its letters: confirmed not for sale
+        assert upgrade_watch_verdict("GS", self._sweep_rows(drop=("GS",))) == (False, None)
+        assert upgrade_watch_verdict("", rows) == (None, None)
+
+    def test_watch_alerts_once_then_rearms_on_confirmed_closure(self, tmp_path):
+        state, n = tmp_path / "state.json", self._notifier()
+        run = lambda rows: self._render(rows=rows, watch={"1234567": ["GS"]},
+                                        state_file=state, notifier=n)
+        out, _, _ = run(self._sweep_rows())
+        assert n.notify.call_count == 1
+        assert "Watching GS: available" in out and "Alert sent for GS" in out
+        run(self._sweep_rows())                                   # still open: no repeat
+        assert n.notify.call_count == 1
+        out, _, _ = run(self._sweep_rows(drop=("GS",)))           # confirmed closure
+        assert "Watching GS: not for sale today" in out
+        assert n.notify.call_count == 1
+        run(self._sweep_rows())                                   # re-opened: alerts again
+        assert n.notify.call_count == 2
+        row = read_cabin_state(state)["upgradeWatch 1234567 GS"]
+        assert row["available"] is True and row["notified"] is True
+
+    def test_watch_unknown_result_keeps_state_and_never_alerts(self, tmp_path):
+        """A lead-in selling out promotes its sister to lead-in: the sister
+        becomes VISIBLE, which is not the same as having just opened."""
+        state, n = tmp_path / "state.json", self._notifier()
+        kw = dict(watch={"1234567": ["2U"]}, state_file=state, notifier=n)
+        out, _, _ = self._render(rows=self._sweep_rows(), **kw)   # family V listed as 4U
+        assert "Watching 2U: can't tell today" in out
+        assert "family V is on sale (from 4U)" in out and "watch V to follow" in out
+        n.notify.assert_not_called()
+        assert not state.exists()                                 # nothing recorded
+        promoted = self._sweep_rows(overrides={"V": {"category": "2U"}})
+        self._render(rows=promoted, **kw)                         # now visibly on sale
+        assert n.notify.call_count == 1                           # first CONFIRMED sighting
+        self._render(rows=self._sweep_rows(), **kw)               # invisible again: unknown
+        self._render(rows=promoted, **kw)
+        assert n.notify.call_count == 1                           # unknown did not re-arm
+
+    def test_watch_alert_text_and_link_carry_no_loyalty_number(self, tmp_path):
+        state, n = tmp_path / "state.json", self._notifier()
+        self._render(rows=self._sweep_rows(), watch={"1234567": ["gs"]}, state_file=state,
+                     notifier=n, loyalty="555444333")
+        kwargs = n.notify.call_args.kwargs
+        assert kwargs["title"] == "Cruise Category Available"
+        body = kwargs["body"]
+        assert "#1234567" in body and "GS Grand Suite - now" in body      # GS/GS: no family note
+        assert "now $2,400.00 (dl-paid +$700.00)" in body          # 2400 - 1700 basis
+        assert "room-selection/type-and-subtype?packageCode=OV07X066" in body
+        assert "555444333" not in body and "555444333" not in state.read_text()
+
+    def test_watch_uses_the_governing_delta_and_the_no_refund_clamp(self, tmp_path):
+        n = self._notifier()
+        self._render(rows=self._sweep_rows(), watch={"1234567": ["GS"]},
+                     state_file=tmp_path / "a.json", notifier=n,
+                     struct={"paid_price": 2050.0, "isCasino": True})
+        assert "(dl-rate +$1,300.00)" in n.notify.call_args.kwargs["body"]   # 2400 - 1100
+        n2 = self._notifier()
+        self._render(rows=self._sweep_rows(), watch={"1234567": ["V"]},
+                     state_file=tmp_path / "b.json", notifier=n2, past_final_payment=True)
+        assert "(dl-paid $0.00)" in n2.notify.call_args.kwargs["body"]       # cheaper: no refund
+
+    def test_watch_failed_delivery_is_contained_and_retried(self, tmp_path):
+        state = tmp_path / "state.json"
+        kw = dict(rows=self._sweep_rows(), watch={"1234567": ["GS", "V"]}, state_file=state)
+        bad = self._notifier(result=False)
+        out, _, _ = self._render(notifier=bad, **kw)
+        assert "Watching GS: Cabin availability notification not confirmed" in out
+        assert "Watching V: available - 4U Interior (family V)" in out    # next watch still ran
+        assert "Upgrade check skipped" not in out                 # not an "unexpected data" failure
+        assert read_cabin_state(state)["upgradeWatch 1234567 GS"]["notified"] is False
+        good = self._notifier()
+        self._render(notifier=good, **kw)
+        assert good.notify.call_count == 2                        # both retried and delivered
+
+    def test_watch_without_a_notifier_logs_and_stays_pending(self, tmp_path):
+        state = tmp_path / "state.json"
+        empty = MagicMock()
+        empty.__len__.return_value = 0
+        out, _, _ = self._render(rows=self._sweep_rows(), watch={"1234567": ["GS"]},
+                                 state_file=state, notifier=empty)
+        assert "Watching GS: available" in out and "Alert sent" not in out
+        empty.notify.assert_not_called()
+        assert read_cabin_state(state)["upgradeWatch 1234567 GS"]["notified"] is False
+
+    def test_watch_shares_the_state_file_without_disturbing_other_watches(self, tmp_path):
+        state = tmp_path / "state.json"
+        other = {"url": "https://example.invalid/x", "available": True, "notified": True}
+        state.write_text(json.dumps({"some other watch": other}))
+        self._render(rows=self._sweep_rows(), watch={"1234567": ["GS"]},
+                     state_file=state, notifier=self._notifier())
+        saved = read_cabin_state(state)
+        assert saved["some other watch"] == other
+        assert set(saved) == {"some other watch", "upgradeWatch 1234567 GS"}
+
+    def test_watch_only_applies_to_its_own_reservation(self, tmp_path):
+        state, n = tmp_path / "state.json", self._notifier()
+        out, _, _ = self._render(rows=self._sweep_rows(), watch={"7654321": ["GS"]},
+                                 state_file=state, notifier=n)
+        assert "Watching" not in out
+        n.notify.assert_not_called()
+        assert not state.exists()
+
+    def test_watched_reservation_is_checked_even_outside_upgrade_reservations(
+            self, mock_global_config, base_account_info):
+        booking = {"bookingId": "1234567", "sailDate": "20270510", "shipCode": "WN",
+                   "stateroomType": "B", "stateroomSubtype": "4D",
+                   "passengersInStateroom": [{"firstName": "A", "birthdate": "19800101"}]}
+        for watch, expected in (({"1234567": ["GS"]}, True), ({"7654321": ["GS"]}, False)):
+            cfg = CruiseAppConfig(check_for_upgrades=True, upgrade_reservations=["9999999"],
+                                  upgrade_watch=watch)
+            _UPGRADE_WATCH_SEEN.discard("1234567")
+            with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+                 patch('CheckRoyalCaribbeanPrice.get_room_price_via_API',
+                       return_value={"room_available": False}) as mock_price:
+                get_cruise_price(account_info=base_account_info, booking=booking,
+                                 ship_dictionary=ShipRegistry(), automatic_URL=True)
+            assert mock_price.call_args.kwargs.get("collect_all") is expected
+            assert ("1234567" in _UPGRADE_WATCH_SEEN) is expected
+
+    def test_config_loads_upgrade_watch(self, tmp_path):
+        def load(extra):
+            f = tmp_path / "config.yaml"
+            f.write_text('accountInfo:\n  - username: "u"\n    password: "p"\n' + extra)
+            with patch('CheckRoyalCaribbeanPrice.setup_hybrid_logging'):
+                return load_config_objects(str(f))
+
+        cfg = load('upgradeWatch:\n  1234567: ["js", "GS", "js "]\n  "7654321": J4\n')
+        assert cfg.upgrade_watch == {"1234567": ["JS", "GS"], "7654321": ["J4"]}
+        assert load('upgradeWatch:\n').upgrade_watch == {}           # present-but-null
+        assert load('upgradeWatch:\n  1234567:\n').upgrade_watch == {}
+        assert load('').upgrade_watch == {}
+        with pytest.raises(ValueError, match="upgradeWatch must map"):
+            load('upgradeWatch: ["JS"]\n')
+        with pytest.raises(ValueError, match="quote them"):
+            load('upgradeWatch:\n  1234567: [NO]\n')                 # YAML boolean, not a code
+
+    def test_main_warns_when_a_watch_can_never_fire(self):
+        def run_main(cfg, seen=()):
+            logged = []
+            _UPGRADE_WATCH_SEEN.clear()
+            _UPGRADE_WATCH_SEEN.update(seen)
+            with patch('CheckRoyalCaribbeanPrice.config', cfg), \
+                 patch('CheckRoyalCaribbeanPrice.history'), \
+                 patch('CheckRoyalCaribbeanPrice.get_ship_dictionary_web'), \
+                 patch('CheckRoyalCaribbeanPrice.CheckinPaymentTracker'), \
+                 patch('CheckRoyalCaribbeanPrice.log',
+                       side_effect=lambda m, *a, **k: logged.append(str(m))):
+                main()
+            return "\n".join(logged)
+
+        out = run_main(CruiseAppConfig(upgrade_watch={"1234567": ["GS"]}))
+        assert "upgradeWatch is set but checkForUpgrades is not true" in out
+        out = run_main(CruiseAppConfig(check_for_upgrades=True,
+                                       upgrade_watch={"1234567": ["GS"], "7654321": ["JS"]}),
+                       seen=("1234567",))
+        assert "upgradeWatch: no booking matched 7654321" in out
+        assert "1234567 -" not in out and "inactive" not in out
+        out = run_main(CruiseAppConfig(check_for_upgrades=True))
+        assert "upgradeWatch" not in out
 
     def _tagged_rows(self, extra=()):
         return [{"type": t, "subtype": code, "category": cat, "display_name": name,
