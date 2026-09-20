@@ -4479,6 +4479,31 @@ class TestCheckForUpgrades:
         assert seen[0].get("r0k") == "CA" and "r0k" not in seen[1]
         assert len(seen) == 2                                # exactly one retry
 
+    def test_collect_all_composes_with_inventory_mode(self):
+        """No caller combines the upgrade sweep (collect_all, booked cruises)
+        with availability watches (inventory_mode, watchlist URLs) today, but
+        the gate accepts both: the verdict must then come from stock, exactly
+        as inventory_mode alone decides it, and the rows must still come back."""
+        def run(category, rooms_left):
+            payload = json.loads(_upgrade_rsc(_UPGRADE_SWEEP))
+            for t in payload["rooms"][0]["options"]["stateroomTypes"]:
+                for s in t["stateroomSubtypes"]:
+                    if s["code"] == "D":
+                        s["roomsLeft"] = rooms_left
+            params = _availability_params(subtype="D", category_code=category)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = json.dumps(payload)
+            with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_resp):
+                return check_if_room_is_available(params, collect_all=True, inventory_mode=True)
+
+        available, rows = run("4D", 5)
+        assert available is True and len(rows) == len(_UPGRADE_SWEEP)
+        available, rows = run("4D", 0)                 # explicit zero stock
+        assert available is False and len(rows) == len(_UPGRADE_SWEEP)
+        available, rows = run("2D", 5)                 # lead-in stock says nothing of a sister
+        assert available is None and len(rows) == len(_UPGRADE_SWEEP)
+
     def test_collect_all_renamed_code_still_adopts_and_collects(self):
         """The letters fallback (renamed funnel codes, the exact place upstream
         got stuck before #118) must keep working under collect_all: the booked
