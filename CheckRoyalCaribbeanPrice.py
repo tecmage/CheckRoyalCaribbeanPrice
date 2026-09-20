@@ -46,7 +46,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 
@@ -620,6 +620,7 @@ class CruiseAppConfig:
     upgrade_alert_below: Optional[float] = None
     upgrade_reservations: List[str] = field(default_factory=list)
     upgrade_sister_categories: bool = True
+    upgrade_watch: Dict[str, List[str]] = field(default_factory=dict)
     cabin_availability_state_file: str = "data/cabin-availability.json"
     output_watch_as_json: bool = False
     output_json_watch_file: Optional[str] = "output-json-watch.txt"
@@ -1493,6 +1494,7 @@ CASINO_MARKER = re.compile(r"casino|clubr|club royale", re.I)
 
 # upgradeReservations ids that matched a booking this run (to warn about typos)
 _UPGRADE_SCOPE_SEEN: Set[str] = set()
+_UPGRADE_WATCH_SEEN: Set[str] = set()
 
 
 def is_upgrade_candidate(booked_rank: Optional[int], booked_now: Optional[float],
@@ -1522,6 +1524,51 @@ def _is_price(value: Any) -> bool:
     zero and negatives are not prices - a row carrying one is not offered, never
     alerted on and never anchors a delta (a -1 total once read as a huge saving)."""
     return type(value) in (int, float) and 0 < value < float("inf")
+
+
+def upgrade_watch_verdict(code: str, rows: List[Dict[str, Any]],
+                          family_prices: Optional[Dict[str, float]] = None,
+                          booked_row: Optional[Dict[str, Any]] = None
+                          ) -> Tuple[Optional[bool], Optional[Dict[str, Any]]]:
+    """
+    Is a watched category on sale, judged from one completed room-selection sweep?
+
+      True  - listed and priced: as a subtype, as a family's lead-in category, or
+              as a sister category of the BOOKED family (the only family whose
+              per-category prices are fetched)
+      False - listed with an explicit 0 rooms left, or no family on the sailing
+              shares its letters: a confirmed closure, which re-arms the alert
+      None  - its family is on sale but this tier is not visible. The sweep shows
+              one lead-in category per family, so a pricier sister of another
+              family can be neither confirmed nor ruled out - and when a lead-in
+              sells out its sister BECOMES the lead-in, which must not read as
+              "just opened" when it may have been on sale all along.
+
+    Returns the matching row (a synthesized one for a booked-family sister); for
+    the None-because-invisible case, the on-sale family row sharing its letters,
+    so the caller can name the family code worth watching instead.
+    """
+    def letters(value: Any) -> str:
+        return re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
+
+    wanted = str(code or "").strip().upper()
+    if not wanted:
+        return None, None
+    for r in rows:
+        if wanted in (str(r.get('subtype') or "").upper(), str(r.get('category') or "").upper()):
+            if r.get('rooms_left') == 0:            # explicit 0 only; None = count unknown
+                return False, r
+            if _is_price(r.get('price')):
+                return True, r
+            return None, r                          # listed but unpriced: unknown
+    for cat, total in (family_prices or {}).items():
+        if str(cat).upper() == wanted and _is_price(total):
+            return True, {**(booked_row or {}), 'category': cat, 'price': total}
+    if letters(wanted):
+        for r in rows:
+            if letters(wanted) in (letters(r.get('category')), letters(r.get('subtype'))):
+                return None, r
+    return False, None
 
 
 def should_apply_dp340(eligible: bool, booked_with_code: bool, guest_count: int) -> bool:
@@ -2674,6 +2721,91 @@ def _report_upgrades(url_params: CruiseURLParams, results: Dict[str, Any],
         if apobj is not None:
             apobj.notify(body=body, title='Cruise Upgrade Opportunity', body_format=NotifyFormat.TEXT)
 
+    watched = (config.upgrade_watch.get(str(reservation_id))
+               if isinstance(config.upgrade_watch, dict) else None) or []
+    if watched:
+        _check_upgrade_watches(watched, rows, family_display, booked_row, url_params,
+                               booked_now if prefer_rate else paid_basis, delta_label,
+                               past_final_payment, sym, pre_string, reservation_id, apobj)
+
+
+def _check_upgrade_watches(watched: List[str], rows: List[Dict[str, Any]],
+                           family_prices: Dict[str, float], booked_row: Optional[Dict[str, Any]],
+                           url_params: CruiseURLParams, anchor_price: Optional[float],
+                           delta_label: str, past_final_payment: bool, sym: str,
+                           pre_string: str, reservation_id: Optional[str],
+                           apobj: Optional[Apprise]) -> None:
+    """
+    upgradeWatch: tell the user ONCE when a category they named opens on a
+    sailing they are booked on. Reads the sweep checkForUpgrades already made
+    (no extra requests, no URL to work out) and shares the cabin-availability
+    state file, so the rules match a watchlist availability watch: one alert
+    per opening, acknowledged only when delivered, re-armed by a confirmed
+    closure, and an unknown result leaves the previous state alone.
+    """
+    # a plain page link for this sailing - no loyalty number or discount flags,
+    # since it is written to the state file and sent in the alert
+    page = (f"https://www.{url_params.url_brand}.com/room-selection/type-and-subtype?"
+            + urlencode({
+                'packageCode': url_params.package_code or "",
+                'sailDate': url_params.sail_date or "",
+                'country': url_params.booking_office_country_code or "USA",
+                'selectedCurrencyCode': url_params.currency_code or "USD",
+                'shipCode': (url_params.package_code or "")[0:2],
+                'cabinClassType': url_params.cabin_class_string or 'INTERIOR',
+                'roomIndex': '0',
+                'r0a': url_params.number_of_adults,
+                'r0c': url_params.number_of_children,
+            }))
+
+    for code in watched:
+        available, row = upgrade_watch_verdict(code, rows, family_prices, booked_row)
+        if available is None:
+            exact = row is not None and code in (str(row.get('subtype') or "").upper(),
+                                                 str(row.get('category') or "").upper())
+            if exact:
+                why = "it is listed without a price"
+            else:
+                # only a family's cheapest category is visible: name the family,
+                # which is the code that follows every category inside it
+                family = (row or {}).get('subtype')
+                why = (f"family {family} is on sale (from {(row or {}).get('category')}) but {code} "
+                       f"itself is not visible - watch {family} to follow the whole family")
+            log(f"\t  Watching {code}: can't tell today - {why} (previous state kept)")
+            continue
+
+        summary = ""
+        if available:
+            price = row['price']
+            delta = (price - anchor_price) if isinstance(anchor_price, (int, float)) else None
+            if delta is not None and past_final_payment:
+                delta = max(delta, 0.0)             # no refund past final payment
+            cost = ""
+            if delta is not None:
+                sign = "+" if delta > 0 else "-" if delta < 0 else ""
+                cost = f" ({delta_label} {sign}{sym}{abs(delta):,.2f})"
+            tags = "".join(f" {t}" for t in (["[GTY]"] if row.get('guarantee') else [])
+                           + (["[connecting]"] if row.get('connecting') else []))
+            family = row.get('subtype')
+            family_note = f" (family {family})" if family and family != row.get('category') else ""
+            summary = (f"{row.get('category') or code} {row.get('display_name', '')}{tags}"
+                       f"{family_note} - now {_upgrade_money(price, sym)}{cost}")
+            log(f"\t  {GREEN}Watching {code}: available - {summary}{RESET}")
+        else:
+            log(f"\t  Watching {code}: not for sale today")
+
+        def alert_lines(summary: str = summary) -> List[str]:
+            return [f"{pre_string} #{reservation_id or '?'}: a category you are watching "
+                    f"is now available.", summary, page]
+
+        try:
+            if record_cabin_transition(f"upgradeWatch {reservation_id} {code}", page, available,
+                                       apobj, alert_lines, "Cruise Category Available"):
+                log(f"\t  {GREEN}Alert sent for {code}; it will not repeat until {code} "
+                    f"has closed and re-opened.{RESET}")
+        except CabinAvailabilityError as exc:
+            log(f"\t  {RED}Watching {code}: {exc}{RESET}")
+
 
 class CabinAvailabilityError(Exception):
     """A cabin availability notification or its persistent state failed."""
@@ -2751,7 +2883,34 @@ def notify_cabin_availability(params: CruiseURLParams, result: dict, url: str,
         log(f"{YELLOW}{label}: availability unknown; previous state retained{RESET}")
         return
     log(f"{GREEN if available else YELLOW}{label}: {'Available' if available else 'Not For Sale'}{RESET}")
+
+    def alert_lines() -> List[str]:
+        lines = [label + " is now available."]
+        fare_key = "all_included" if params.all_included else "base"
+        fare_key += "_refundable_fare" if params.refundable else "_fare"
+        fare = result.get(fare_key) or {}
+        price = fare.get("fare")
+        if price is not None:
+            if params.prepaid_grats:
+                price += fare.get("gratuities") or 0
+            if params.travel_insurance:
+                price += fare.get("insurance") or 0
+            lines.append(f"Current price: {price:.2f} {params.currency_code}")
+        else:
+            lines.append("Current price unavailable; check the booking page.")
+        lines.append(url)
+        return lines
+
+    record_cabin_transition(scope, url, available, notifier, alert_lines, "Cruise Room Available")
+
+
+def record_cabin_transition(scope: str, url: str, available: bool, notifier: Optional[Apprise],
+                            alert_lines: Callable[[], List[str]], title: str) -> bool:
+    """One watch's confirmed availability against the shared state file: alert
+    once per opening, acknowledge only a delivered alert, re-arm on confirmed
+    closure. Returns True when an alert was delivered by this call."""
     path = Path(config.cabin_availability_state_file).expanduser()
+    alerted = False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with cabin_state_lock(path):
@@ -2760,26 +2919,13 @@ def notify_cabin_availability(params: CruiseURLParams, result: dict, url: str,
             notified = bool(available and row.get("available") and row.get("notified"))
             sent = True
             if available and not notified and notifier is not None and len(notifier) > 0:
-                lines = [label + " is now available."]
-                fare_key = "all_included" if params.all_included else "base"
-                fare_key += "_refundable_fare" if params.refundable else "_fare"
-                fare = result.get(fare_key) or {}
-                price = fare.get("fare")
-                if price is not None:
-                    if params.prepaid_grats:
-                        price += fare.get("gratuities") or 0
-                    if params.travel_insurance:
-                        price += fare.get("insurance") or 0
-                    lines.append(f"Current price: {price:.2f} {params.currency_code}")
-                else:
-                    lines.append("Current price unavailable; check the booking page.")
-                lines.append(url)
+                body = "\n".join(alert_lines())
                 try:
-                    sent = notifier.notify(body="\n".join(lines),
-                        title="Cruise Room Available", body_format=NotifyFormat.TEXT) is True
+                    sent = notifier.notify(body=body,
+                        title=title, body_format=NotifyFormat.TEXT) is True
                 except Exception:
                     sent = False
-                notified = sent
+                notified = alerted = sent
             updated = {"url": url, "available": available, "notified": notified}
             if row != updated:
                 state[scope] = updated
@@ -2788,6 +2934,7 @@ def notify_cabin_availability(params: CruiseURLParams, result: dict, url: str,
         raise CabinAvailabilityError("Cannot update cabin availability state; check cabinAvailabilityStateFile, JSON contents and overlapping checks") from exc
     if not sent:
         raise CabinAvailabilityError("Cabin availability notification not confirmed; will retry on the next check")
+    return alerted
 
 
 def get_cruise_price(account_info: AccountInfo,
@@ -2935,10 +3082,16 @@ def get_cruise_price(account_info: AccountInfo,
         # its extra family request) to the listed bookings only
         _upgrade_scope = (config.upgrade_reservations
                           if isinstance(config.upgrade_reservations, (list, set, tuple)) else [])
+        # a booking with upgradeWatch categories is always checked: the watch
+        # reads the same sweep, so scoping it out would silently disable it
+        _watched = str(reservation_id) in (config.upgrade_watch
+                                           if isinstance(config.upgrade_watch, dict) else {})
+        if _watched:
+            _UPGRADE_WATCH_SEEN.add(str(reservation_id))
         if _upgrade_scope:
             if str(reservation_id) in [str(r) for r in _upgrade_scope]:
                 _UPGRADE_SCOPE_SEEN.add(str(reservation_id))
-            else:
+            elif not _watched:
                 collect_upgrades = False
     api_options = {"inventory_mode": True} if not automatic_URL and notification_mode == "availability" else {}
     results = get_room_price_via_API(url_params, room_number, collect_all=collect_upgrades,
@@ -4848,6 +5001,31 @@ def _config_id_list(value: Any, key: str) -> List[str]:
     raise ValueError(f"{key} must be a reservation id or a list of reservation ids")
 
 
+def _config_watch_map(value: Any, key: str) -> Dict[str, List[str]]:
+    """{reservation id: [category codes]}, codes upper-cased and de-duplicated.
+    A bare string is ONE code - iterating "JS" would watch "J" and "S"."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f'{key} must map reservation ids to category codes, '
+                         f'e.g. {key}: {{"1234567": ["JS", "GS"]}}')
+    watch: Dict[str, List[str]] = {}
+    for reservation, codes in value.items():
+        if codes is None:
+            continue
+        if isinstance(codes, (str, int)) and not isinstance(codes, bool):
+            codes = [codes]
+        if not isinstance(codes, (list, tuple, set)) or any(isinstance(c, bool) for c in codes):
+            # YAML reads a bare NO / ON / YES as a boolean - the code must be quoted
+            raise ValueError(f"{key}[{reservation}] must be a list of category codes "
+                             f"(quote them, e.g. \"JS\")")
+        cleaned = list(dict.fromkeys(str(c).strip().upper() for c in codes
+                                     if c is not None and str(c).strip()))
+        if cleaned and str(reservation).strip():
+            watch[str(reservation).strip()] = cleaned
+    return watch
+
+
 def _config_amount(value: Any, key: str) -> Optional[float]:
     """A money threshold; tolerates "$100" / "1,000" as users naturally write them."""
     if value is None:
@@ -4968,6 +5146,7 @@ def load_config_objects(config_path: str) -> CruiseAppConfig:
         upgrade_alert_below=_config_amount(data.get("upgradeAlertBelow"), "upgradeAlertBelow"),
         upgrade_reservations=_config_id_list(data.get("upgradeReservations"), "upgradeReservations"),
         upgrade_sister_categories=_config_bool(data.get("upgradeSisterCategories"), True),
+        upgrade_watch=_config_watch_map(data.get("upgradeWatch"), "upgradeWatch"),
         cabin_availability_state_file=cabin_state_file,
         output_watch_as_json=data.get("outputWatchAsJson",False),
         output_json_watch_file=data.get("outputJsonFile","output-json-watch.txt"),
@@ -5293,6 +5472,15 @@ def main() -> None:
             _unmatched = [str(r) for r in _scope if str(r) not in _UPGRADE_SCOPE_SEEN]
             if _unmatched:
                 log(YELLOW + f"upgradeReservations: no booking matched {', '.join(_unmatched)} "
+                             f"- check the reservation id(s)" + RESET)
+        _watch = config.upgrade_watch if isinstance(config.upgrade_watch, dict) else {}
+        if _watch and config.check_for_upgrades is not True:
+            log(YELLOW + "upgradeWatch is set but checkForUpgrades is not true "
+                         "- category watches are inactive" + RESET)
+        elif _watch:
+            _unmatched = [r for r in _watch if r not in _UPGRADE_WATCH_SEEN]
+            if _unmatched:
+                log(YELLOW + f"upgradeWatch: no booking matched {', '.join(_unmatched)} "
                              f"- check the reservation id(s)" + RESET)
 
         # Summary table of upcoming check-in and final-payment dates for booked sailings

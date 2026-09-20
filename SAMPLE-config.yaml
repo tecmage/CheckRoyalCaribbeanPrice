@@ -49,5 +49,7 @@ logFile: "output.txt"
 # upgradeAlertBelow: 100 # Optional, needs checkForUpgrades. Send an Apprise alert when an upgrade costs this much or less (on the same basis the upgrade table shows)
 # upgradeReservations: ["1234567"] # Optional, needs checkForUpgrades. Only run the upgrade check for these reservation IDs (absent/empty = every booking)
 # upgradeSisterCategories: false # Optional, needs checkForUpgrades. Set false to skip the per-category prices inside your booked family (one fewer API request per booking; the table then shows each family's cheapest tier only)
+# upgradeWatch: # Optional, needs checkForUpgrades. Alert ONCE when a category opens on a sailing you are booked on (no URL needed). Codes are the ones in the upgrade table's "cat" column
+#   "1234567": ["JS", "GS"]
 # outputWatchAsJson: true # Optional (off by default). Uncomment to write the watchlist price results to a JSON file for external consumption
 # outputJsonFile: "output-json-watch.txt" # Optional, only needed if you want to override the default output file name for the watchlist price results JSON file

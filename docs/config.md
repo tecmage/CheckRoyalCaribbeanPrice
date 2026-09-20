@@ -212,3 +212,45 @@ alert also says when a quote is on the other deposit type than your booking
 Rows without a real positive price are never offered or alerted on. Solo
 bookings the main checker prices with the DP340 single-supplement
 code (or that were booked with it) have the booked family quoted with it too.
+
+### Watching for a category to open (optional)
+
+To be told when a particular category becomes available on a sailing you are
+already booked on - a suite that is currently sold out, say - list its code under
+your reservation ID:
+
+```yaml
+checkForUpgrades: true
+upgradeWatch:
+  "1234567": ["JS", "GS"]
+```
+
+No URL is needed: the check reads the same stateroom list the upgrade table is
+built from, so it costs no extra requests. Royal groups categories into
+families (Junior Suite is family `JS`, holding categories such as `J3` and `J4`).
+You can watch either: a category code as shown in the table's `cat` column, or a
+family code, which follows every category inside it and is usually what you want
+- each status line names the family. Codes are case-insensitive; quote them in
+YAML. A watched reservation is always checked, even if `upgradeReservations`
+does not list it.
+
+Each run prints one status line per watched code, and you get **one** Apprise
+alert per opening, with today's price, what the move would cost on the same basis
+the table shows, and a link to the sailing's room-selection page. It will not
+repeat while the category stays on sale; once the category is confirmed gone
+again the watch re-arms. If the category is already on sale the first time the
+watch runs, you are alerted then. A failed notification is retried on the next
+run. With no Apprise configured the status line is all you get.
+
+One limit: Royal's stateroom list shows only each family's cheapest category. A
+pricier category of a family you are *not* booked in (say `1B` when the family's
+cheapest is `4B`) cannot be seen, so the watch reports "can't tell today", names
+the family code to watch instead, and leaves its state alone rather than guess.
+Categories inside your own booked family are visible individually (unless
+`upgradeSisterCategories: false`).
+
+Watches share the state file used by availability watches on watchlist URLs
+(`cabinAvailabilityStateFile`, default `data/cabin-availability.json` - see
+[watchlist-cruise-url.md](watchlist-cruise-url.md)); entries are keyed
+`upgradeWatch <reservation> <code>`. To reset one, remove its entry or set
+`notified` to `false`.
