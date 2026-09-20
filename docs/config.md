@@ -206,6 +206,9 @@ Optionally set `upgradeAlertBelow: 100` to send one Apprise alert per booking
 listing genuine upgrades (a higher class, or a pricier non-niche category within
 your class) whose cost - on the same basis the table shows - is at or below that
 amount. `[GTY]` and `[connecting]` rows alert only as a move to a higher class,
-never as a pricier option within your own, and keep their tag in the alert. Solo
+never as a pricier option within your own, and keep their tag in the alert. An
+alert also says when a quote is on the other deposit type than your booking
+(`[refundable rate]` / `[NRD rate]`), with a line explaining what that means.
+Rows without a real positive price are never offered or alerted on. Solo
 bookings the main checker prices with the DP340 single-supplement
 code (or that were booked with it) have the booked family quoted with it too.

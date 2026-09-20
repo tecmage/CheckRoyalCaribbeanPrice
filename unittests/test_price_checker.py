@@ -5017,6 +5017,133 @@ class TestCheckForUpgrades:
                                   category="XB", adults=1, struct=casino)
         assert "rough guide only" in out2
 
+    # ---------------- review hardening (PR #137) ------------------------------
+
+    def _gate(self, subtypes, subtype="D", category="2D", **kwargs):
+        """Run the availability gate over a hand-built (possibly malformed) sweep."""
+        payload = {"rooms": [{"options": {"stateroomTypes": subtypes}}]}
+        params = _availability_params(subtype=subtype, category_code=category)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = json.dumps(payload)
+        with patch('CheckRoyalCaribbeanPrice._execute_api_request', return_value=mock_resp):
+            return check_if_room_is_available(params, **kwargs)
+
+    @staticmethod
+    def _sub(code, cat, name="Balcony", **extra):
+        return dict({"code": code, "categoryCode": cat, "name": name, "roomsLeft": 5,
+                     "pricing": {"invoice": {"total": 1000.0}}}, **extra)
+
+    def test_collecting_never_fails_a_check_that_passes_without_it(self):
+        """Without collect_all the gate returns at the booked subtype and never
+        looks at the rows after it. Collecting keeps sweeping - so a malformed
+        row out there must be skipped, not allowed to fail the core price check."""
+        after = [{"code": "BALCONY", "stateroomSubtypes": [
+                    self._sub("D", "4D"), "$junk",
+                    self._sub("F", "2F", pricing="$ref")]},
+                 "$junk-type",
+                 {"code": "DELUXE", "stateroomSubtypes": None},
+                 {"code": "DELUXE", "stateroomSubtypes": [self._sub("GS", "GS", name="Grand Suite")]}]
+        assert self._gate(after)[0] is True                       # flag off: always passed
+        available, rows = self._gate(after, collect_all=True)
+        assert available is True
+        assert [r["subtype"] for r in rows] == ["D", "GS"]        # good rows kept, junk skipped
+
+        # the GTY bypass answers before the loop, so under it EVERY row is optional
+        assert self._gate([{"code": "BALCONY", "stateroomSubtypes": ["$junk"]}],
+                          subtype="XB", category="XB", collect_all=True) == (True, [])
+
+        # before the gate has answered, rows behave exactly as they always have
+        before = [{"code": "BALCONY", "stateroomSubtypes": ["$junk", self._sub("D", "4D")]}]
+        for kwargs in ({}, {"collect_all": True}):
+            with pytest.raises(AttributeError):
+                self._gate(before, **kwargs)
+
+    def test_optional_row_fields_tolerate_any_payload_with_the_flag_off(self):
+        """The connecting/refundability fields are new; the alternatives list is
+        not. A non-text name or pricing in an unrelated row ahead of the booked
+        one must not break a plain price check."""
+        sweep = [{"code": "BALCONY", "stateroomSubtypes": [
+            self._sub("E", "2E", name=123), self._sub("C", "4C", name=None),
+            self._sub("D", "4D")]}]
+        assert self._gate(sweep) == (True, [])
+        available, rows = self._gate(sweep, collect_all=True)
+        assert available is True
+        assert [(r["subtype"], r["display_name"], r["connecting"]) for r in rows] == [
+            ("E", "", False), ("C", "", False), ("D", "Balcony", False)]
+
+    def test_invalid_prices_are_never_offered_alerted_or_anchored(self):
+        """A synthetic Grand Suite total of -1 once produced an alert claiming a
+        $1,701 saving. A price is a real, positive, finite number."""
+        for bad in (-1, 0, True, float("nan"), float("inf")):
+            rows = [{"type": t, "subtype": code, "category": cat, "display_name": name,
+                     "name": name, "price": bad if code == "GS" else total, "rooms_left": 5,
+                     "guarantee": gty, "connecting": False, "refundability": None}
+                    for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP]
+            out, apobj, _ = self._render(rows=rows, threshold=1_000_000.0)
+            assert "Grand Suite" not in out, bad
+            assert "Grand Suite" not in (apobj.notify.call_args.kwargs["body"]
+                                         if apobj.notify.called else ""), bad
+
+        # an invalid family price is dropped; an invalid checkout price cannot anchor
+        out, _, _ = self._render(family={"2D": -5.0, "4D": 1100.0},
+                                 struct={"paid_price": 2050.0, "isCasino": True},
+                                 results_extra={"base_fare": {"fare": float("inf")}})
+        assert "-$5.00" not in out and "inf" not in out
+        assert "dl-rate basis: $1,100.00" in out                  # fell back to a real price
+
+    def test_same_class_alerts_need_one_dp340_basis(self):
+        """Checkout priced the booked 2D WITH DP340 (900) but the family request
+        was refused the code and retried without it: its undiscounted 4D (1100)
+        is a CHEAPER tier that merely looks pricier than the discounted anchor."""
+        kw = dict(threshold=5000.0, adults=1, coupon="DP340",
+                  results_extra={"base_fare": {"fare": 900.0}})
+        out, apobj, _ = self._render(family={"4D": 1100.0, "2D": 1180.0},
+                                     family_dp340=False, **kw)
+        body = apobj.notify.call_args.kwargs["body"]
+        assert "4D Ocean View Balcony" not in body
+        assert "Grand Suite" in body                              # a class jump still alerts
+        assert "was not accepted for the booked-family quote" in out
+
+        # same basis on both sides: a genuinely pricier sister tier alerts again
+        out, apobj, _ = self._render(family={"2D": 900.0, "1D": 1010.0},
+                                     family_dp340=True, **kw)
+        assert "1D Ocean View Balcony for" in apobj.notify.call_args.kwargs["body"]
+        assert "was not accepted" not in out
+
+    def test_alert_names_the_fare_restriction_the_table_shows(self):
+        def rows(suite_refund, other_refund):
+            return [{"type": t, "subtype": code, "category": cat, "display_name": name,
+                     "name": name, "price": 1750.0 if code == "GS" else total, "rooms_left": 5,
+                     "guarantee": gty, "connecting": False,
+                     "refundability": suite_refund if code == "GS" else other_refund}
+                    for (t, code, cat, name, total, gty) in _UPGRADE_SWEEP]
+        nrd, ref = "DEPOSIT_NOT_REFUNDABLE", "REFUNDABLE"
+        base = {"paid_price": 2050.0, "fareAndTaxes": 1700.0, "isCasino": False}
+
+        _, apobj, _ = self._render(rows=rows(ref, nrd), threshold=100.0,
+                                   struct=dict(base, depositType="NRD"))
+        body = apobj.notify.call_args.kwargs["body"]
+        assert "GS Grand Suite [refundable rate] for +$50.00" in body
+        assert "may not be available as priced" in body and "[NRD rate]" not in body
+
+        # every quote on the other fare type: the TABLE uses one note instead of
+        # per-row tags, but an alert stands alone and must still say so
+        out, apobj, _ = self._render(rows=rows(nrd, nrd), threshold=100.0,
+                                     struct=dict(base, depositType="REFUNDABLE"))
+        body = apobj.notify.call_args.kwargs["body"]
+        assert "GS Grand Suite [NRD rate] for +$50.00" in body and "one-way" in body
+        assert "Grand Suite  [NRD rate]" not in out               # table unchanged
+
+        # matching fare type, and comped casino fares: no restriction to state
+        _, apobj, _ = self._render(rows=rows(nrd, nrd), threshold=100.0,
+                                   struct=dict(base, depositType="NRD"))
+        assert "rate]" not in apobj.notify.call_args.kwargs["body"]
+        _, apobj, _ = self._render(rows=rows(ref, nrd), threshold=5000.0,
+                                   struct={"paid_price": 2050.0, "isCasino": True,
+                                           "depositType": "NRD"})
+        assert "rate]" not in apobj.notify.call_args.kwargs["body"]
+
     def _tagged_rows(self, extra=()):
         return [{"type": t, "subtype": code, "category": cat, "display_name": name,
                  "name": name, "price": total, "rooms_left": 5, "guarantee": gty,
