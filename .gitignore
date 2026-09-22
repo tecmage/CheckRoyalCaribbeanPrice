@@ -1,4 +1,5 @@
 config.yaml
+config.yaml.*
 __pycache__
 gui_settings.json
 reports/
