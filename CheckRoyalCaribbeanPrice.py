@@ -3007,8 +3007,10 @@ def notify_cabin_availability(params: CruiseURLParams, result: dict, url: str,
                     lines.append("Current price unavailable; check the booking page.")
                 lines.append(url)
                 try:
-                    sent = notifier.notify(body="\n".join(lines),
-                        title="Cruise Room Available", body_format=NotifyFormat.TEXT) is True
+                    # Apprise 1.x returns a bool; 2.0 returns an AppriseResult whose
+                    # truth value is "every destination succeeded" - never `is True`
+                    sent = bool(notifier.notify(body="\n".join(lines),
+                        title="Cruise Room Available", body_format=NotifyFormat.TEXT))
                 except Exception:
                     sent = False
                 notified = sent
