@@ -163,6 +163,14 @@ python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --new-double-points 34
   on right now is tagged `[sailing now]` and one that has ended but not yet posted to
   the loyalty ledger is still listed: both are included in the points projection as
   estimates (same nights x suite/solo math) until Crown & Anchor posts them
+- Cruises that have debarked but not posted yet (usually about a week) vanish from
+  Royal's profile and are not in the ledger either - no API shows them. So the script
+  remembers every booking it sees in `data/sailed-bookings.json` (`sailedBookingsFile`
+  in config; guest counts and room type only, no names) and lists a remembered cruise
+  that has sailed but not posted under "Points not posted yet", estimated in the
+  projection. A cruise it never saw can be entered once with
+  `--sailed SHIP:YYYYMMDD:NIGHTS[:GUESTS][:suite]` (e.g. `--sailed AN:20260920:7:solo`;
+  first account in the config); it is remembered and drops out by itself once posted
 - C&A points projection for booked cruises (suite/solo multipliers, crystal-block and
   Diamond-Plus milestone math), with `--double-points` to mark bookings made during the
   original double-points promo ((base + suite + solo) x2) and `--new-double-points` for

@@ -248,6 +248,12 @@ SCRIPTS = [
               tip='Points earned but not yet posted (e.g. a cruise that just ended). '
                   'Added to the current balance for tier progress and projections, shown '
                   'as "+N pending". Applies to every account in this config tab.'),
+        Field('Sailed, not posted', '--sailed', width=26,
+              tip='A cruise that already ended but is not in the loyalty ledger yet and '
+                  'this script never saw: SHIP:YYYYMMDD:NIGHTS[:GUESTS][:suite], e.g. '
+                  'AN:20260920:7:solo. Remembered for the first account in this tab and '
+                  'estimated until Crown & Anchor posts it. Comma-separate several. '
+                  'Cruises this script has seen before are remembered automatically.'),
     ]),
     ScriptDef('Back-to-Back Cabins', 'FindBackToBackCabins.py', uses_config=False, fields=[
         # --ship and --type are required: without them the script falls back to

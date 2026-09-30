@@ -20,6 +20,7 @@ Add family members' logins to accountInfo in config.yaml to match them up.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -39,14 +40,20 @@ from CheckRoyalCaribbeanPrice import GREEN, YELLOW, BLUE, RESET
 SHIP_NAMES: Dict[str, str] = {}
 
 
-def load_accounts(config_path: str) -> Tuple[List[Any], List[str], Optional[str]]:
-    """Log every account in. Returns (accounts, skipped, history_db) where skipped
-    holds the masked usernames that failed login, and history_db is the price
-    checker's optional SQLite path (used to spot sailed-but-unposted points)."""
+SAILED_FILE_DEFAULT = "data/sailed-bookings.json"
+
+
+def load_accounts(config_path: str) -> Tuple[List[Any], List[str], Optional[str], str]:
+    """Log every account in. Returns (accounts, skipped, history_db, sailed_file)
+    where skipped holds the masked usernames that failed login, history_db is
+    the price checker's optional SQLite path (used to spot sailed-but-unposted
+    points), and sailed_file is this script's own record of bookings seen
+    (`sailedBookingsFile`, default data/sailed-bookings.json)."""
     with open(config_path) as f:
         data = crccl.expand_env_vars(yaml.safe_load(f)) or {}
     crccl.setup_hybrid_logging(data.get("logFile"))
     history_db = data.get("historyDb")
+    sailed_file = str(data.get("sailedBookingsFile") or SAILED_FILE_DEFAULT)
 
     entries = data.get("accountInfo") or []
     if not entries:
@@ -82,7 +89,7 @@ def load_accounts(config_path: str) -> Tuple[List[Any], List[str], Optional[str]
     if not accounts:
         print("No accounts could log in.", file=sys.stderr)
         sys.exit(1)
-    return accounts, skipped, history_db
+    return accounts, skipped, history_db, sailed_file
 
 
 def api_get(account, url: str, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
@@ -555,7 +562,7 @@ def upcoming_earnings(bookings: List[Dict[str, Any]], holder_name: Optional[str]
             continue
         guests = b.get("passengersInStateroom") or []
         names = [guest_name(g).upper() for g in guests]
-        if holder_name and holder_name not in names:
+        if holder_name and holder_name not in names and not b.get("_remembered"):
             continue  # a linked booking (someone else's room)
         try:
             nights = int(b.get("numberOfNights") or 0)
@@ -700,6 +707,161 @@ def pending_ledger_sailings(db_path: Optional[str], username: str,
     return sorted(out, key=lambda p: p["sail_date"])
 
 
+##################################
+# Sailed-bookings record: bridging debarkation -> points posted
+##################################
+# No API Royal exposes returns a cruise between debarkation and the day Crown &
+# Anchor posts it (usually about a week): the profile drops the booking on
+# debarkation day and the loyalty ledger only gains it once posted - checked
+# against the profile endpoint's parameters, the v3 profile, the web and
+# mobile GraphQL schemas (both are the onboard commerce API). So this script
+# remembers the bookings it sees, and a remembered booking that has sailed but
+# not posted is listed as waiting, with the usual estimate.
+SAILED_KEEP_DAYS = 120          # give up on an entry that never posts
+
+
+def load_sailed_file(path: str) -> Dict[str, Any]:
+    """Missing file starts fresh; an unreadable one is reported and NOT overwritten."""
+    empty = {"version": 1, "accounts": {}}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return empty
+    except (OSError, ValueError) as e:
+        crccl.log(f"{YELLOW}Could not read {path} ({type(e).__name__}); sailed-booking "
+                  f"memory is off for this run{RESET}")
+        return {"version": 1, "accounts": {}, "_readonly": True}
+    if not isinstance(data, dict) or not isinstance(data.get("accounts"), dict):
+        crccl.log(f"{YELLOW}{path} is not a sailed-bookings file; ignoring it{RESET}")
+        return {"version": 1, "accounts": {}, "_readonly": True}
+    return data
+
+
+def save_sailed_file(path: str, store: Dict[str, Any]) -> None:
+    if store.get("_readonly"):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "accounts": store["accounts"]}, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as e:
+        crccl.log(f"{YELLOW}Could not write {path} ({e}); sailed bookings not remembered{RESET}")
+
+
+def remember_bookings(store: Dict[str, Any], username: str, bookings: List[Dict[str, Any]],
+                      holder_name: Optional[str], today: Optional[date] = None) -> None:
+    """Record every booking on the profile the account holder is in (guest count
+    and room type only - no names), and forget a remembered booking that
+    vanished BEFORE its sail date: that is a cancellation, not a sailing."""
+    today = today or date.today()
+    mine = store["accounts"].setdefault(username, {})
+    seen = set()
+    for b in bookings:
+        bid = str(b.get("bookingId") or "")
+        if not bid or sailing_status(b, today) == "unknown":
+            continue
+        guests = b.get("passengersInStateroom") or []
+        names = [guest_name(g).upper() for g in guests]
+        if holder_name and holder_name not in names:
+            continue
+        seen.add(bid)
+        entry = mine.get(bid, {"firstSeen": today.isoformat()})
+        entry.update({"shipCode": b.get("shipCode"), "sailDate": str(b.get("sailDate")),
+                      "nights": int(b.get("numberOfNights") or 0), "guests": len(guests),
+                      "stateroomType": b.get("stateroomType"), "lastSeen": today.isoformat()})
+        mine[bid] = entry
+    for bid in list(mine):
+        e = mine[bid]
+        if bid in seen or bid.startswith("manual:"):
+            continue
+        try:
+            sailed = datetime.strptime(str(e.get("sailDate") or ""), "%Y%m%d").date()
+        except ValueError:
+            del mine[bid]
+            continue
+        if sailed > today:
+            del mine[bid]                      # gone before it sailed: cancelled
+
+
+def parse_sailed_spec(spec: str) -> Dict[str, Any]:
+    """SHIP:YYYYMMDD:NIGHTS[:GUESTS][:suite] -> a remembered-booking entry.
+    Raises ValueError with the reason for anything else."""
+    parts = [x.strip() for x in spec.split(":")]
+    if len(parts) < 3:
+        raise ValueError("expected SHIP:YYYYMMDD:NIGHTS[:GUESTS][:suite]")
+    ship, sail, nights = parts[0].upper(), parts[1], parts[2]
+    if not re.fullmatch(r"[A-Z]{2}", ship):
+        raise ValueError(f"ship code must be two letters (got {parts[0]!r})")
+    try:
+        datetime.strptime(sail, "%Y%m%d")
+    except ValueError:
+        raise ValueError(f"sail date must be YYYYMMDD (got {sail!r})") from None
+    if not nights.isdigit() or int(nights) < 1:
+        raise ValueError(f"nights must be a positive number (got {nights!r})")
+    guests = 2
+    suite = False
+    for extra in parts[3:]:
+        if extra.isdigit():
+            guests = int(extra)
+        elif extra.lower() in ("suite", "solo"):
+            suite = suite or extra.lower() == "suite"
+            guests = 1 if extra.lower() == "solo" else guests
+        elif extra:
+            raise ValueError(f"unrecognized part {extra!r} (use a guest count, 'solo' or 'suite')")
+    if guests < 1:
+        raise ValueError("guest count must be at least 1")
+    return {"shipCode": ship, "sailDate": sail, "nights": int(nights), "guests": guests,
+            "stateroomType": "D" if suite else "B", "manual": True,
+            "firstSeen": date.today().isoformat(), "lastSeen": date.today().isoformat()}
+
+
+def add_manual_sailed(store: Dict[str, Any], username: str, specs: List[str]) -> List[str]:
+    """Seed sailings nothing recorded (they ended before this script ran).
+    Returns the specs that could not be parsed, with the reason."""
+    errors = []
+    mine = store["accounts"].setdefault(username, {})
+    for spec in specs:
+        try:
+            entry = parse_sailed_spec(spec)
+        except ValueError as e:
+            errors.append(f"{spec}: {e}")
+            continue
+        mine[f"manual:{entry['shipCode']}:{entry['sailDate']}"] = entry
+    return errors
+
+
+def sailed_unposted(store: Dict[str, Any], username: str, posted: frozenset,
+                    on_profile: set, today: Optional[date] = None) -> List[Dict[str, Any]]:
+    """Remembered bookings that have ended, are not in the loyalty ledger and are
+    no longer on the profile, as booking-shaped dicts the projection can price.
+    Posted and long-stale entries are dropped from the record."""
+    today = today or date.today()
+    mine = store["accounts"].get(username) or {}
+    out = []
+    for bid in list(mine):
+        e = mine[bid]
+        try:
+            sailed = datetime.strptime(str(e.get("sailDate") or ""), "%Y%m%d").date()
+            nights = int(e.get("nights") or 0)
+        except (TypeError, ValueError):
+            del mine[bid]
+            continue
+        ended = sailed + timedelta(days=nights)
+        if (e.get("shipCode"), e.get("sailDate")) in posted or (today - ended).days > SAILED_KEEP_DAYS:
+            del mine[bid]                      # posted at last, or never will be
+            continue
+        if bid in on_profile or ended > today or not nights:
+            continue
+        out.append({"bookingId": bid, "shipCode": e.get("shipCode"), "sailDate": e.get("sailDate"),
+                    "numberOfNights": nights, "stateroomType": e.get("stateroomType"),
+                    "passengersInStateroom": [{} for _ in range(int(e.get("guests") or 2))],
+                    "_remembered": "manual" if e.get("manual") else "seen"})
+    return sorted(out, key=lambda b: b["sailDate"])
+
+
 def show_pending_points(pending: List[Dict[str, Any]]) -> None:
     if not pending:
         return
@@ -707,10 +869,12 @@ def show_pending_points(pending: List[Dict[str, Any]]) -> None:
               f"missing from the loyalty ledger):{RESET}")
     for p in pending:
         days = (date.today() - p["ended"]).days
+        src = {"manual": " (entered with --sailed)", "seen": " (remembered from an earlier run)"
+               }.get(p.get("source"), "")
         crccl.log(f"  {pretty_date(p['sail_date'])}  {p['ship']:<26} ended {days}d ago  "
-                  f"~{p['est_points']} pts expected (not yet in totals)")
-    crccl.log("  (points usually post within a few days of debarkation; contact C&A if "
-              "a cruise is still missing after 2 weeks)")
+                  f"~{p['est_points']} pts expected{src}")
+    crccl.log("  (estimated in the projection below until Crown & Anchor posts them - usually "
+              "within a week of debarkation; contact C&A if a cruise is still missing after 2 weeks)")
 
 
 def show_tier_progress(account, profile_points: int, sailings: List[Dict[str, Any]],
@@ -880,7 +1044,14 @@ def main() -> None:
                         help="Comma-separated booking IDs on the NEWER double-points promo, "
                              "which doubles only base + suite and pays the solo point single: "
                              "(base + suite) x2 + solo. Solo earns 3/night, suite solo 5/night")
+    parser.add_argument("--sailed", action="append", default=[], metavar="SHIP:YYYYMMDD:NIGHTS[:GUESTS][:suite]",
+                        help="A cruise that already ended but is not in the loyalty ledger yet and "
+                             "was never seen by this script (e.g. AN:20260920:7:solo or "
+                             "SR:20260913:7:2:suite). Remembered for the first account in the "
+                             "config and estimated until Crown & Anchor posts it. Repeatable, or "
+                             "comma-separated")
     args = parser.parse_args()
+    sailed_specs = [s.strip() for chunk in args.sailed for s in chunk.split(",") if s.strip()]
     promo_ids = frozenset(i.strip() for i in args.double_points.split(",") if i.strip())
     new_promo_ids = frozenset(i.strip() for i in args.new_double_points.split(",") if i.strip())
     both = promo_ids & new_promo_ids
@@ -888,10 +1059,11 @@ def main() -> None:
         print(f"Booking(s) {', '.join(sorted(both))} given to BOTH promo flags; "
               f"using the new-promo math for them.", file=sys.stderr)
 
-    accounts, skipped, history_db = load_accounts(args.config)
+    accounts, skipped, history_db, sailed_file = load_accounts(args.config)
     try:
         _run_report(accounts, skipped, promo_ids, new_promo_ids, history_db,
-                    pending_points=args.pending_points)
+                    pending_points=args.pending_points, sailed_file=sailed_file,
+                    sailed_specs=sailed_specs)
     finally:
         for account, _loyalty, _points in accounts:
             account.access.session.close()
@@ -900,7 +1072,12 @@ def main() -> None:
 def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
                 new_promo_ids: frozenset = frozenset(),
                 history_db: Optional[str] = None,
-                pending_points: int = 0) -> None:
+                pending_points: int = 0,
+                sailed_file: str = SAILED_FILE_DEFAULT,
+                sailed_specs: Optional[List[str]] = None) -> None:
+    store = load_sailed_file(sailed_file)
+    for err in add_manual_sailed(store, accounts[0][0].username, sailed_specs or []):
+        crccl.log(f"{YELLOW}--sailed ignored - {err}{RESET}")
     registry = crccl.ShipRegistry()
     try:
         crccl.get_ship_dictionary_web(registry)
@@ -963,15 +1140,23 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
         # Manual --double-points wins; otherwise auto-detect from the amend pages
         acct_promo = promo_ids or probe_promo(account, own_bookings, holder)
         posted = frozenset((s.get("shipCode"), s.get("sailingDate")) for s in sailings)
-        upcoming = upcoming_earnings(own_bookings, holder, acct_promo, new_promo_ids, posted)
+        remember_bookings(store, account.username, own_bookings, holder)
+        remembered = sailed_unposted(store, account.username, posted,
+                                     {str(b.get("bookingId") or "") for b in own_bookings})
+        upcoming = upcoming_earnings(own_bookings + remembered, holder, acct_promo, new_promo_ids, posted)
         eff_points = (points or sum(sail_ints(s)[1] for s in sailings)) + pending_points
         earns_blocks = idx == block_idx
-        # an ended-but-unposted sailing still on the profile is already
-        # estimated in the projection above; the historyDb view covers the
-        # ones that have dropped off the profile
+        # Every sailed-but-unposted cruise the projection estimates (still on the
+        # profile, remembered, or entered with --sailed), plus the price
+        # checker's historyDb view for any it never saw
+        pending = [{"sail_date": sail, "ship": SHIP_NAMES.get(b.get("shipCode"), b.get("shipCode") or "?"),
+                    "ended": datetime.strptime(sail, "%Y%m%d").date() + timedelta(days=int(b.get("numberOfNights") or 0)),
+                    "est_points": pts, "source": b.get("_remembered")}
+                   for sail, b, pts, _w in upcoming if sailing_status(b) == "ended"]
         projected = {(b.get("shipCode"), sail) for sail, b, _p, _w in upcoming}
-        show_pending_points([p for p in pending_ledger_sailings(history_db, account.username, sailings)
-                             if (p.get("ship_code"), p["sail_date"]) not in projected])
+        pending += [p for p in pending_ledger_sailings(history_db, account.username, sailings)
+                    if (p.get("ship_code"), p["sail_date"]) not in projected]
+        show_pending_points(sorted(pending, key=lambda p: p["sail_date"]))
         show_upcoming_earnings(upcoming, SHIP_NAMES, holder,
                                start_points=eff_points, earns_blocks=earns_blocks,
                                promo_ids=acct_promo, new_promo_ids=new_promo_ids)
@@ -979,6 +1164,7 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
                            earns_blocks=earns_blocks, block_holder=block_holder)
         if sailings or upcoming:
             show_yearly(sailings, upcoming)
+    save_sailed_file(sailed_file, store)
     crccl.log("")
 
 

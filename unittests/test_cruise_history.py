@@ -157,7 +157,8 @@ def test_load_accounts_skips_malformed_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(crccl, "get_profile", lambda acct: ("FL", "123456", 42))
     monkeypatch.setattr(hist.time, "sleep", lambda s: None)
 
-    accounts, skipped, history_db = hist.load_accounts(str(cfg))
+    accounts, skipped, history_db, sailed_file = hist.load_accounts(str(cfg))
+    assert sailed_file == hist.SAILED_FILE_DEFAULT
     assert [a[0].username for a in accounts] == ["good@example.com"]
     assert skipped == ["broken@e…"]
     assert any("KeyError" in s for s in logged)
@@ -355,3 +356,110 @@ def test_tier_progress_names_the_sailing_in_progress(monkeypatch):
     hist.show_tier_progress(account, 78, [], rows)                                # 80 = next block
     out = "\n".join(logged)
     assert "sailing (sailing now)" in out and "(booked)" not in out
+
+
+def _store():
+    return {"version": 1, "accounts": {}}
+
+
+def test_remember_bookings_records_mine_and_forgets_cancellations():
+    """Bookings the holder is in are recorded (counts and room type, no names);
+    one that vanishes BEFORE its sail date was cancelled and is forgotten; one
+    that vanishes after sailing is kept - that is the point of the record."""
+    from datetime import date, timedelta
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    store = _store()
+    mine = _booking_on(10, bid="1111111", guests=1, suite=True)
+    mine["passengersInStateroom"][0].update(firstName="Jane", lastName="Holder")
+    linked = _booking_on(20, bid="2222222")                      # someone else's room
+    hist.remember_bookings(store, "jane@example.com", [mine, linked], "JANE HOLDER")
+    acct = store["accounts"]["jane@example.com"]
+    assert set(acct) == {"1111111"}
+    assert acct["1111111"]["guests"] == 1 and acct["1111111"]["stateroomType"] == "D"
+    assert "Jane" not in str(acct) and "Holder" not in str(acct)      # no names stored
+    # next run: 1111111 is gone and its sail date is still ahead -> cancelled
+    hist.remember_bookings(store, "jane@example.com", [], "JANE HOLDER")
+    assert acct == {}
+    # a booking that sailed and then dropped off the profile is kept
+    sailed = _booking_on(-3, bid="3333333")
+    sailed["passengersInStateroom"][0].update(firstName="Jane", lastName="Holder")
+    hist.remember_bookings(store, "jane@example.com", [sailed], "JANE HOLDER",
+                           today=date.today() - timedelta(days=5))         # seen before it sailed
+    hist.remember_bookings(store, "jane@example.com", [], "JANE HOLDER")   # gone now, after sailing
+    assert "3333333" in acct
+    # unknown holder name: record everything rather than nothing
+    hist.remember_bookings(_s := _store(), "x@example.com", [linked], None)
+    assert "2222222" in _s["accounts"]["x@example.com"]
+
+
+def test_parse_sailed_spec_forms_and_errors():
+    import pytest
+    from CheckRoyalCaribbeanCruiseHistory import parse_sailed_spec
+    e = parse_sailed_spec("an:20260920:7:solo")
+    assert (e["shipCode"], e["sailDate"], e["nights"], e["guests"], e["stateroomType"]) == ("AN", "20260920", 7, 1, "B")
+    e = parse_sailed_spec("SR:20260913:7:2:suite")
+    assert e["guests"] == 2 and e["stateroomType"] == "D" and e["manual"] is True
+    assert parse_sailed_spec("SR:20260913:7")["guests"] == 2                 # default: not solo
+    for bad, why in [("SR:20260913", "expected"), ("Serenade:20260913:7", "two letters"),
+                     ("SR:2026-09-13:7", "YYYYMMDD"), ("SR:20260913:0", "positive"),
+                     ("SR:20260913:7:balcony", "unrecognized"), ("SR:20260913:7:0", "at least 1")]:
+        with pytest.raises(ValueError, match=why):
+            parse_sailed_spec(bad)
+
+
+def test_sailed_unposted_prices_remembered_and_manual_cruises_until_posted():
+    from datetime import date, timedelta
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    store = _store()
+    errors = hist.add_manual_sailed(store, "u", ["AN:%s:7:solo" % (date.today() - timedelta(days=12)).strftime("%Y%m%d"),
+                                                "junk"])
+    assert errors and errors[0].startswith("junk:")
+    # a remembered (seen) booking that sailed 10 days ago for 7 nights: ended 3 days ago
+    seen = _booking_on(-10, bid="5555555", guests=2, suite=True)
+    hist.remember_bookings(store, "u", [seen], None, today=date.today() - timedelta(days=11))
+    rows = hist.sailed_unposted(store, "u", posted=frozenset(), on_profile=set())
+    assert [r["_remembered"] for r in rows] == ["manual", "seen"]
+    # the projection prices them with the normal math and no holder-name match
+    proj = hist.upcoming_earnings(rows, "SOMEONE ELSE", posted=frozenset())
+    assert [(r[1]["bookingId"][:6], r[2]) for r in proj] == [("manual", 14), ("555555", 14)]   # 7n x2 solo / 7n x2 suite
+    assert all("ended" in r[3] and "not in the loyalty ledger" in r[3] for r in proj)
+    # still on the profile -> the profile copy is used, not the remembered one
+    assert hist.sailed_unposted(store, "u", frozenset(), on_profile={"5555555"}) [0]["_remembered"] == "manual"
+    # posted at last -> dropped from the record for good
+    posted = frozenset({("SR", seen["sailDate"])})
+    hist.sailed_unposted(store, "u", posted, set())
+    assert "5555555" not in store["accounts"]["u"]
+    # not ended yet -> not listed, still remembered
+    current = _booking_on(-2, bid="6666666")
+    hist.remember_bookings(store, "u", [current], None)
+    assert not any(r["bookingId"] == "6666666" for r in hist.sailed_unposted(store, "u", frozenset(), set()))
+    assert "6666666" in store["accounts"]["u"]
+
+
+def test_sailed_file_round_trip_and_bad_file_is_left_alone(tmp_path, monkeypatch):
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    path = str(tmp_path / "data" / "sailed.json")
+    store = hist.load_sailed_file(path)                       # missing -> fresh
+    hist.add_manual_sailed(store, "u", ["AN:20260920:7:solo"])
+    hist.save_sailed_file(path, store)
+    again = hist.load_sailed_file(path)
+    assert again["accounts"]["u"]["manual:AN:20260920"]["nights"] == 7
+    (tmp_path / "data" / "sailed.json").write_text("{not json")
+    broken = hist.load_sailed_file(path)
+    assert broken["accounts"] == {} and broken.get("_readonly")
+    hist.save_sailed_file(path, broken)                        # must NOT overwrite the bad file
+    assert (tmp_path / "data" / "sailed.json").read_text() == "{not json"
+    assert any("sailed-booking memory is off" in m for m in logged)
+
+
+def test_pending_display_names_the_source(monkeypatch):
+    from datetime import date, timedelta
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    hist.show_pending_points([{"sail_date": "20260920", "ship": "Anthem of the Seas",
+                               "ended": date.today() - timedelta(days=4), "est_points": 14, "source": "manual"}])
+    out = "\n".join(logged)
+    assert "entered with --sailed" in out and "estimated in the projection below" in out
