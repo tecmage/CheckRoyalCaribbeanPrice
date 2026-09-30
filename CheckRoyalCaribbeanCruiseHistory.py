@@ -497,6 +497,25 @@ def show_b2b(sailings: List[Dict[str, Any]]) -> None:
                       f"{nxt.get('shipName')}  [{kind}]")
 
 
+def sailing_status(booking: Dict[str, Any], today: Optional[date] = None) -> str:
+    """'upcoming', 'in_progress' (sailed, not yet debarked), 'ended', or 'unknown'.
+
+    The loyalty ledger only gains a cruise a few days after debarkation, so a
+    sailing in progress is in neither the history nor the future: without this
+    it read as [past] with no points at all."""
+    today = today or date.today()
+    try:
+        sailed = datetime.strptime(str(booking.get("sailDate") or ""), "%Y%m%d").date()
+        nights = int(booking.get("numberOfNights") or 0)
+    except (TypeError, ValueError):
+        return "unknown"
+    if sailed > today:
+        return "upcoming"
+    if nights and today < sailed + timedelta(days=nights):
+        return "in_progress"
+    return "ended"
+
+
 def get_holder_name(account) -> Optional[str]:
     """Account holder's name from the v3 profile, for matching them in bookings."""
     url = f"https://aws-prd.api.rccl.com/en/{account.api_brand}/web/v3/guestAccounts/{account.access.id}"
@@ -510,20 +529,29 @@ def get_holder_name(account) -> Optional[str]:
 
 def upcoming_earnings(bookings: List[Dict[str, Any]], holder_name: Optional[str],
                       promo_ids: frozenset = frozenset(),
-                      new_promo_ids: frozenset = frozenset()
+                      new_promo_ids: frozenset = frozenset(),
+                      posted: frozenset = frozenset()
                       ) -> List[Tuple[str, Dict[str, Any], int, str]]:
-    """Project C&A points from booked future cruises: (sailDate, booking, pts, why).
+    """Project C&A points from booked cruises: (sailDate, booking, pts, why).
+
+    Covers future sailings, a sailing in progress, and one that has ended but
+    is not yet in the loyalty ledger (`posted` = the ledger's (shipCode,
+    sailingDate) keys) - the same estimate either way, marked as such, since
+    C&A posts points a few days after debarkation. A sailing already in the
+    ledger is history, not a projection.
 
     Two promo shapes exist: the original double-points promo doubled the whole
     per-night rate ((base + suite + solo) x2); the newer one doubles only the
     base+suite part and pays the solo supplement single ((base + suite) x2 + solo),
     so solo earns 3/night (not 4) and suite-solo 5/night (not 6). Non-solo
     bookings earn the same either way."""
-    today = date.today().strftime("%Y%m%d")
     rows = []
     for b in bookings:
         sail = b.get("sailDate") or ""
-        if not sail or sail < today:
+        status = sailing_status(b)
+        if not sail or status == "unknown":
+            continue
+        if status == "ended" and (b.get("shipCode"), sail) in posted:
             continue
         guests = b.get("passengersInStateroom") or []
         names = [guest_name(g).upper() for g in guests]
@@ -556,6 +584,10 @@ def upcoming_earnings(bookings: List[Dict[str, Any]], holder_name: Optional[str]
             else:
                 desc += (f"  {YELLOW}[--double-points ignored: sails outside the "
                          f"Sep 2026 - Apr 2027 promo window]{RESET}")
+        if status == "in_progress":
+            desc += f"  {YELLOW}[sailing now - estimate; posts after debarkation]{RESET}"
+        elif status == "ended":
+            desc += f"  {YELLOW}[ended - estimate; not in the loyalty ledger yet]{RESET}"
         rows.append((sail, b, pts, desc))
     return sorted(rows, key=lambda r: r[0])
 
@@ -604,6 +636,9 @@ def show_upcoming_earnings(rows: List[Tuple[str, Dict[str, Any], int, str]],
             line += f"  {GREEN}[{r[6]}]{RESET}"
         crccl.log(line.rstrip())
     crccl.log(f"  total: +{total} pts -> {cum}")
+    if any(sailing_status(b) != "upcoming" for _s, b, _p, _w in rows):
+        crccl.log(f"  {YELLOW}(rows marked 'sailing now' / 'ended' are estimates until Crown & "
+                  f"Anchor posts them - usually a few days after debarkation){RESET}")
 
     # ids given to BOTH flags resolve as new-promo in projected_rows, so they
     # must not count toward the OLD promo's per-member cruise cap
@@ -661,7 +696,7 @@ def pending_ledger_sailings(db_path: Optional[str], username: str,
         solo = guest_count == 1
         est = nights * (1 + (1 if suite else 0) + (1 if solo else 0))
         out.append({"reservation_id": rid, "ship": ship_name or ship_code or "?",
-                    "sail_date": sail, "ended": ended, "est_points": est})
+                    "ship_code": ship_code, "sail_date": sail, "ended": ended, "est_points": est})
     return sorted(out, key=lambda p: p["sail_date"])
 
 
@@ -726,7 +761,9 @@ def show_tier_progress(account, profile_points: int, sailings: List[Dict[str, An
             cum += pts_
             if cum >= target:
                 ship = SHIP_NAMES.get(b.get("shipCode"), b.get("shipCode") or "?")
-                return f"{GREEN}on the {pretty_date(sail)} {ship} sailing (booked){RESET}"
+                how = {"in_progress": "sailing now", "ended": "ended, points pending"
+                       }.get(sailing_status(b), "booked")
+                return f"{GREEN}on the {pretty_date(sail)} {ship} sailing ({how}){RESET}"
         if pace:
             remaining = target - end_pts
             eta = booked_end + timedelta(days=365 * remaining / pace)
@@ -805,10 +842,10 @@ def show_bookings(bookings: List[Dict[str, Any]], ships: Dict[str, str]) -> None
         crccl.log("No bookings returned (this endpoint only exposes upcoming sailings).")
         return
 
-    today = date.today().strftime("%Y%m%d")
     for b in sorted(bookings, key=lambda x: x.get("sailDate") or ""):
         sail = b.get("sailDate") or "?"
-        tag = f"{YELLOW}[past]{RESET}" if sail < today else f"{GREEN}[upcoming]{RESET}"
+        tag = {"in_progress": f"{BLUE}[sailing now]{RESET}", "ended": f"{YELLOW}[past]{RESET}",
+               "upcoming": f"{GREEN}[upcoming]{RESET}"}.get(sailing_status(b), f"{YELLOW}[?]{RESET}")
         ship = ships.get(b.get("shipCode"), b.get("shipCode") or "?")
         room = b.get("stateroomNumber") or "GTY"
         nights = b.get("numberOfNights")
@@ -925,10 +962,16 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
         holder = get_holder_name(account)
         # Manual --double-points wins; otherwise auto-detect from the amend pages
         acct_promo = promo_ids or probe_promo(account, own_bookings, holder)
-        upcoming = upcoming_earnings(own_bookings, holder, acct_promo, new_promo_ids)
+        posted = frozenset((s.get("shipCode"), s.get("sailingDate")) for s in sailings)
+        upcoming = upcoming_earnings(own_bookings, holder, acct_promo, new_promo_ids, posted)
         eff_points = (points or sum(sail_ints(s)[1] for s in sailings)) + pending_points
         earns_blocks = idx == block_idx
-        show_pending_points(pending_ledger_sailings(history_db, account.username, sailings))
+        # an ended-but-unposted sailing still on the profile is already
+        # estimated in the projection above; the historyDb view covers the
+        # ones that have dropped off the profile
+        projected = {(b.get("shipCode"), sail) for sail, b, _p, _w in upcoming}
+        show_pending_points([p for p in pending_ledger_sailings(history_db, account.username, sailings)
+                             if (p.get("ship_code"), p["sail_date"]) not in projected])
         show_upcoming_earnings(upcoming, SHIP_NAMES, holder,
                                start_points=eff_points, earns_blocks=earns_blocks,
                                promo_ids=acct_promo, new_promo_ids=new_promo_ids)

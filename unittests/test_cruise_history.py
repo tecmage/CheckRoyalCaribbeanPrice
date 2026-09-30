@@ -268,3 +268,90 @@ def test_show_pending_points_lists_unposted_sailings(monkeypatch):
     logged.clear()
     hist.show_pending_points([])
     assert logged == []   # nothing pending prints nothing
+
+
+def _booking_on(days_from_today, nights=7, guests=2, suite=False, ship="SR", bid="1234567"):
+    from datetime import date, timedelta
+    sail = (date.today() + timedelta(days=days_from_today)).strftime("%Y%m%d")
+    return {"bookingId": bid, "sailDate": sail, "numberOfNights": nights, "shipCode": ship,
+            "stateroomType": "D" if suite else "B",
+            "passengersInStateroom": [{"firstName": f"G{i}", "lastName": "Test"} for i in range(guests)]}
+
+
+def test_sailing_status_three_way():
+    """A cruise that has departed but not debarked is neither history nor future."""
+    from CheckRoyalCaribbeanCruiseHistory import sailing_status
+    assert sailing_status(_booking_on(1)) == "upcoming"
+    assert sailing_status(_booking_on(0)) == "in_progress"          # embarkation day
+    assert sailing_status(_booking_on(-3)) == "in_progress"         # mid-cruise (7 nights)
+    assert sailing_status(_booking_on(-6)) == "in_progress"         # last night aboard
+    assert sailing_status(_booking_on(-7)) == "ended"               # debarkation morning
+    assert sailing_status(_booking_on(-30)) == "ended"
+    assert sailing_status(_booking_on(-3, nights=0)) == "ended"     # no length known: can't be aboard
+    assert sailing_status({"sailDate": "soon", "numberOfNights": 7}) == "unknown"
+    assert sailing_status({}) == "unknown"
+
+
+def test_in_progress_sailing_is_projected_with_the_same_rate_math():
+    """The complaint: a current sailing showed as [past] with no points. It is
+    estimated exactly like a future one - nights x (base + suite + solo)."""
+    from CheckRoyalCaribbeanCruiseHistory import upcoming_earnings
+    rows = upcoming_earnings([_booking_on(-2, nights=7, guests=1, suite=True)], None)
+    assert len(rows) == 1
+    sail, b, pts, why = rows[0]
+    assert pts == 21                                                # 7n x3 (suite, solo)
+    assert "suite, solo" in why and "sailing now" in why and "estimate" in why
+    # promos still apply to a sailing in progress
+    rows = upcoming_earnings([_booking_on(-2, nights=7, guests=1)], None,
+                             new_promo_ids=frozenset({"1234567"}))
+    assert rows[0][2] == 21 and "sailing now" in rows[0][3]          # 7n x3 (new promo, solo)
+
+
+def test_ended_sailing_is_estimated_only_until_the_ledger_has_it():
+    from CheckRoyalCaribbeanCruiseHistory import upcoming_earnings
+    ended = _booking_on(-9, nights=7, guests=2, ship="SR")
+    rows = upcoming_earnings([ended], None)
+    assert rows and rows[0][2] == 7 and "ended" in rows[0][3] and "not in the loyalty ledger" in rows[0][3]
+    # once C&A has posted it (ledger key = shipCode + sailingDate) it is history, not a projection
+    posted = frozenset({("SR", ended["sailDate"])})
+    assert upcoming_earnings([ended], None, posted=posted) == []
+    # a different ship on the same date does not count as posted
+    assert upcoming_earnings([ended], None, posted=frozenset({("AN", ended["sailDate"])}))
+
+
+def test_projection_orders_current_before_future_and_flags_estimates(monkeypatch):
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    rows = hist.upcoming_earnings([_booking_on(30, bid="2222222"), _booking_on(-2, bid="1111111")], None)
+    assert [r[1]["bookingId"] for r in rows] == ["1111111", "2222222"]
+    hist.show_upcoming_earnings(rows, {"SR": "Serenade of the Seas"}, None)
+    out = "\n".join(logged)
+    assert "total: +14 pts" in out
+    assert "estimates until Crown & Anchor posts them" in out
+    logged.clear()
+    hist.show_upcoming_earnings(hist.upcoming_earnings([_booking_on(30)], None), {}, None)
+    assert "estimates until" not in "\n".join(logged)                # future-only: no caveat
+
+
+def test_bookings_list_tags_a_sailing_in_progress(monkeypatch):
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    hist.show_bookings([_booking_on(-2, bid="1111111"), _booking_on(-20, bid="2222222"),
+                        _booking_on(20, bid="3333333")], {})
+    out = "\n".join(logged)
+    # listed by sail date: the ended one, then the one in progress, then the future one
+    assert out.index("[past]") < out.index("[sailing now]") < out.index("[upcoming]")
+    assert out.count("[past]") == 1 and out.count("[sailing now]") == 1
+
+
+def test_tier_progress_names_the_sailing_in_progress(monkeypatch):
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    account = type("A", (), {"is_royal": True})()
+    rows = hist.upcoming_earnings([_booking_on(-2, nights=7, guests=2)], None)   # +7
+    hist.show_tier_progress(account, 78, [], rows)                                # 80 = next block
+    out = "\n".join(logged)
+    assert "sailing (sailing now)" in out and "(booked)" not in out

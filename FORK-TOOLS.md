@@ -159,7 +159,10 @@ python CheckRoyalCaribbeanCruiseHistory.py -c config.yaml --new-double-points 34
 - Each person's past sailings: date, ship, nights, cabin, itinerary, points earned
 - Roommate matching on past sailings by joining multiple accounts' histories on
   ship + sail date + cabin (the ledger only records the account holder)
-- Upcoming bookings with the roommates the API lists per stateroom
+- Upcoming bookings with the roommates the API lists per stateroom. A cruise you are
+  on right now is tagged `[sailing now]` and one that has ended but not yet posted to
+  the loyalty ledger is still listed: both are included in the points projection as
+  estimates (same nights x suite/solo math) until Crown & Anchor posts them
 - C&A points projection for booked cruises (suite/solo multipliers, crystal-block and
   Diamond-Plus milestone math), with `--double-points` to mark bookings made during the
   original double-points promo ((base + suite + solo) x2) and `--new-double-points` for
