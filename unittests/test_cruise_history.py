@@ -486,3 +486,38 @@ def test_pending_display_names_the_source(monkeypatch):
                                "ended": date.today() - timedelta(days=4), "est_points": 14, "source": "manual"}])
     out = "\n".join(logged)
     assert "entered with --sailed" in out and "estimated in the projection below" in out
+
+
+def test_reconcile_credited_zeroes_an_ended_estimate_the_balance_already_holds():
+    """Live: balance 285, ledger 271 - the just-ended cruise's 14 points were
+    credited before its ledger line appeared. An ended estimate that fits the
+    surplus must not be added on top of the balance a second time."""
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    ended = _booking_on(-9, nights=7, guests=1, bid="1111111")             # 14 pts
+    future = _booking_on(30, nights=7, guests=1, bid="2222222")            # 14 pts
+    rows = hist.upcoming_earnings([ended, future], None)
+    adjusted, left = hist.reconcile_credited(rows, surplus=14)
+    assert [(r[1]["bookingId"], r[2]) for r in adjusted] == [("1111111", 0), ("2222222", 14)]
+    assert "already in your balance" in adjusted[0][3] and "ledger line pending" in adjusted[0][3]
+    assert "[ended - estimate" not in adjusted[0][3]                        # old tag replaced
+    assert adjusted[0][1]["_credited"] == 14 and left == 0
+    # a surplus too small for the estimate leaves the row alone
+    same, left = hist.reconcile_credited(rows, surplus=10)
+    assert [r[2] for r in same] == [14, 14] and left == 10
+    assert hist.reconcile_credited(rows, 0) == (rows, 0)
+
+
+def test_show_yearly_shows_credited_points_in_the_current_year(monkeypatch):
+    from datetime import date
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    year = date.today().strftime("%Y")
+    sailings = [{"sailingDate": f"{year}0101", "itineraryNightsQuantity": 7, "points": 7}]
+    upcoming = [(f"{year}1231", {"numberOfNights": 7}, 14, "7n x2 (solo)")]
+    hist.show_yearly(sailings, upcoming, credited=14)
+    out = [hist.crccl.StripAnsiFilter.ANSI_REGEX.sub("", s) for s in logged]
+    rows = [l.split() for l in out if l.strip().startswith(year) or l.strip().startswith("w/")]
+    assert rows[1][:2] == [year, "posted"] and rows[1][2:4] == ["+14", "21"] and "not itemized" in " ".join(rows[1])
+    assert rows[2][:6] == [year, "est", "+1", "+7", "+14", "35"]
+    assert rows[3] == ["w/", "booked", "2", "14", "35"]            # ends on balance + booked, like the tier line

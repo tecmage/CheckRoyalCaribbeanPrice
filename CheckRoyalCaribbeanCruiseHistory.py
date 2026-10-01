@@ -421,10 +421,12 @@ def show_household(histories: List[Tuple[str, List[Dict[str, Any]]]],
 
 def show_yearly(sailings: List[Dict[str, Any]],
                 upcoming: List[Tuple[str, Dict[str, Any], int, str]],
-                pending_points: int = 0) -> None:
-    """pending_points is the --pending-points adjustment: points earned but not
-    posted, with no sailing of their own. They land in the current year so this
-    table ends on the same number the tier-progress line reports."""
+                pending_points: int = 0, credited: int = 0) -> None:
+    """pending_points is the --pending-points adjustment (points earned but not
+    posted, with no sailing of their own); credited is the profile balance's
+    lead over the ledger sum (points posted to the balance whose ledger line
+    has not appeared yet). Both land in the current year so this table ends on
+    the same number the tier-progress line reports."""
     crccl.log(f"\n{BLUE}Per-year totals:{RESET}")
     years: Dict[str, List[int]] = defaultdict(lambda: [0, 0, 0])
     for s in sailings:
@@ -451,11 +453,14 @@ def show_yearly(sailings: List[Dict[str, Any]],
     this_year = date.today().strftime("%Y")
     table = []
     cum = 0
-    for year in sorted(set(years) | set(est) | ({this_year} if pending_points else set())):
+    for year in sorted(set(years) | set(est) | ({this_year} if pending_points or credited else set())):
         if year in years:
             cruises, nights, pts = years[year]
             cum += pts
             table.append((year, str(cruises), str(nights), str(pts), str(cum)))
+        if credited and year == this_year:
+            cum += credited
+            table.append((f"{year} posted", "", "", f"+{credited}", str(cum)))
         if pending_points and year == this_year:
             cum += pending_points
             table.append((f"{year} pending", "", "", f"+{pending_points}", str(cum)))
@@ -467,10 +472,10 @@ def show_yearly(sailings: List[Dict[str, Any]],
     total = [sum(v[i] for v in years.values()) for i in range(3)]
     est_total = [sum(v[i] for v in est.values()) for i in range(3)]
     summary = [("total", str(total[0]), str(total[1]), str(total[2]), "")]
-    if est_total[0] or pending_points:
+    if est_total[0] or pending_points or credited:
         summary.append(("w/ booked", str(total[0] + est_total[0]),
                         str(total[1] + est_total[1]),
-                        str(total[2] + est_total[2] + pending_points), ""))
+                        str(total[2] + est_total[2] + pending_points + credited), ""))
 
     headers = ("Year", "Cruises", "Nights", "Points", "Total")
     widths = [max(len(r[i]) for r in ([headers] + table + summary)) for i in range(5)]
@@ -485,7 +490,8 @@ def show_yearly(sailings: List[Dict[str, Any]],
     crccl.log("  " + "  ".join("-" * w for w in widths))
     for r in table:
         emit(r, "  (booked)" if r[0].endswith("est") else
-                "  (--pending-points, not posted yet)" if r[0].endswith("pending") else "")
+                "  (--pending-points, not posted yet)" if r[0].endswith("pending") else
+                "  (in your balance, not itemized in the ledger yet)" if r[0].endswith("posted") else "")
     crccl.log("  " + "  ".join("-" * w for w in widths))
     for r in summary:
         emit(r)
@@ -872,6 +878,28 @@ def sailed_unposted(store: Dict[str, Any], username: str, posted: frozenset,
     return sorted(out, key=lambda b: b["sailDate"])
 
 
+def reconcile_credited(upcoming: List[Tuple[str, Dict[str, Any], int, str]],
+                       surplus: int) -> Tuple[List[Tuple[str, Dict[str, Any], int, str]], int]:
+    """Crown & Anchor credits a cruise's points to the balance before its line
+    appears in the ledger (seen live: balance 285, ledger 271). `surplus` is
+    balance minus ledger sum. An ended-but-unlisted sailing whose estimate fits
+    inside that surplus is already paid: its points are zeroed in the
+    projection (the balance has them) and its row says so. Returns the
+    adjusted rows and the surplus left unexplained."""
+    if surplus <= 0:
+        return upcoming, 0
+    out = []
+    for sail, b, pts, why in upcoming:
+        if sailing_status(b) == "ended" and pts and pts <= surplus:
+            surplus -= pts
+            why = re.sub(r"  \x1b\[[0-9;]*m\[ended[^\]]*\]\x1b\[[0-9;]*m$", "", why)
+            out.append((sail, dict(b, _credited=pts), 0,
+                        why + f"  {GREEN}[ended - {pts} pts already in your balance; ledger line pending]{RESET}"))
+        else:
+            out.append((sail, b, pts, why))
+    return out, surplus
+
+
 def show_pending_points(pending: List[Dict[str, Any]]) -> None:
     if not pending:
         return
@@ -881,6 +909,10 @@ def show_pending_points(pending: List[Dict[str, Any]]) -> None:
         days = (date.today() - p["ended"]).days
         src = {"manual": " (entered with --sailed)", "seen": " (remembered from an earlier run)"
                }.get(p.get("source"), "")
+        if p.get("credited"):
+            crccl.log(f"  {pretty_date(p['sail_date'])}  {p['ship']:<26} ended {days}d ago  "
+                      f"{p['credited']} pts already in your balance; ledger line pending{src}")
+            continue
         crccl.log(f"  {pretty_date(p['sail_date'])}  {p['ship']:<26} ended {days}d ago  "
                   f"~{p['est_points']} pts expected{src}")
     crccl.log("  (estimated in the projection below until Crown & Anchor posts them - usually "
@@ -1154,14 +1186,18 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
         remembered = sailed_unposted(store, account.username, posted,
                                      {str(b.get("bookingId") or "") for b in own_bookings})
         upcoming = upcoming_earnings(own_bookings + remembered, holder, acct_promo, new_promo_ids, posted)
-        eff_points = (points or sum(sail_ints(s)[1] for s in sailings)) + pending_points
+        ledger_sum = sum(sail_ints(s)[1] for s in sailings)
+        # points C&A has credited to the balance ahead of the ledger line
+        credited = max(0, points - ledger_sum) if points else 0
+        upcoming, unexplained = reconcile_credited(upcoming, credited)
+        eff_points = (points or ledger_sum) + pending_points
         earns_blocks = idx == block_idx
         # Every sailed-but-unposted cruise the projection estimates (still on the
         # profile, remembered, or entered with --sailed), plus the price
         # checker's historyDb view for any it never saw
         pending = [{"sail_date": sail, "ship": SHIP_NAMES.get(b.get("shipCode"), b.get("shipCode") or "?"),
                     "ended": datetime.strptime(sail, "%Y%m%d").date() + timedelta(days=int(b.get("numberOfNights") or 0)),
-                    "est_points": pts, "source": b.get("_remembered")}
+                    "est_points": pts, "source": b.get("_remembered"), "credited": b.get("_credited")}
                    for sail, b, pts, _w in upcoming if sailing_status(b) == "ended"]
         projected = {(b.get("shipCode"), sail) for sail, b, _p, _w in upcoming}
         pending += [p for p in pending_ledger_sailings(history_db, account.username, sailings)
@@ -1172,8 +1208,12 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
                                promo_ids=acct_promo, new_promo_ids=new_promo_ids)
         show_tier_progress(account, points, sailings, upcoming, pending=pending_points,
                            earns_blocks=earns_blocks, block_holder=block_holder)
-        if sailings or upcoming or pending_points:
-            show_yearly(sailings, upcoming, pending_points)
+        if credited:
+            crccl.log(f"  {YELLOW}{credited} pts are in your balance but not itemized in the loyalty "
+                      f"ledger yet{' - the sailing(s) above' if credited > unexplained else ''}; the "
+                      f"ledger usually catches up within days{RESET}")
+        if sailings or upcoming or pending_points or credited:
+            show_yearly(sailings, upcoming, pending_points, credited)
     save_sailed_file(sailed_file, store)
     crccl.log("")
 
