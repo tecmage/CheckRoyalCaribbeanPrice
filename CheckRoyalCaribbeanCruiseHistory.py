@@ -420,7 +420,11 @@ def show_household(histories: List[Tuple[str, List[Dict[str, Any]]]],
 
 
 def show_yearly(sailings: List[Dict[str, Any]],
-                upcoming: List[Tuple[str, Dict[str, Any], int, str]]) -> None:
+                upcoming: List[Tuple[str, Dict[str, Any], int, str]],
+                pending_points: int = 0) -> None:
+    """pending_points is the --pending-points adjustment: points earned but not
+    posted, with no sailing of their own. They land in the current year so this
+    table ends on the same number the tier-progress line reports."""
     crccl.log(f"\n{BLUE}Per-year totals:{RESET}")
     years: Dict[str, List[int]] = defaultdict(lambda: [0, 0, 0])
     for s in sailings:
@@ -444,13 +448,17 @@ def show_yearly(sailings: List[Dict[str, Any]],
     # One uniform table (same style as the projections table): history rows and
     # booked ("est") rows interleaved by year, with a running points total so
     # each year shows where the balance stood/lands.
+    this_year = date.today().strftime("%Y")
     table = []
     cum = 0
-    for year in sorted(set(years) | set(est)):
+    for year in sorted(set(years) | set(est) | ({this_year} if pending_points else set())):
         if year in years:
             cruises, nights, pts = years[year]
             cum += pts
             table.append((year, str(cruises), str(nights), str(pts), str(cum)))
+        if pending_points and year == this_year:
+            cum += pending_points
+            table.append((f"{year} pending", "", "", f"+{pending_points}", str(cum)))
         if year in est:
             cruises, nights, pts = est[year]
             cum += pts
@@ -459,9 +467,10 @@ def show_yearly(sailings: List[Dict[str, Any]],
     total = [sum(v[i] for v in years.values()) for i in range(3)]
     est_total = [sum(v[i] for v in est.values()) for i in range(3)]
     summary = [("total", str(total[0]), str(total[1]), str(total[2]), "")]
-    if est_total[0]:
+    if est_total[0] or pending_points:
         summary.append(("w/ booked", str(total[0] + est_total[0]),
-                        str(total[1] + est_total[1]), str(total[2] + est_total[2]), ""))
+                        str(total[1] + est_total[1]),
+                        str(total[2] + est_total[2] + pending_points), ""))
 
     headers = ("Year", "Cruises", "Nights", "Points", "Total")
     widths = [max(len(r[i]) for r in ([headers] + table + summary)) for i in range(5)]
@@ -475,7 +484,8 @@ def show_yearly(sailings: List[Dict[str, Any]],
                                for i, h in enumerate(headers)))
     crccl.log("  " + "  ".join("-" * w for w in widths))
     for r in table:
-        emit(r, "  (booked)" if r[0].endswith("est") else "")
+        emit(r, "  (booked)" if r[0].endswith("est") else
+                "  (--pending-points, not posted yet)" if r[0].endswith("pending") else "")
     crccl.log("  " + "  ".join("-" * w for w in widths))
     for r in summary:
         emit(r)
@@ -1162,8 +1172,8 @@ def _run_report(accounts: List[Any], skipped: List[str], promo_ids: frozenset,
                                promo_ids=acct_promo, new_promo_ids=new_promo_ids)
         show_tier_progress(account, points, sailings, upcoming, pending=pending_points,
                            earns_blocks=earns_blocks, block_holder=block_holder)
-        if sailings or upcoming:
-            show_yearly(sailings, upcoming)
+        if sailings or upcoming or pending_points:
+            show_yearly(sailings, upcoming, pending_points)
     save_sailed_file(sailed_file, store)
     crccl.log("")
 

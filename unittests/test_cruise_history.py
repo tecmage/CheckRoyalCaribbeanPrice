@@ -252,6 +252,29 @@ def test_show_yearly_totals_and_projections(monkeypatch):
     assert row("w/ booked") == ["w/", "booked", "4", "24", "38"]
 
 
+def test_show_yearly_includes_pending_points_in_the_current_year(monkeypatch):
+    """--pending-points reached the tier-progress line but not this table, so
+    the two ended on different numbers (467 vs 453 live: 14 points of a
+    just-ended cruise). The adjustment now lands in the current year."""
+    from datetime import date
+    import CheckRoyalCaribbeanCruiseHistory as hist
+    logged = []
+    monkeypatch.setattr(hist.crccl, "log", lambda m, *a, **k: logged.append(str(m)))
+    year = date.today().strftime("%Y")
+    sailings = [{"sailingDate": f"{year}0101", "itineraryNightsQuantity": 7, "points": 7}]
+    upcoming = [(f"{year}1231", {"numberOfNights": 7}, 14, "7n x2 (solo)")]
+    hist.show_yearly(sailings, upcoming, pending_points=14)
+    out = [hist.crccl.StripAnsiFilter.ANSI_REGEX.sub("", s) for s in logged]
+    rows = [l.split() for l in out if l.strip().startswith(year) or l.strip().startswith("w/")]
+    assert rows[0] == [year, "1", "7", "7", "7"]
+    assert rows[1][:2] == [year, "pending"] and rows[1][2:4] == ["+14", "21"] and "not posted" in " ".join(rows[1])
+    assert rows[2][:6] == [year, "est", "+1", "+7", "+14", "35"]
+    assert rows[3] == ["w/", "booked", "2", "14", "35"]            # same end point as tier progress
+    logged.clear()
+    hist.show_yearly(sailings, upcoming)                           # no adjustment: no pending row
+    assert not any("pending" in l for l in logged)
+
+
 def test_show_pending_points_lists_unposted_sailings(monkeypatch):
     import CheckRoyalCaribbeanCruiseHistory as hist
     from datetime import date, timedelta
