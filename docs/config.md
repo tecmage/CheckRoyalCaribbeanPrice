@@ -135,6 +135,57 @@ accountInfo:
 If `outputWatchAsJson` is true, the add-on watch prices checked during each run are also written as a JSON list.
 Set `outputJsonFile` to change the output path; it defaults to `output-json-watch.txt`.
 
+## Reservation-release alerts
+
+Optional dining and entertainment release alerts use booked Royal Caribbean
+sailings and the existing Apprise settings. Configure each reservation once and
+enable automatic discovery for dining, shows, or both. The check uses dated
+offering inventory, including free shows, independently of price thresholds.
+
+```yaml
+reservationAlerts:
+  dryRun: true
+  stateFile: "data/reservation-availability.json"
+  reservations:
+    - reservation: "1234567"
+      dining: true
+      shows: true
+      notifyOnReopen: false
+```
+
+By default, `dining: true` and `shows: true` monitor every matching product
+Royal returns for that category. To monitor only selected products in a category,
+use a `products` list:
+
+```yaml
+reservationAlerts:
+  dryRun: true
+  stateFile: "data/reservation-availability.json"
+  reservations:
+    - reservation: "1234567"
+      dining:
+        products:
+          - "UT_RAILDINNER"
+      shows: true
+      notifyOnReopen: false
+```
+
+See [configuration, notification behavior, and limitations](reservation-alerts.md).
+
+Selective monitoring uses markedly fewer resources: with 20 dining products in
+two catalog pages, checking one selected restaurant costs 3 requests instead of
+22. Catalog pages are still fetched, but only selected products receive eligibility
+checks. Once the dining you want has opened and you have booked it, set
+`dining: false`; keep monitoring only the restaurants still outstanding. One-time
+notifications suppress repeat alerts, not polling. Remove entries when neither
+category needs monitoring. Availability requests have a one-second minimum gap.
+
+Live alerts require `overflow=split` only on destinations where the actual formatted
+message needs splitting. All destinations are validated before sending; destructive
+title/line limits are also rejected. Pending alerts remain unacknowledged until
+configuration is corrected. Existing price checks continue normally. See
+[notification configuration and pre-release upgrade instructions](reservation-alerts.md#notifications-and-state).
+
 ## Example Config with more options (not all of them)
 ```yaml
 accountInfo:
@@ -241,3 +292,31 @@ accounts are skipped with a note. If the offers API fails part-way, the offers
 fetched so far are still listed and marked partial, and the rest of the run is
 unaffected. This replaces the standalone `CheckRoyalCaribbeanCasinoOffers.py`
 script for scheduled use; that script still works on its own.
+
+Casino offers are personal, but bookings often are not: when you travel with a
+companion (partner, family member, friend) and book together, one account usually
+sees every booking already. Add `casinoOffersOnly: true` to the companion's
+`accountInfo` entry to log that account in for its casino offers only - its
+bookings, prices, add-ons, upgrades and `reservationAlerts` are skipped, so
+nothing is checked twice.
+
+```yaml
+checkCasinoOffers: true
+accountInfo:
+  - username: "me@example.com"
+    password: "..."
+  - username: "companion@example.com"
+    password: "..."
+    casinoOffersOnly: true
+```
+
+`checkCasinoOffers` stays the master switch: without it, `casinoOffersOnly` has
+no effect and the account is checked in full (a warning is logged).
+
+Only use it for an account whose bookings another account already sees. A
+booking visible only to the `casinoOffersOnly` account (e.g. a solo sailing) is
+not checked at all, and a `reservationAlerts` or `upgradeReservations` entry for
+it is reported as not found. Shared bookings are priced with the other account's
+discounts only (state, senior/military/police/fire, 340-point C&A single
+supplement), so put the account holding those on the fully checked side. On a
+Celebrity account the option only logs that there are no casino offers to check.

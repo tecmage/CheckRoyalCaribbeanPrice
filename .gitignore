@@ -26,3 +26,5 @@ dist/
 data/cabin-availability.json*
 data/cabin-availability.sqlite3*
 data/sailed-bookings.json*
+# Reservation availability notification state and sidecar files.
+data/reservation-availability.json*
