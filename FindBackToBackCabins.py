@@ -39,7 +39,7 @@ except ImportError:
           "403. Install it (the main script uses it too).", file=sys.stderr)
 
 APPKEY_WEB = "hyNNqIPHHzaLzVpcICPdAdbFV8yvTsAm"
-USER_AGENT_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0"
+USER_AGENT_WEB = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) Gecko/20100101 Firefox/159.0"
 API = "https://aws-prd.api.rccl.com"
 
 RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA, RESET = (
